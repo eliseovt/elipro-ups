@@ -42,14 +42,18 @@ def sequence_profile():
     return profile
 
 
-def sample(**changes):
-    return {"timestamp": datetime.now(timezone.utc).isoformat(), "on_battery": True,
+def sample(*, after=None, **changes):
+    # An explicit later observation must not depend on the host clock advancing
+    # between adjacent calls (Windows can return the same UTC tick for both).
+    timestamp = (datetime.fromisoformat(after.replace("Z", "+00:00")) + timedelta(milliseconds=1)
+                 if after is not None else datetime.now(timezone.utc))
+    return {"timestamp": timestamp.isoformat(), "on_battery": True,
             "low_battery": False, "fault": False, "output_voltage": 220,
             "raw_status": "Battery mode", "raw_flags": {"status_hex": "89"}, **changes}
 
 
-def pending_sample():
-    return sample(on_battery=None, raw_status="Shutdown mode", raw_flags={"status_hex": "8B"})
+def pending_sample(**changes):
+    return sample(**{"on_battery": None, "raw_status": "Shutdown mode", "raw_flags": {"status_hex": "8B"}, **changes})
 
 
 class UpsPowerCodecTests(unittest.TestCase):
@@ -178,8 +182,8 @@ class UpsPowerCoordinatorTests(unittest.TestCase):
         evidence["automatic_return_observed"] = True
         coordinator = self.make(profiles={profile["profile_id"]: profile})
         self.assertTrue(coordinator.capabilities(DEVICE)["available"])
-        self.arm(coordinator)
-        self.assertEqual(coordinator.cancel(device=DEVICE, sample=sample())["state"], "cancel_submitted")
+        operation = self.arm(coordinator)
+        self.assertEqual(coordinator.cancel(device=DEVICE, sample=sample(after=operation["submitted_at"]))["state"], "cancel_submitted")
         self.transport.cancel_shutdown.assert_called_once_with()
         for field in ("output_cut_observed", "pending_signal_not_reported", "cancel_observed_without_cut", "automatic_return_observed", "device_fingerprint"):
             invalid = copy.deepcopy(profile)
@@ -252,35 +256,37 @@ class UpsPowerCoordinatorTests(unittest.TestCase):
         self.transport.submit_shutdown.assert_called_once()
 
     def test_observation_requires_own_same_device_and_real_shutdown_bit(self):
-        self.arm()
-        self.assertEqual(self.coordinator.observe(device=DEVICE, sample=sample())["state"], "submitted")
-        self.assertEqual(self.coordinator.observe(device=DEVICE, sample=sample(raw_status="Shutdown mode"))["state"], "submitted")
-        self.assertEqual(self.coordinator.observe(device=DEVICE, sample=pending_sample())["state"], "armed")
+        operation = self.arm()
+        self.assertEqual(self.coordinator.observe(device=DEVICE, sample=sample(after=operation["submitted_at"]))["state"], "submitted")
+        self.assertEqual(self.coordinator.observe(device=DEVICE, sample=sample(after=operation["submitted_at"], raw_status="Shutdown mode"))["state"], "submitted")
+        self.assertEqual(self.coordinator.observe(device=DEVICE, sample=pending_sample(after=operation["submitted_at"]))["state"], "armed")
         result = self.coordinator.mark_windows_requested()
         self.assertTrue(result["windows_requested"])
         self.assertEqual(result["confirmation"], "observed_in_qs")
 
     def test_qs_captured_before_or_at_shutdown_submission_cannot_confirm_or_cancel_it(self):
-        before = pending_sample()
         submitted = self.arm()
-        at_submission = {**pending_sample(), "timestamp": submitted["submitted_at"]}
+        completed_at = datetime.fromisoformat(submitted["submitted_at"].replace("Z", "+00:00"))
+        before = pending_sample(timestamp=(completed_at - timedelta(milliseconds=1)).isoformat())
+        at_submission = pending_sample(timestamp=submitted["submitted_at"])
         for evidence in (before, at_submission):
             with self.subTest(timestamp=evidence["timestamp"]):
                 self.assertEqual(self.coordinator.observe(device=DEVICE, sample=evidence)["state"], "submitted")
                 with self.assertRaises(UpsPowerBlocked):
                     self.coordinator.cancel(device=DEVICE, sample=evidence)
         self.transport.cancel_shutdown.assert_not_called()
-        self.assertEqual(self.coordinator.observe(device=DEVICE, sample=pending_sample())["state"], "armed")
+        self.assertEqual(self.coordinator.observe(device=DEVICE, sample=pending_sample(after=submitted["submitted_at"]))["state"], "armed")
 
     def test_qs_captured_before_or_at_cancel_submission_cannot_confirm_cancellation(self):
-        self.arm()
-        before_cancel = sample()
-        cancelled = self.coordinator.cancel(device=DEVICE, sample=pending_sample())
-        at_cancel = {**sample(), "timestamp": cancelled["cancel_submitted_at"]}
+        submitted = self.arm()
+        cancelled = self.coordinator.cancel(device=DEVICE, sample=pending_sample(after=submitted["submitted_at"]))
+        completed_at = datetime.fromisoformat(cancelled["cancel_submitted_at"].replace("Z", "+00:00"))
+        before_cancel = sample(timestamp=(completed_at - timedelta(milliseconds=1)).isoformat())
+        at_cancel = sample(timestamp=cancelled["cancel_submitted_at"])
         for evidence in (before_cancel, at_cancel):
             with self.subTest(timestamp=evidence["timestamp"]):
                 self.assertEqual(self.coordinator.observe(device=DEVICE, sample=evidence)["state"], "cancel_submitted")
-        self.assertEqual(self.coordinator.observe(device=DEVICE, sample=sample())["state"], "cancelled")
+        self.assertEqual(self.coordinator.observe(device=DEVICE, sample=sample(after=cancelled["cancel_submitted_at"]))["state"], "cancelled")
 
     def test_uncertain_partial_submission_never_authorizes_cancel_even_with_later_shutdown_bit(self):
         before = pending_sample()
@@ -290,38 +296,39 @@ class UpsPowerCoordinatorTests(unittest.TestCase):
         with self.assertRaises(UpsPowerBlocked):
             self.coordinator.cancel(device=DEVICE, sample=before)
         with self.assertRaises(UpsPowerBlocked):
-            self.coordinator.cancel(device=DEVICE, sample=pending_sample())
+            self.coordinator.cancel(device=DEVICE, sample=pending_sample(after=uncertain["submission_finished_at"]))
         self.transport.cancel_shutdown.assert_not_called()
 
     def test_cancel_requires_owned_pending_shutdown_and_confirmed_powered_output(self):
         with self.assertRaises(UpsPowerBlocked):
             self.coordinator.cancel(device=DEVICE, sample=pending_sample())
-        self.arm()
-        for evidence in (sample(), sample(raw_status="Shutdown mode"), pending_sample() | {"output_voltage": 0},
-                         pending_sample() | {"low_battery": True}):
+        operation = self.arm()
+        for evidence in (sample(after=operation["submitted_at"]), sample(after=operation["submitted_at"], raw_status="Shutdown mode"),
+                         pending_sample(after=operation["submitted_at"], output_voltage=0),
+                         pending_sample(after=operation["submitted_at"], low_battery=True)):
             with self.subTest(evidence=evidence), self.assertRaises(UpsPowerBlocked):
                 self.coordinator.cancel(device=DEVICE, sample=evidence)
         self.transport.cancel_shutdown.assert_not_called()
-        result = self.coordinator.cancel(device=DEVICE, sample=pending_sample())
+        result = self.coordinator.cancel(device=DEVICE, sample=pending_sample(after=operation["submitted_at"]))
         self.assertEqual(result["state"], "cancel_submitted")
         self.assertEqual(result["confirmation"], "unconfirmed")
         with self.assertRaises(UpsPowerBlocked):
-            self.coordinator.cancel(device=DEVICE, sample=pending_sample())
+            self.coordinator.cancel(device=DEVICE, sample=pending_sample(after=operation["submitted_at"]))
         self.transport.cancel_shutdown.assert_called_once()
-        incomplete = sample(raw_flags={})
+        incomplete = sample(after=result["cancel_submitted_at"], raw_flags={})
         self.assertEqual(self.coordinator.observe(device=DEVICE, sample=incomplete)["state"], "cancel_submitted")
-        self.assertEqual(self.coordinator.observe(device=DEVICE, sample=sample())["state"], "cancelled")
+        self.assertEqual(self.coordinator.observe(device=DEVICE, sample=sample(after=result["cancel_submitted_at"]))["state"], "cancelled")
 
     def test_cancel_cannot_run_at_cutoff_or_repeat_after_uncertain_attempt(self):
-        self.arm()
+        operation = self.arm()
         self.clock.return_value = 276
         with self.assertRaises(UpsPowerBlocked):
-            self.coordinator.cancel(device=DEVICE, sample=pending_sample())
+            self.coordinator.cancel(device=DEVICE, sample=pending_sample(after=operation["submitted_at"]))
         self.clock.return_value = 110
         self.transport.cancel_shutdown.side_effect = TimeoutError("uncertain cancel")
-        self.assertEqual(self.coordinator.cancel(device=DEVICE, sample=pending_sample())["state"], "uncertain")
+        self.assertEqual(self.coordinator.cancel(device=DEVICE, sample=pending_sample(after=operation["submitted_at"]))["state"], "uncertain")
         with self.assertRaises(UpsPowerBlocked):
-            self.coordinator.cancel(device=DEVICE, sample=pending_sample())
+            self.coordinator.cancel(device=DEVICE, sample=pending_sample(after=operation["submitted_at"]))
         self.transport.cancel_shutdown.assert_called_once()
 
     def test_restart_pending_needs_review_and_never_replays_even_corroborated_cancel(self):
@@ -367,14 +374,15 @@ class UpsPowerCoordinatorTests(unittest.TestCase):
     def test_unreliable_profile_can_cancel_only_own_full_submission_and_never_confirms_from_constant_zero_bit(self):
         profile = unreliable_profile()
         coordinator = self.make(profiles={profile["profile_id"]: profile})
-        self.arm(coordinator)
+        operation = self.arm(coordinator)
         self.clock.return_value = 110
-        self.assertEqual(coordinator.cancel(device=DEVICE, sample=sample())["state"], "cancel_submitted")
-        result = coordinator.observe(device=DEVICE, sample=sample())
+        cancelled = coordinator.cancel(device=DEVICE, sample=sample(after=operation["submitted_at"]))
+        self.assertEqual(cancelled["state"], "cancel_submitted")
+        result = coordinator.observe(device=DEVICE, sample=sample(after=cancelled["cancel_submitted_at"]))
         self.assertEqual((result["state"], result["confirmation"]), ("cancel_submitted", "unconfirmed"))
         for current in range(120, 311, 10):
             self.clock.return_value = current
-            result = coordinator.observe(device=DEVICE, sample=sample())
+            result = coordinator.observe(device=DEVICE, sample=sample(after=cancelled["cancel_submitted_at"]))
         self.assertEqual((result["state"], result["confirmation"]), ("cancelled", "output_active_after_deadline"))
         self.transport.cancel_shutdown.assert_called_once_with()
         self.assertEqual(VALIDATED_PROFILES[profile["profile_id"]]["device_fingerprint"], OBSERVED_UNIT_FINGERPRINT)
@@ -552,8 +560,8 @@ class UpsPowerCoordinatorTests(unittest.TestCase):
         profile = unreliable_profile()
         coordinator = self.make(profiles={profile["profile_id"]: profile})
         self.transport.submit_shutdown.side_effect = TimeoutError("partial")
-        self.arm(coordinator)
-        for evidence in (sample(), pending_sample()):
+        operation = self.arm(coordinator)
+        for evidence in (sample(after=operation["submission_finished_at"]), pending_sample(after=operation["submission_finished_at"])):
             with self.assertRaises(UpsPowerBlocked):
                 coordinator.cancel(device=DEVICE, sample=evidence)
         self.transport.cancel_shutdown.assert_not_called()
@@ -563,18 +571,23 @@ class UpsPowerCoordinatorTests(unittest.TestCase):
         coordinator = self.make(profiles={profile["profile_id"]: profile})
         operation = self.arm(coordinator)
         operation.update(state="cancelling", cancel_attempted=True)
-        self.assertIs(validate_production_cancel_preflight(profile, operation, sample(), now_monotonic=110), True)
+        after_submission = sample(after=operation["submitted_at"])
+        self.assertIs(validate_production_cancel_preflight(profile, operation, after_submission, now_monotonic=110), True)
         for changes in ({"owner_pid": -1}, {"owner_pid": True}, {"state": "submitted"}, {"interrupted": True},
                         {"submission_complete": False}, {"profile_id": "other"}, {"device_fingerprint": "0" * 64},
                         {"started_monotonic": float("nan")}, {"cancel_attempted": False}):
             with self.subTest(changes=changes), self.assertRaises(UpsPowerBlocked):
-                validate_production_cancel_preflight(profile, {**operation, **changes}, sample(), now_monotonic=110)
-        for evidence in (sample(output_voltage=0), sample(low_battery=True), sample(fault=True),
-                         sample(timestamp=operation["submitted_at"]), sample(raw_flags={})):
+                validate_production_cancel_preflight(profile, {**operation, **changes}, after_submission, now_monotonic=110)
+        submitted_at = datetime.fromisoformat(operation["submitted_at"].replace("Z", "+00:00"))
+        for evidence in (sample(after=operation["submitted_at"], output_voltage=0),
+                         sample(after=operation["submitted_at"], low_battery=True),
+                         sample(after=operation["submitted_at"], fault=True),
+                         sample(timestamp=(submitted_at - timedelta(milliseconds=1)).isoformat()),
+                         sample(timestamp=operation["submitted_at"]), sample(after=operation["submitted_at"], raw_flags={})):
             with self.subTest(evidence=evidence), self.assertRaises(UpsPowerBlocked):
                 validate_production_cancel_preflight(profile, operation, evidence, now_monotonic=110)
         with self.assertRaises(UpsPowerBlocked):
-            validate_production_cancel_preflight(profile, operation, sample(), now_monotonic=270)
+            validate_production_cancel_preflight(profile, operation, after_submission, now_monotonic=270)
 
     def test_start_worker_requires_immediate_battery_sample_remaining_reserve_and_original_arming_phase(self):
         operation = self.arm()
@@ -630,18 +643,18 @@ class UpsPowerCoordinatorTests(unittest.TestCase):
         coordinator = UpsPowerCoordinator(self.path, validated_profiles=self.profiles, clock=self.clock)
         with patch("ups_monitor.hid_windows.ControlTransport", return_value=self.transport) as native:
             armed = self.arm(coordinator)
-            coordinator.cancel(device=DEVICE, sample=pending_sample())
+            coordinator.cancel(device=DEVICE, sample=pending_sample(after=armed["submitted_at"]))
         native.assert_called_once_with(DEVICE["path"], self.profile["profile_id"], journal_path=self.path,
                                        operation_id=armed["operation_id"])
 
     def test_suspend_and_missing_continuous_observation_require_review_without_replaying_control(self):
         profile = unreliable_profile()
         coordinator = self.make(profiles={profile["profile_id"]: profile})
-        self.arm(coordinator)
+        operation = self.arm(coordinator)
         self.clock.return_value = 110
-        coordinator.cancel(device=DEVICE, sample=sample())
+        cancelled = coordinator.cancel(device=DEVICE, sample=sample(after=operation["submitted_at"]))
         self.clock.return_value = 310
-        self.assertEqual(coordinator.observe(device=DEVICE, sample=sample())["state"], "review_required")
+        self.assertEqual(coordinator.observe(device=DEVICE, sample=sample(after=cancelled["cancel_submitted_at"]))["state"], "review_required")
         with self.assertRaises(UpsPowerBlocked):
             coordinator.cancel(device=DEVICE, sample=pending_sample())
         self.assertTrue(OperationJournal(self.path).load()["interrupted"])

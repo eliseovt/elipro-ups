@@ -10,7 +10,7 @@ import tempfile
 import time
 from types import SimpleNamespace
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 import uuid
 
 from ups_monitor.core import Store, iso_utc
@@ -22,6 +22,12 @@ from ups_monitor.ups_power import NT2402PRO_CANDIDATE_PROFILE, UpsPowerBlocked
 
 class BatteryTestApiTests(unittest.TestCase):
     def setUp(self):
+        # A recently booted Windows runner can have less than 211 s of uptime.
+        # Advance a controlled monotonic clock instead of making journal times negative.
+        self.clock = Mock(return_value=100.0)
+        clock_patch = patch("time.monotonic", self.clock)
+        clock_patch.start()
+        self.addCleanup(clock_patch.stop)
         self.directory = tempfile.TemporaryDirectory(dir=Path(__file__).parent)
         self.addCleanup(self.directory.cleanup)
         self.root = Path(self.directory.name)
@@ -218,7 +224,7 @@ class BatteryTestApiTests(unittest.TestCase):
     def test_resume_never_replays_and_observations_only_record_metadata(self):
         self.battery()
         result = self.monitor.run_ups_battery_test(acknowledge_risk=True)
-        self.test._save(started_monotonic=self.test._operation["started_monotonic"] - 211)
+        self.clock.return_value += 211
         self.monitor.handle_power_event("suspend")
         self.monitor.snapshot()
         self.monitor.handle_power_event("resume")
@@ -229,6 +235,7 @@ class BatteryTestApiTests(unittest.TestCase):
                 "hibernate_resumed": True, "automatic_return_observed": False, "acknowledge_observation": True}
         handler = self.handler("confirm-observation", body)
         handler.do_POST()
+        self.assertEqual(handler._json.call_args.args[1:], (), handler._json.call_args)
         status = handler._json.call_args.args[0]["ups_battery_test"]
         self.assertEqual(status["result"], "battery_cut_manual_restart_observed")
         self.assertFalse(status["production_validated"])

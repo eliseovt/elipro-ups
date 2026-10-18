@@ -8,7 +8,7 @@ import tempfile
 import threading
 from types import SimpleNamespace
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 import uuid
 
 from ups_monitor.core import Store
@@ -19,6 +19,12 @@ from ups_monitor.ups_power import NT2402PRO_CANDIDATE_PROFILE, UpsPowerBlocked
 
 class CancellationApiTests(unittest.TestCase):
     def setUp(self):
+        # A recently booted Windows runner can have less than 211 s of uptime.
+        # Advance a controlled monotonic clock instead of making journal times negative.
+        self.clock = Mock(return_value=100.0)
+        clock_patch = patch("time.monotonic", self.clock)
+        clock_patch.start()
+        self.addCleanup(clock_patch.stop)
         test_root = Path(__file__).resolve().parents[1] / ".test-data"
         self.directory = tempfile.TemporaryDirectory(dir=test_root)
         self.addCleanup(self.directory.cleanup)
@@ -41,8 +47,8 @@ class CancellationApiTests(unittest.TestCase):
         self.monitor.tick()
 
     @staticmethod
-    def sample():
-        return {"timestamp": datetime.now(timezone.utc).isoformat(), "on_battery": False, "low_battery": False,
+    def sample(timestamp=None):
+        return {"timestamp": timestamp or datetime.now(timezone.utc).isoformat(), "on_battery": False, "low_battery": False,
                 "fault": False, "output_voltage": 220, "raw_status": "Line mode", "raw_flags": {"status_hex": "09"}}
 
     def handler(self, suffix="start", body=None, token=None):
@@ -101,10 +107,20 @@ class CancellationApiTests(unittest.TestCase):
 
     def test_cancel_fetches_fresh_pending_qs_and_is_once_only(self):
         self.monitor.run_ups_cancel_test(acknowledge_risk=True)
-        self.adapter.read.side_effect = lambda: {**self.sample(), "on_battery": None,
+        submitted = datetime.fromisoformat(self.test._operation["submitted_at"])
+        # The same wall-clock tick cannot prove a read happened after the write.
+        self.adapter.read.side_effect = lambda: {**self.sample(submitted.isoformat()), "on_battery": None,
+                                                "raw_status": "Shutdown mode", "raw_flags": {"status_hex": "0B"}}
+        at_submission = self.handler("cancel")
+        at_submission.do_POST()
+        self.assertEqual(at_submission._json.call_args.args[1], 400)
+        self.usb.cancel_test.assert_not_called()
+        after_submission = (submitted + timedelta(milliseconds=1)).isoformat()
+        self.adapter.read.side_effect = lambda: {**self.sample(after_submission), "on_battery": None,
                                                 "raw_status": "Shutdown mode", "raw_flags": {"status_hex": "0B"}}
         handler = self.handler("cancel")
         handler.do_POST()
+        self.assertEqual(handler._json.call_args.args[1:], (), handler._json.call_args)
         self.assertEqual(handler._json.call_args.args[0]["ups_cancel_test"]["state"], "cancel_submitted")
         self.usb.cancel_test.assert_called_once()
         handler.do_POST()
@@ -134,7 +150,7 @@ class CancellationApiTests(unittest.TestCase):
 
     def test_missing_signal_creates_one_critical_notice_and_no_automatic_cancel(self):
         self.monitor.run_ups_cancel_test(acknowledge_risk=True)
-        self.test._save(started_monotonic=self.test._operation["started_monotonic"] - 11)
+        self.clock.return_value += 11
         self.monitor.tick()
         self.monitor.tick()
         notices = [event for event in self.monitor.events() if event["kind"] == "ups_cancel_test_unconfirmed"]
@@ -146,7 +162,7 @@ class CancellationApiTests(unittest.TestCase):
     def test_review_close_requires_exact_physical_assertions_and_never_controls_ups(self):
         result = self.monitor.run_ups_cancel_test(acknowledge_risk=True)
         operation_id = result["ups_cancel_test"]["operation_id"]
-        self.test._save(started_monotonic=self.test._operation["started_monotonic"] - 211)
+        self.clock.return_value += 211
         self.test.interrupted()
         payload = {"operation_id": operation_id, "output_cut_observed": True,
                    "pending_signal_not_reported": True, "manual_start_observed": True}
@@ -155,6 +171,7 @@ class CancellationApiTests(unittest.TestCase):
         self.assertEqual(invalid._json.call_args.args[1], 400)
         handler = self.handler("close", payload)
         handler.do_POST()
+        self.assertEqual(handler._json.call_args.args[1:], (), handler._json.call_args)
         closed = handler._json.call_args.args[0]
         self.assertEqual(closed["ups_cancel_test"]["result"], "cut_observed_cancel_not_tested")
         self.assertFalse(closed["ups_cancel_test"]["production_validated"])
@@ -165,10 +182,12 @@ class CancellationApiTests(unittest.TestCase):
 
     def test_independent_load_report_is_metadata_after_the_complete_original_deadline(self):
         started = self.monitor.run_ups_cancel_test(acknowledge_risk=True)
-        self.adapter.read.side_effect = lambda: {**self.sample(), "on_battery": None,
+        submitted = datetime.fromisoformat(self.test._operation["submitted_at"])
+        after_submission = (submitted + timedelta(milliseconds=1)).isoformat()
+        self.adapter.read.side_effect = lambda: {**self.sample(after_submission), "on_battery": None,
                                                 "raw_status": "Shutdown mode", "raw_flags": {"status_hex": "0B"}}
         self.monitor.run_ups_cancel_test(cancel=True)
-        self.test._save(started_monotonic=self.test._operation["started_monotonic"] - 211)
+        self.clock.return_value += 211
         self.test.interrupted()
         self.adapter.read.side_effect = self.sample
         self.monitor.tick()
@@ -176,6 +195,7 @@ class CancellationApiTests(unittest.TestCase):
                 "outputs_stayed_on": True, "independent_load_observed": True}
         handler = self.handler("confirm-observation", body)
         handler.do_POST()
+        self.assertEqual(handler._json.call_args.args[1:], (), handler._json.call_args)
         result = handler._json.call_args.args[0]
         self.assertEqual(result["ups_cancel_test"]["result"], "cancel_observed_by_user")
         self.assertFalse(result["ups_cancel_test"]["production_validated"])
