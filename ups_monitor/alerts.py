@@ -37,6 +37,15 @@ _EVENTS = {
     "simulation": ("Prueba de protección sin apagado", "info"),
 }
 _PERSISTENT = frozenset(("battery_low", "overload", "ups_fault", "policy_countdown"))
+# These observations form persistence barriers. The history worker flushes
+# queued telemetry and the transition together; selecting an alert never waits
+# for SQLite or asks the desktop notifier to make a durability decision.
+CRITICAL_HISTORY_EVENTS = frozenset((
+    "power_lost", "power_restored", "battery_low", "overload", "ups_fault",
+    "connection_lost", "connection_restored", "monitor_error", "monitor_restarted",
+    "policy_countdown", "policy_cancelled", "policy_action_started", "policy_action_failed",
+    "policy_unknown",
+))
 _CONDITION_MESSAGES = {
     "battery_low": "El UPS continúa indicando batería baja. Revisa el estado del equipo.",
     "overload": "El UPS continúa indicando una carga igual o superior al 100 %.",

@@ -173,7 +173,7 @@ class ServiceTests(unittest.TestCase):
                                    dry_run=True, observe_hours=0)
             monitor = Mock()
             monitor.engine.policy = {"enabled": False}
-            monitor.thread = monitor.supervisor_thread = None
+            monitor.thread = monitor.supervisor_thread = monitor.processor_thread = None
             monitor.stop_event = threading.Event()
             stopped, ready = threading.Event(), Mock()
             stopped.set()

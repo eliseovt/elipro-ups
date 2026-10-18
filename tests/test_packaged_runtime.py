@@ -47,12 +47,11 @@ class PackagedRuntimeTests(unittest.TestCase):
     def test_frozen_hid_uses_safe_internal_role_with_original_bounds(self):
         with patch.object(sys, "frozen", True, create=True), \
                 patch.dict(hid_windows._cooldown_until, {}, clear=True), \
-                patch("ups_monitor.hid_windows.subprocess.run") as run:
+                patch("ups_monitor.hid_windows._run_bounded_worker") as run:
             run.return_value = Mock(returncode=0, stdout=b"#sample\r", stderr=b"")
             self.assertEqual(hid_windows.StatusTransport(HID_PATH).query_status(), b"#sample\r")
             self.assertEqual(run.call_args.args[0], [sys.executable, "qs-worker", HID_PATH])
-            self.assertEqual(run.call_args.kwargs["timeout"], 3)
-            self.assertTrue(run.call_args.kwargs["capture_output"])
+            self.assertEqual(run.call_args.args[1], HID_PATH.casefold())
 
     def test_smoke_checks_resources_without_usb_or_process_or_data_creation(self):
         with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as directory:

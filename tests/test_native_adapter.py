@@ -16,6 +16,29 @@ def metadata(**changes):
 
 
 class NativeAdapterTests(unittest.TestCase):
+    def test_reconnection_backoff_is_exponential_capped_and_success_resets(self):
+        clock = Mock(return_value=100)
+        adapter = NativeHidAdapter(clock=clock)
+        with patch("ups_monitor.native_adapter.forza_monitor_running", return_value=False), \
+             patch("ups_monitor.native_adapter.enumerate_ups", return_value=[]) as enumerate_hid:
+            for delay in (2, 4, 8, 16, 30, 30):
+                before = enumerate_hid.call_count
+                with self.assertRaises(TelemetryError):
+                    adapter.read()
+                self.assertEqual(adapter.retry_after_seconds, delay)
+                with self.assertRaises(TelemetryError):
+                    adapter.read()
+                self.assertEqual(enumerate_hid.call_count, before + 1)
+                clock.return_value += delay
+        transport = Mock()
+        transport.query_status.return_value = FRAME
+        with patch("ups_monitor.native_adapter.forza_monitor_running", return_value=False), \
+             patch("ups_monitor.native_adapter.enumerate_ups", return_value=[metadata()]), \
+             patch("ups_monitor.native_adapter.StatusTransport", return_value=transport):
+            self.assertFalse(adapter.read()["on_battery"])
+        self.assertEqual(adapter.retry_after_seconds, 0)
+        self.assertEqual(adapter._failures, 0)
+
     def test_forza_active_blocks_every_native_query_including_cached_transport(self):
         adapter = NativeHidAdapter()
         existing = Mock()

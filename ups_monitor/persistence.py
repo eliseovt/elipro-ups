@@ -9,12 +9,13 @@ from __future__ import annotations
 import copy
 import itertools
 import json
+import math
 import threading
 import time
 from collections import deque
 from dataclasses import dataclass
 
-from .alerts import DEFAULT_NOTIFICATION_SETTINGS, validate_notification_settings
+from .alerts import CRITICAL_HISTORY_EVENTS, DEFAULT_NOTIFICATION_SETTINGS, validate_notification_settings
 from .core import DEFAULT_POLICY, SAMPLE_FIELDS, Store, _timestamp, iso_utc, validate_policy
 
 
@@ -26,6 +27,8 @@ class HistoryUnavailable(RuntimeError):
 class _Write:
     kind: str
     value: dict
+    queued_at: float
+    urgent: bool = False
 
 
 class ResilientStore:
@@ -35,6 +38,10 @@ class ResilientStore:
     and ``status`` only read memory. ``close(timeout)`` returns True only when the
     worker stopped and all accepted writes were flushed; a still-running worker
     keeps ownership of its connection and closes it itself after its operation.
+
+    Continuous records share transactions of up to 32 entries and wait at most
+    30 seconds. Electrical transitions/alarms bypass that wait; a failed disk
+    keeps its independent retry backoff. Configuration stays synchronous.
     """
 
     @classmethod
@@ -45,16 +52,24 @@ class ResilientStore:
         return result
 
     def __init__(self, path, *, store_factory=None, capacity=512, event_limit=1000,
-                 retry_seconds=2.0, max_retry_seconds=30.0, clock=time.monotonic):
+                 retry_seconds=2.0, max_retry_seconds=30.0, batch_size=32,
+                 batch_latency_seconds=30.0, clock=time.monotonic):
         if type(capacity) is not int or capacity < 1:
             raise ValueError("capacity debe ser un entero positivo")
         if type(event_limit) is not int or not 1 <= event_limit <= 1000:
             raise ValueError("event_limit debe estar entre 1 y 1000")
         if retry_seconds <= 0 or max_retry_seconds < retry_seconds:
             raise ValueError("Intervalo de reintento inválido")
+        if type(batch_size) is not int or not 1 <= batch_size <= 512:
+            raise ValueError("batch_size debe ser entero entre 1 y 512")
+        if (type(batch_latency_seconds) not in (int, float) or
+                not math.isfinite(batch_latency_seconds) or not 0 < batch_latency_seconds <= 60):
+            raise ValueError("batch_latency_seconds debe estar entre 0 y 60 segundos")
         self.path = path
         self._factory = store_factory or (lambda value: Store(value, busy_timeout_ms=100))
         self._capacity, self._clock = capacity, clock
+        self._batch_size = min(batch_size, capacity)
+        self._batch_latency = batch_latency_seconds
         self._retry_seconds, self._max_retry_seconds = retry_seconds, max_retry_seconds
         self._retry_delay, self._retry_at = retry_seconds, 0.0
         self._condition = threading.Condition(threading.RLock())
@@ -63,7 +78,9 @@ class ResilientStore:
         self._queue, self._events = deque(), deque(maxlen=event_limit)
         self._settings = {}
         self._next_event_id = -1
-        self._backend = self._thread = self._inflight = None
+        self._backend = self._thread = None
+        self._inflight = ()
+        self._last_sample_state = None
         self._closing = self._closed = False
         self._close_deadline = None
         self._dropped = 0
@@ -180,9 +197,9 @@ class ResilientStore:
                 # Keep critical events ahead of expendable graph samples, and
                 # never evict an entry currently being written.
                 candidate = next((value for value in self._queue
-                                  if value.kind == "sample" and value is not self._inflight), None)
+                                  if value.kind == "sample" and value not in self._inflight), None)
                 if candidate is None and entry.kind == "event":
-                    candidate = next((value for value in self._queue if value is not self._inflight), None)
+                    candidate = next((value for value in self._queue if value not in self._inflight), None)
                 self._dropped += 1
                 if candidate is None:
                     return
@@ -190,12 +207,22 @@ class ResilientStore:
             self._queue.append(entry)
             self._condition.notify_all()
 
-    def add_sample(self, sample):
+    def add_sample(self, sample, *, urgent=False):
         value = {field: sample.get(field) for field in SAMPLE_FIELDS}
         value["timestamp"] = iso_utc(_timestamp(sample["timestamp"]))
         value["watts_is_estimate"] = sample.get("watts_is_estimate") is True
         json.dumps(value, allow_nan=False)
-        self._enqueue(_Write("sample", copy.deepcopy(value)))
+        load, battery = value.get("load_percent"), value.get("battery_percent")
+        sample_state = (value.get("on_battery") is True, value.get("low_battery") is True,
+                        value.get("fault") is True,
+                        type(load) in (int, float) and load >= 100,
+                        type(battery) in (int, float) and battery <= 20)
+        with self._condition:
+            # A first healthy read may wait for its batch; a first alarm cannot.
+            changed = (sample_state != self._last_sample_state if self._last_sample_state is not None
+                       else any(sample_state))
+            self._last_sample_state = sample_state
+            self._enqueue(_Write("sample", copy.deepcopy(value), self._clock(), urgent or changed))
         return value
 
     def add_event(self, kind, message, data=None, *, timestamp=None):
@@ -207,7 +234,7 @@ class ResilientStore:
                      "message": message, "data": data}
             self._next_event_id -= 1
             self._events.appendleft(value)
-        self._enqueue(_Write("event", value))
+        self._enqueue(_Write("event", value, self._clock(), kind in CRITICAL_HISTORY_EVENTS))
         return copy.deepcopy(value)
 
     def events(self, limit=100):
@@ -307,6 +334,8 @@ class ResilientStore:
                 message = "Historial activo."
             return {"available": available, "state": state, "message": message,
                     "pending": len(self._queue), "dropped": self._dropped,
+                    "batch_size": self._batch_size,
+                    "batch_latency_seconds": self._batch_latency,
                     "last_error": self._error, "last_failure_at": self._last_failure_at,
                     "last_success_at": self._last_success_at,
                     "configuration_warning": " ".join(self._configuration_warnings) or None}
@@ -317,6 +346,36 @@ class ResilientStore:
                 return
             self._thread = threading.Thread(target=self._run, name="ups-history", daemon=True)
             self._thread.start()
+
+    def _acknowledge(self, entries, results):
+        """Publish committed IDs and remove only the confirmed queue prefix."""
+        with self._condition:
+            for entry, result in zip(entries, results):
+                if not self._queue or self._queue[0] is not entry:
+                    raise RuntimeError("Se perdió el orden de la cola del historial")
+                self._queue.popleft()
+                if entry.kind == "event":
+                    entry.value["id"] = result["id"]
+            self._condition.notify_all()
+
+    def _persist_batch(self, entries):
+        # An explicitly implemented optional method is the atomic contract.
+        # Avoid treating a Mock's automatically invented attribute as support.
+        batch_writer = getattr(type(self._backend), "write_batch", None)
+        if callable(batch_writer):
+            results = self._backend.write_batch([(entry.kind, entry.value) for entry in entries])
+            self._acknowledge(entries, results)
+            return
+        # Compatible adapters commit one at a time. Acknowledge each success
+        # before attempting the next, so a partial failure cannot duplicate it.
+        for entry in entries:
+            value = entry.value
+            if entry.kind == "event":
+                result = self._backend.add_event(value["kind"], value["message"], value["data"],
+                                                 timestamp=value["timestamp"])
+            else:
+                result = self._backend.add_sample(value)
+            self._acknowledge((entry,), (result,))
 
     def _run(self):
         try:
@@ -339,8 +398,14 @@ class ResilientStore:
                             delay = min(delay, max(0, self._close_deadline - now))
                         self._condition.wait(timeout=delay)
                         continue
-                    entry = self._queue[0] if self._queue else None
-                    self._inflight = entry
+                    if self._queue and not self._closing:
+                        deadline = self._queue[0].queued_at + self._batch_latency
+                        urgent = any(value.urgent for value in self._queue)
+                        if len(self._queue) < self._batch_size and not urgent and now < deadline:
+                            self._condition.wait(timeout=deadline - now)
+                            continue
+                    entries = tuple(itertools.islice(self._queue, self._batch_size))
+                    self._inflight = entries
                 try:
                     with self._io_lock:
                         if self._backend is None:
@@ -348,7 +413,7 @@ class ResilientStore:
                             with self._condition:
                                 self._backend = backend
                             self._succeeded("open")
-                        if entry is None:
+                        if not entries:
                             self._backend.events(1)
                             self._succeeded("events")
                             with self._condition:
@@ -357,26 +422,16 @@ class ResilientStore:
                                 self._backend.history(hours=0.001, max_points=2)
                                 self._succeeded("read")
                             self._succeeded("open")
-                            event = None
-                        elif entry.kind == "event":
-                            value = entry.value
-                            event = self._backend.add_event(value["kind"], value["message"], value["data"],
-                                                            timestamp=value["timestamp"])
                         else:
-                            self._backend.add_sample(entry.value)
-                            event = None
+                            self._persist_batch(entries)
                     with self._condition:
-                        if entry is not None and self._queue and self._queue[0] is entry:
-                            self._queue.popleft()
-                        if event is not None:
-                            entry.value["id"] = event["id"]
-                        self._inflight = None
-                    if entry is not None:
+                        self._inflight = ()
+                    if entries:
                         self._succeeded("write")
                 except Exception as exc:
                     with self._condition:
-                        self._inflight = None
-                    self._failed(exc, "write" if entry is not None else "read")
+                        self._inflight = ()
+                    self._failed(exc, "write" if entries else "read")
         finally:
             # Only the worker closes its connection, even if close() timed out.
             # No request can enter _read/set_setting after _closing was set.

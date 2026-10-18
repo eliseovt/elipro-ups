@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import ctypes
 import hashlib
+import json
 import os
 import math
 import subprocess
@@ -29,6 +30,10 @@ PRODUCT_ID = 0x5161
 STATUS_QUERY = b"QS\r"
 _cooldown_until = {}
 _cooldown_lock = threading.Lock()
+_active_workers = {}
+_worker_lock = threading.Lock()
+WORKER_TIMEOUT_SECONDS = 3
+CANCELLATION_GRACE_SECONDS = 0.5
 
 
 class GUID(ctypes.Structure):
@@ -216,6 +221,8 @@ def _validate_path(path):
 
 def _read_report(kernel, handle, event, deadline):
     """Keep buffer/OVERLAPPED alive until completion, even after cancellation."""
+    if time.monotonic() >= deadline:
+        raise TimeoutError("El plazo de lectura HID ya terminó")
     report = ctypes.create_string_buffer(9)
     overlapped = OVERLAPPED()
     overlapped.hEvent = event
@@ -298,6 +305,8 @@ def _query_status_once(path):
             raise ctypes.WinError(ctypes.get_last_error())
         if not hid.HidD_FlushQueue(handle):
             raise ctypes.WinError(ctypes.get_last_error())
+        if time.monotonic() >= deadline:
+            raise TimeoutError("El plazo HID terminó antes de enviar QS")
         # Output report 0, eight payload bytes; no alternate commands/framing.
         output = ctypes.create_string_buffer(b"\x00QS\r\x00\x00\x00\x00\x00", 9)
         if not hid.HidD_SetOutputReport(handle, output, 9):
@@ -318,6 +327,77 @@ def _query_status_once(path):
         kernel.CloseHandle(mutex)
 
 
+def _run_bounded_worker(args, key):
+    """Bound both response and cancellation, retaining uncertain live workers.
+
+    subprocess.run(timeout=...) performs an unbounded communicate after killing
+    on Windows. A driver may delay that termination. Keep such a child strongly
+    referenced and quarantine its path until poll confirms exit; never open a
+    second reader and never free its pending OVERLAPPED buffers in the parent.
+    """
+    with _worker_lock:
+        previous = _active_workers.get(key)
+        if previous is not None:
+            if previous.poll() is None:
+                raise TimeoutError("El lector HID anterior aún no terminó; USB en cuarentena")
+            _active_workers.pop(key, None)
+        child = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                 cwd=str(resource_root()),
+                                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        _active_workers[key] = child
+    try:
+        try:
+            stdout, stderr = child.communicate(timeout=WORKER_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired as exc:
+            try:
+                child.kill()
+            except OSError:
+                # Exit may race kill. If it is still alive, retain quarantine.
+                if child.poll() is None:
+                    raise TimeoutError("No se confirmó la terminación del lector HID; USB en cuarentena") from exc
+            try:
+                child.communicate(timeout=CANCELLATION_GRACE_SECONDS)
+            except subprocess.TimeoutExpired:
+                raise TimeoutError("El lector HID no terminó tras cancelar; USB en cuarentena") from exc
+            raise TimeoutError("El diagnóstico HID excedió 3 segundos y fue terminado") from exc
+        return subprocess.CompletedProcess(args, child.returncode, stdout, stderr)
+    finally:
+        with _worker_lock:
+            if child.poll() is not None and _active_workers.get(key) is child:
+                _active_workers.pop(key, None)
+
+
+def enumerate_ups_bounded():
+    """Discover metadata in the same bounded isolation as status transactions.
+
+    SetupAPI/HidD metadata calls have no cancellable Win32 deadline. They must
+    never execute in the monitor process, even before its first status query.
+    This fixed internal role sends no UPS command and accepts no caller flags.
+    """
+    result = _run_bounded_worker(child_command("qs-worker", "--enumerate"), "metadata:0665:5161")
+    if result.returncode:
+        raise OSError("No se completó la enumeración HID aislada")
+    if not result.stdout or len(result.stdout) > 65536:
+        raise OSError("La enumeración HID excedió el tamaño permitido")
+    try:
+        devices = json.loads(result.stdout)
+        if not isinstance(devices, list) or len(devices) > 16:
+            raise ValueError("Lista HID no válida")
+        for device in devices:
+            if not isinstance(device, dict) or type(device.get("metadata_open")) is not bool:
+                raise ValueError("Metadatos HID no válidos")
+            _validate_path(device.get("path"))
+            for name, expected in (("vendor_id", VENDOR_ID), ("product_id", PRODUCT_ID)):
+                if type(device.get(name)) is not int or device[name] != expected:
+                    raise ValueError("Identificador USB no válido")
+            for name in ("input_report_bytes", "output_report_bytes", "feature_report_bytes"):
+                if name in device and (type(device[name]) is not int or not 0 <= device[name] <= 65535):
+                    raise ValueError("Tamaño de reporte HID no válido")
+        return devices
+    except (ValueError, TypeError, UnicodeError) as exc:
+        raise OSError("El proceso devolvió metadatos HID no válidos") from exc
+
+
 class StatusTransport:
     """QS-only transport validated against this NT-2402PRO while online.
 
@@ -326,7 +406,8 @@ class StatusTransport:
 
     HidD_SetOutputReport is synchronous; Windows cancellation may also wait for a
     driver. A child process contains both operations so a hung driver cannot block
-    the caller beyond three seconds under normal Windows process cancellation.
+    the caller beyond 3 seconds plus a 0.5-second cancellation grace. If process
+    exit cannot be confirmed, that USB path remains quarantined until it exits.
     """
 
     def __init__(self, path):
@@ -341,12 +422,7 @@ class StatusTransport:
                 raise TimeoutError("USB en espera de seguridad tras una respuesta fallida (5 segundos)")
         args = child_command("qs-worker", self.path)
         try:
-            try:
-                result = subprocess.run(args, capture_output=True, timeout=3,
-                                        cwd=str(resource_root()),
-                                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-            except subprocess.TimeoutExpired as exc:
-                raise TimeoutError("El diagnóstico HID excedió 3 segundos y fue terminado") from exc
+            result = _run_bounded_worker(args, key)
             if result.returncode:
                 raise OSError(result.stderr.decode("utf-8", "replace").strip()[:500] or "Falló el diagnóstico HID")
             if not result.stdout or len(result.stdout) > 256 or not result.stdout.endswith(b"\r"):
@@ -363,6 +439,12 @@ def worker_main(argv):
     if len(argv) != 1:
         raise SystemExit("Uso interno: diagnóstico QS aislado")
     try:
+        if argv[0] == "--enumerate":
+            payload = json.dumps(enumerate_ups(), allow_nan=False).encode("utf-8")
+            if len(payload) > 65536:
+                raise OSError("Demasiados metadatos HID")
+            sys.stdout.buffer.write(payload)
+            return 0
         sys.stdout.buffer.write(_query_status_once(argv[0]))
         return 0
     except Exception as exc:

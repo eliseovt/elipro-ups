@@ -289,6 +289,121 @@ class PersistenceTests(unittest.TestCase):
         eventually(closed.is_set)
         self.assertEqual(store.status()["state"], "stopped")
 
+    def test_continuous_samples_share_one_transaction_at_batch_size(self):
+        store, backend = self.memory(batch_size=8, batch_latency_seconds=2)
+        statements = []
+        backend._db.set_trace_callback(statements.append)
+        for number in range(8):
+            store.add_sample({"timestamp": iso_utc(), "on_battery": False,
+                              "battery_voltage": 27 + number / 100})
+        store.start()
+        eventually(lambda: store.status()["pending"] == 0)
+        self.assertEqual(len(backend.history()), 8)
+        self.assertEqual(sum(value == "COMMIT" for value in statements), 1)
+
+    def test_partial_normal_batch_flushes_at_latency_deadline(self):
+        store, backend = self.memory(batch_latency_seconds=0.04)
+        store.start()
+        store.add_sample({"timestamp": iso_utc(), "on_battery": False})
+        eventually(lambda: store.status()["pending"] == 0, timeout=0.5)
+        self.assertEqual(len(backend.history()), 1)
+
+    def test_info_waits_but_critical_event_flushes_pending_samples_in_order(self):
+        store, backend = self.memory(batch_latency_seconds=2)
+        statements = []
+        backend._db.set_trace_callback(statements.append)
+        store.start()
+        store.add_sample({"timestamp": iso_utc(), "on_battery": False})
+        store.add_event("simulation", "Información")
+        self.assertEqual(store.status()["pending"], 2)
+        store.add_event("power_lost", "Corte")
+        eventually(lambda: store.status()["pending"] == 0, timeout=0.5)
+        writes = [value for value in statements if value.startswith("INSERT INTO")]
+        self.assertEqual(len(writes), 3)
+        self.assertIn("samples", writes[0])
+        self.assertIn("'simulation'", writes[1])
+        self.assertIn("'power_lost'", writes[2])
+        self.assertEqual(sum(value == "COMMIT" for value in statements), 1)
+
+    def test_sample_alarm_transition_flushes_without_requiring_an_event(self):
+        store, backend = self.memory(batch_latency_seconds=2)
+        store.start()
+        store.add_sample({"timestamp": iso_utc(), "on_battery": False})
+        store.add_sample({"timestamp": iso_utc(), "on_battery": True, "low_battery": True})
+        eventually(lambda: store.status()["pending"] == 0, timeout=0.5)
+        self.assertEqual(len(backend.history()), 2)
+
+    def test_close_forces_partial_batch_to_disk(self):
+        test_root = Path(__file__).resolve().parents[1] / ".test-data"
+        test_root.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=test_root) as directory:
+            path = Path(directory) / "history.sqlite3"
+            disk = ResilientStore.open(path, batch_latency_seconds=2)
+            self.backends.append(disk)
+            disk.start()
+            disk.add_sample({"timestamp": iso_utc(), "on_battery": False})
+            self.assertTrue(disk.close(timeout=0.5))
+            check = Store(path)
+            try:
+                self.assertEqual(len(check.history()), 1)
+            finally:
+                check.close()
+
+    def test_failed_atomic_batch_rolls_back_then_recovers_without_duplicates(self):
+        store, backend = self.memory(batch_latency_seconds=2)
+        original = backend.add_event
+        backend.add_event = Mock(side_effect=sqlite3.OperationalError("disk full"))
+        store.add_sample({"timestamp": iso_utc(), "on_battery": False})
+        event = store.add_event("power_lost", "Corte")
+        store.start()
+        eventually(lambda: store.status()["last_error"] is not None)
+        self.assertEqual(backend.history(), [])
+        self.assertEqual(store.status()["pending"], 2)
+        self.assertLess(event["id"], 0)
+        backend.add_event = original
+        eventually(lambda: store.status()["pending"] == 0)
+        self.assertEqual(len(backend.history()), 1)
+        self.assertEqual(len(backend.events()), 1)
+        self.assertGreater(store.events()[0]["id"], 0)
+
+    def test_legacy_backend_acknowledges_partial_success_before_retry(self):
+        class LegacyBackend:
+            def __init__(self):
+                self.samples, self.saved_events = [], []
+                self.failed = False
+
+            def events(self, limit):
+                return self.saved_events[:limit]
+
+            def get_setting(self, key, default):
+                return default
+
+            def add_sample(self, sample):
+                self.samples.append(sample)
+
+            def add_event(self, kind, message, data, *, timestamp):
+                if not self.failed:
+                    self.failed = True
+                    raise sqlite3.OperationalError("busy")
+                value = {"id": 1, "kind": kind, "message": message, "data": data,
+                         "timestamp": timestamp}
+                self.saved_events.append(value)
+                return value
+
+            def close(self):
+                pass
+
+        backend = LegacyBackend()
+        store = ResilientStore.open("fake", store_factory=lambda path: backend,
+                                    retry_seconds=0.02, max_retry_seconds=0.05)
+        self.backends.append(store)
+        store.add_sample({"timestamp": iso_utc(), "on_battery": False})
+        store.add_event("power_lost", "Corte")
+        store.start()
+        eventually(lambda: store.status()["pending"] == 0)
+        self.assertEqual(len(backend.samples), 1)
+        self.assertEqual(len(backend.saved_events), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

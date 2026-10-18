@@ -261,6 +261,7 @@ class ServerTests(unittest.TestCase):
         monitor.engine.policy = {"enabled": False}
         monitor.thread.is_alive.return_value = False
         monitor.supervisor_thread.is_alive.return_value = False
+        monitor.processor_thread = None
         store.close.return_value = True
         with tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parent) as directory:
             with patch("sys.argv", ["elipro", "--data-dir", directory, "--dry-run"]), \
@@ -279,6 +280,27 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(event.args[2], {"restart_count": 2})
         self.assertFalse(monitor.engine.policy["enabled"])
         ownership.close.assert_called_once_with()
+
+    def test_cleanup_keeps_database_and_ownership_for_unfinished_consumer(self):
+        monitor, server, store, ownership = Mock(), Mock(), Mock(), Mock()
+        monitor.engine.policy = {"enabled": False}
+        monitor.thread.is_alive.return_value = False
+        monitor.supervisor_thread.is_alive.return_value = False
+        monitor.processor_thread.is_alive.return_value = True
+        monitor.stop.side_effect = RuntimeError("Consumer still active")
+        with tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parent) as directory:
+            with patch("sys.argv", ["elipro", "--data-dir", directory]), \
+                 patch("ups_monitor.server.make_adapter"), \
+                 patch("ups_monitor.server.ResilientStore.open", return_value=store), \
+                 patch("ups_monitor.server.MonitorInstanceGuard", return_value=ownership), \
+                 patch("ups_monitor.server.Monitor", return_value=monitor), \
+                 patch("ups_monitor.server.WindowsNotifier"), \
+                 patch("ups_monitor.server.AlertManager"), \
+                 patch("ups_monitor.server.ThreadingHTTPServer", return_value=server), \
+                 patch("builtins.print"), self.assertRaisesRegex(RuntimeError, "Consumer"):
+                main()
+        store.close.assert_not_called()
+        ownership.close.assert_not_called()
 
 
 if __name__ == "__main__":
