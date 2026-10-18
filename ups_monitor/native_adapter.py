@@ -128,6 +128,7 @@ class NativeHidAdapter:
 
     def __init__(self, *, clock=None):
         self.transport = None
+        self._device_identity = None
         self._clock = clock or time.monotonic
         self._battery_estimator = Nt2402ProBatteryEstimator(clock=self._clock)
         self._failures = 0
@@ -172,6 +173,12 @@ class NativeHidAdapter:
     def retry_after_seconds(self):
         return max(0, self._retry_at - self._clock())
 
+    @property
+    def device_identity(self):
+        # The USB strings are generic: this is evidence for a profile, not a
+        # claim that control or a particular firmware has been validated.
+        return dict(self._device_identity) if self._device_identity is not None else None
+
     def read(self):
         if self.retry_after_seconds:
             raise TelemetryError("USB en reconexión automática; próximo intento tras el plazo de espera.")
@@ -188,6 +195,7 @@ class NativeHidAdapter:
         if result.state != "absent":
             self._battery_estimator.reset()
             self.transport = None
+            self._device_identity = None
             if result.state == "active":
                 raise TelemetryError("El colector ForzaTracker está activo. Detén ese lector antes de usar USB directo para evitar consultas simultáneas.")
             code = (f", winerror={result.winerror}" if result.winerror is not None else "")
@@ -211,7 +219,10 @@ class NativeHidAdapter:
                 if any(type(value) is not int for value in report_sizes) or report_sizes != (9, 9, 0):
                     raise TelemetryError("El descriptor HID no coincide con el validado para este UPS.")
                 self.transport = StatusTransport(device["path"])
+                self._device_identity = dict(device)
             sample = parse_qs(self.transport.query_status(), preserve_battery_precision=True)
+            if self._device_identity is not None:
+                self._device_identity["protocol"] = "T"
             sample.update(self._battery_estimator.update(sample))
             sample["battery_voltage"] = round(sample["battery_voltage"], 2)
             self._failures = 0
@@ -220,6 +231,7 @@ class NativeHidAdapter:
         except (OSError, ValueError, TelemetryError) as exc:
             self._battery_estimator.reset()
             self.transport = None
+            self._device_identity = None
             self._failures += 1
             self._retry_at = self._clock() + min(30, 2 ** min(self._failures, 5))
             raise TelemetryError("No se recibió una respuesta USB válida: " + str(exc)) from exc

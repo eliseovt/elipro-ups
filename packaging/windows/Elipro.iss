@@ -11,6 +11,9 @@
 #ifndef SecurityPreflight
   #error SecurityPreflight must be embedded by the build script.
 #endif
+#ifndef ServicePowerCapability
+  #error ServicePowerCapability must be embedded by the build script.
+#endif
 
 [Setup]
 AppId={{34C2FD4D-76D9-47E0-A699-21209C29CF5A}
@@ -73,6 +76,10 @@ Filename: "{app}\EliproLauncher.exe"; Parameters: "--background"; Flags: nowait 
 Filename: "{app}\EliproLauncher.exe"; Description: "Abrir el panel de Elipro UPS"; Flags: postinstall nowait runasoriginaluser skipifsilent unchecked
 
 [Code]
+var
+  PreservePowerActions: Boolean;
+  PreserveUpsPoweroff: Boolean;
+
 function RunServiceCommand(const Arguments: String): Boolean;
 var
   ResultCode: Integer;
@@ -91,6 +98,8 @@ var
   PreviousRedirection: Boolean;
 begin
   Result := '';
+  PreservePowerActions := False;
+  PreserveUpsPoweroff := False;
   if (ExpandConstant('{param:SERVICESELFTEST|0}') = '1') and
     (ExpandConstant('{param:SERVICESIMULATION|0}') = '1') then
   begin
@@ -105,7 +114,7 @@ begin
   end;
   if CheckForMutexes('Global\EliproUPS.Guardian') then
   begin
-    Result := 'Elipro sigue ejecutándose desde su carpeta de desarrollo. La instalación no lo cerrará. Finaliza la observación y cierra esa instancia antes de instalar.';
+    Result := 'Elipro sigue ejecutándose desde su carpeta de desarrollo. La instalación no lo cerrará. Cierra esa instancia antes de instalar para detener la vigilancia de forma ordenada.';
     Exit;
   end;
   // Execute embedded code through the trusted Windows PowerShell binary. No
@@ -124,6 +133,23 @@ begin
   end;
   if FileExists(ExpandConstant('{app}\Elipro.exe')) then
   begin
+    // Only the installed, ACL-validated executable may report an existing opt-in.
+    // The fixed helper parses status JSON; no command-line text is interpreted.
+    PreviousRedirection := EnableFsRedirection(False);
+    try
+      if not Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
+        '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand {#ServicePowerCapability}',
+        '', SW_HIDE, ewWaitUntilTerminated, ResultCode) or
+        ((ResultCode <> 0) and (ResultCode <> 1) and (ResultCode <> 3)) then
+      begin
+        Result := 'No se pudo comprobar la autorización de energía del servicio instalado. No se actualizó Elipro. Revisa el estado del servicio antes de reintentar.';
+        Exit;
+      end;
+      PreservePowerActions := (ResultCode = 1) or (ResultCode = 3);
+      PreserveUpsPoweroff := ResultCode = 3;
+    finally
+      EnableFsRedirection(PreviousRedirection);
+    end;
     // End this session's notifications before the planned service outage.
     // An unexpected service loss still warns through the running agent.
     if not Exec(ExpandConstant('{app}\Elipro.exe'), 'agent --stop',
@@ -136,7 +162,7 @@ begin
   end;
   if Result = '' then
     if CheckForMutexes('Global\EliproUPS.Monitor,Global\EliproUPS.Guardian') then
-      Result := 'Ya hay otro monitor de Elipro en ejecución. La instalación no lo cerrará. Finaliza la observación y cierra esa instancia antes de instalar; así conservarás la prueba actual.';
+      Result := 'Ya hay otro monitor de Elipro en ejecución. La instalación no lo cerrará. Cierra esa instancia antes de instalar para detener la vigilancia de forma ordenada.';
 end;
 
 procedure CurStepChanged(CurStep: TSetupStep);
@@ -151,6 +177,14 @@ begin
       Arguments := Arguments + ' --self-test';
     if ExpandConstant('{param:SERVICESIMULATION|0}') = '1' then
       Arguments := Arguments + ' --simulate';
+    if PreservePowerActions and
+      (ExpandConstant('{param:SERVICESELFTEST|0}') <> '1') and
+      (ExpandConstant('{param:SERVICESIMULATION|0}') <> '1') then
+      Arguments := Arguments + ' --allow-power-actions';
+    if PreserveUpsPoweroff and PreservePowerActions and
+      (ExpandConstant('{param:SERVICESELFTEST|0}') <> '1') and
+      (ExpandConstant('{param:SERVICESIMULATION|0}') <> '1') then
+      Arguments := Arguments + ' --allow-ups-poweroff';
     if not RunServiceCommand(Arguments) then
       RaiseException('No se pudo registrar el servicio de Elipro. Consulta el registro de instalación.');
     if not RunServiceCommand('start') then

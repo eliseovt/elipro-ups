@@ -15,6 +15,7 @@ import queue
 import sqlite3
 import threading
 import time
+import unicodedata
 from collections import deque
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
@@ -25,8 +26,10 @@ DEFAULT_POLICY = {
     "on_battery_seconds": 300,
     "low_battery_percent": 20,
     "min_runtime_seconds": 180,
-    "countdown_seconds": 60,
+    "countdown_seconds": 15,
     "action": "shutdown",
+    "ups_poweroff": False,
+    "ups_poweroff_delay_seconds": 180,
 }
 BATTERY_ESTIMATE_FIELDS = ("battery_percent_estimate", "battery_estimate_method")
 SAMPLE_FIELDS = (
@@ -67,6 +70,13 @@ def _timestamp(value):
     return result.astimezone(timezone.utc)
 
 
+class IncidentCursorExpired(ValueError):
+    """A retained-history snapshot can no longer locate its pagination anchor."""
+
+    def __init__(self):
+        super().__init__("La consulta venció porque cambió el historial conservado. Vuelve a consultar incidentes.")
+
+
 def validate_policy(value):
     """Validate partial/full policy; booleans and numbers are never coerced."""
     if not isinstance(value, dict):
@@ -77,15 +87,20 @@ def validate_policy(value):
     result = {**DEFAULT_POLICY, **value}
     if type(result["enabled"]) is not bool:
         raise ValueError("enabled debe ser booleano")
+    if type(result["ups_poweroff"]) is not bool:
+        raise ValueError("ups_poweroff debe ser booleano")
     limits = {
         "on_battery_seconds": (0, 86400),
         "low_battery_percent": (0, 100),
         "min_runtime_seconds": (0, 86400),
-        "countdown_seconds": (10, 3600),
+        "countdown_seconds": (10, 120),
     }
     for key, (lower, upper) in limits.items():
         if type(result[key]) is not int or not lower <= result[key] <= upper:
             raise ValueError(f"{key} debe ser entero entre {lower} y {upper}")
+    delay = result["ups_poweroff_delay_seconds"]
+    if type(delay) is not int or not 60 <= delay <= 540 or delay % 60:
+        raise ValueError("El tiempo para apagar el UPS debe ser de 1 a 9 minutos enteros")
     if result["action"] not in ("shutdown", "hibernate"):
         raise ValueError("action debe ser shutdown o hibernate")
     return result
@@ -335,6 +350,81 @@ class Store:
         return base64.urlsafe_b64encode(json.dumps(value, separators=(",", ":")).encode()).decode().rstrip("=")
 
     @staticmethod
+    def _incident_order(sort=None, direction=None):
+        allowed = {"type", "status", "started_at", "ended_at", "duration_seconds", "action_result"}
+        if sort is None:
+            if direction is not None:
+                raise ValueError("La dirección requiere una columna de ordenación.")
+            return None, None
+        if not isinstance(sort, str) or sort not in allowed:
+            raise ValueError("Columna de incidentes no válida.")
+        direction = "desc" if direction is None else direction
+        if not isinstance(direction, str) or direction not in {"asc", "desc"}:
+            raise ValueError("Dirección de incidentes no válida.")
+        return sort, direction
+
+    @classmethod
+    def _decode_incident_cursor(cls, cursor, filters, sort=None, direction=None):
+        if sort is None:
+            return cls._decode_cursor(cursor, filters, "incidents")
+        if cursor is None:
+            return None
+        if not isinstance(cursor, str) or not 1 <= len(cursor) <= 512:
+            raise ValueError("Cursor de historial inválido")
+        try:
+            value = json.loads(base64.urlsafe_b64decode(cursor + "=" * (-len(cursor) % 4)))
+            fingerprint = cls._cursor_fingerprint({**filters, "sort": sort, "direction": direction}, "incidents")
+            if (set(value) != {"v", "high", "before", "as_of", "filter"} or
+                    type(value["v"]) is not int or value["v"] != 2 or
+                    type(value["high"]) is not int or type(value["before"]) is not int or
+                    not 0 < value["before"] <= value["high"] < 2 ** 63 - 1 or
+                    value["filter"] != fingerprint):
+                raise ValueError()
+            value["as_of"] = iso_utc(_timestamp(value["as_of"]))
+        except (ValueError, TypeError, KeyError, UnicodeError, OverflowError) as exc:
+            raise ValueError("Cursor inválido o perteneciente a otros filtros u ordenación") from exc
+        return value
+
+    @classmethod
+    def _encode_incident_cursor(cls, high, before, as_of, filters, sort, direction):
+        value = {"v": 2, "high": high, "before": before, "as_of": as_of,
+                 "filter": cls._cursor_fingerprint({**filters, "sort": sort, "direction": direction}, "incidents")}
+        return base64.urlsafe_b64encode(json.dumps(value, separators=(",", ":")).encode()).decode().rstrip("=")
+
+    @staticmethod
+    def _incident_sort_value(incident, sort):
+        labels = {
+            "type": {"power": "Corte eléctrico", "communication": "Problema de comunicación"},
+            "status": {"recovered": "Recuperado", "open": "Sin recuperación registrada"},
+            "action_result": {"cancelled": "Cancelada", "failed": "Fallida", "started": "Iniciada",
+                              "simulated": "Simulada", "none": "Sin acciones"},
+        }
+        value = incident.get(sort)
+        if sort in labels:
+            label = labels[sort].get(value)
+            return ("".join(character for character in unicodedata.normalize("NFKD", label.casefold())
+                            if not unicodedata.combining(character)) if label is not None else None)
+        if sort in {"started_at", "ended_at"}:
+            if value is None or (sort == "started_at" and incident.get("start_known") is False):
+                return None
+            return _timestamp(value).timestamp()
+        return value if type(value) in (int, float) and math.isfinite(value) else None
+
+    @classmethod
+    def _sort_incidents(cls, incidents, sort, direction):
+        # Stable sorting preserves this ID tie-break in both primary directions.
+        incidents.sort(key=lambda item: item["opening_event_id"], reverse=True)
+        known, unknown = [], []
+        for incident in incidents:
+            value = cls._incident_sort_value(incident, sort)
+            if value is None:
+                unknown.append(incident)
+            else:
+                known.append((value, incident))
+        known.sort(key=lambda item: item[0], reverse=direction == "desc")
+        return [incident for _, incident in known] + unknown
+
+    @staticmethod
     def _event_where(filters):
         clauses, values = [], []
         for key, operator in (("from", ">="), ("to", "<=")):
@@ -395,7 +485,7 @@ class Store:
                 after = event["id"]
                 yield event
 
-    def incidents(self, *, start=None, end=None, limit=50, cursor=None):
+    def incidents(self, *, start=None, end=None, limit=50, cursor=None, sort=None, direction=None):
         """Group evidence of power and communication failures independently.
 
         Scan retained events before filtering overlaps, so an incident starting
@@ -404,14 +494,16 @@ class Store:
         """
         filters = self._event_filters(start, end)
         self._page_limit(limit)
-        position = self._decode_cursor(cursor, filters, "incidents")
+        sort, direction = self._incident_order(sort, direction)
+        position = self._decode_incident_cursor(cursor, filters, sort, direction)
         with self._lock:
             high = position["high"] if position else self._db.execute("SELECT COALESCE(MAX(id),0) FROM events").fetchone()[0]
         before = position["before"] if position else high + 1
         active, incidents = {}, []
         opening = {"power_lost": "power", "connection_lost": "communication", "monitor_error": "communication"}
         recovery = {"power_restored": "power", "connection_restored": "communication"}
-        action_kinds = {"policy_countdown", "policy_cancelled", "policy_action_started", "policy_action_failed", "policy_unknown", "simulation"}
+        action_kinds = {"policy_countdown", "policy_cancelled", "policy_action_started", "policy_action_failed", "policy_unknown", "simulation",
+                        "ups_poweroff_submitted", "ups_poweroff_unconfirmed", "ups_poweroff_cancel_requested", "ups_poweroff_blocked"}
         for event in self.iter_events(_high_id=high):
             if (event["kind"] in ("connection_lost", "monitor_error") and
                     isinstance(event["data"], dict) and event["data"].get("error_kind") == "stopped"):
@@ -436,7 +528,8 @@ class Store:
                     incident["actions"].append(event)
         lower = _timestamp(filters["from"]) if filters["from"] else None
         upper = _timestamp(filters["to"]) if filters["to"] else None
-        now = utc_now()
+        now = _timestamp(position["as_of"]) if sort is not None and position else utc_now()
+        as_of = iso_utc(now)
         selected = []
         for incident in incidents:
             began = _timestamp(incident["started_at"])
@@ -449,37 +542,30 @@ class Store:
                                          "simulated" if "simulation" in kinds else "none")
             if (lower is None or ended is None or ended >= lower) and (upper is None or began <= upper):
                 selected.append(incident)
-        selected.sort(key=lambda item: item["opening_event_id"], reverse=True)
         total = len(selected)
-        rows = [item for item in selected if item["opening_event_id"] < before][:limit + 1]
+        if sort is None:
+            selected.sort(key=lambda item: item["opening_event_id"], reverse=True)
+            rows = [item for item in selected if item["opening_event_id"] < before][:limit + 1]
+        else:
+            selected = self._sort_incidents(selected, sort, direction)
+            offset = 0
+            if position:
+                anchor = next((index for index, item in enumerate(selected)
+                               if item["opening_event_id"] == before), None)
+                if anchor is None:
+                    raise IncidentCursorExpired()
+                offset = anchor + 1
+            rows = selected[offset:offset + limit + 1]
         more, rows = len(rows) > limit, rows[:limit]
+        next_cursor = None
+        if more:
+            next_cursor = (self._encode_cursor(high, rows[-1]["opening_event_id"], filters, "incidents") if sort is None else
+                           self._encode_incident_cursor(high, rows[-1]["opening_event_id"], as_of, filters, sort, direction))
         return {"incidents": rows, "total": total, "limit": limit, **filters,
-                "next_cursor": self._encode_cursor(high, rows[-1]["opening_event_id"], filters, "incidents") if more else None,
+                "next_cursor": next_cursor,
+                **({"sort": sort, "direction": direction, "as_of": as_of} if sort is not None else {}),
                 "retention_days": self.retention_days,
                 "note": "Duración detectada entre lecturas; los incidentes anteriores a la retención pueden estar incompletos."}
-
-    def backup(self, destination):
-        """Write a consistent, standalone SQLite snapshot, including WAL data."""
-        target_path = Path(destination)
-        if self.path != ":memory:" and target_path.resolve() == Path(self.path).resolve():
-            raise ValueError("El respaldo debe usar otro archivo")
-        if target_path.exists():
-            raise ValueError("El archivo de respaldo ya existe")
-        connection = None
-        deadline = time.monotonic() + 20
-        def progress(status, remaining, total):
-            if time.monotonic() > deadline:
-                raise TimeoutError("El respaldo excedió el plazo de 20 segundos")
-        try:
-            connection = sqlite3.connect(str(target_path), timeout=0.1)
-            with self._lock:
-                self._db.backup(connection, pages=128, progress=progress, sleep=0.01)
-            counts = {key + "_count": connection.execute("SELECT COUNT(*) FROM " + table).fetchone()[0]
-                      for key, table in (("event", "events"), ("sample", "samples"), ("settings", "settings"))}
-            return {"created_at": iso_utc(), **counts}
-        finally:
-            if connection is not None:
-                connection.close()
 
     def close(self):
         with self._lock:
@@ -535,7 +621,7 @@ class TelemetryRingBuffer:
         self._previous = current
         return result
 
-    def publish(self, sample=None, *, error=None, error_kind="telemetry", captured_at=None):
+    def publish(self, sample=None, *, error=None, error_kind="telemetry", captured_at=None, power_generation=0):
         owned = copy.deepcopy(sample) if sample is not None else None
         if error is None and not isinstance(owned, dict):
             raise ValueError("La telemetría debe ser un objeto")
@@ -543,7 +629,7 @@ class TelemetryRingBuffer:
             self._sequence += 1
             entry = {"sequence": self._sequence, "sample": owned,
                      "error": str(error)[:1000] if error is not None else None,
-                     "error_kind": error_kind, "captured_at": captured_at,
+                     "error_kind": error_kind, "captured_at": captured_at, "power_generation": power_generation,
                      "facts": self._facts(owned, error)}
             if owned is not None:
                 self._samples.append(owned)
@@ -639,7 +725,9 @@ class PolicyEngine:
             self._fired = False
             if not value["enabled"]:
                 self._suppressed = False
-            self._transition("unknown" if value["enabled"] else "disabled")
+            self._transition("unknown" if value["enabled"] else "disabled",
+                             "Esperando una lectura válida del UPS después de actualizar la protección."
+                             if value["enabled"] else "Protección automática desactivada.")
         return self.status()
 
     def cancel(self):

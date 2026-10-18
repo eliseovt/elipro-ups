@@ -90,12 +90,20 @@ print(json.dumps({"python": str(python_license), "pyinstaller": str(licenses[0])
     if ($LASTEXITCODE -ne 0) { throw 'The bundled executable failed its non-invasive smoke test.' }
     & (Join-Path $appOutput 'Elipro.exe') battery-diagnostic --help
     if ($LASTEXITCODE -ne 0) { throw 'The bundled battery diagnostic failed its non-invasive help check.' }
+    & (Join-Path $appOutput 'Elipro.exe') ups-power-diagnostic --help
+    if ($LASTEXITCODE -ne 0) { throw 'The bundled UPS power diagnostic failed its non-invasive help check.' }
+    & (Join-Path $appOutput 'Elipro.exe') authorize-ups-cancel-test --help
+    if ($LASTEXITCODE -ne 0) { throw 'The bundled manual-test authorization failed its non-invasive help check.' }
+    & (Join-Path $appOutput 'Elipro.exe') authorize-ups-battery-test --help
+    if ($LASTEXITCODE -ne 0) { throw 'The bundled battery-test authorization failed its non-invasive help check.' }
 
     New-Item -ItemType Directory -Force -Path $installerOutput | Out-Null
     $preflightText = [IO.File]::ReadAllText((Join-Path $PSScriptRoot 'Protect-InstallPaths.ps1'))
     $preflightEncoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($preflightText))
+    $capabilityText = [IO.File]::ReadAllText((Join-Path $PSScriptRoot 'Read-ServicePowerCapability.ps1'))
+    $capabilityEncoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($capabilityText))
     $innoArguments = @("/DAppVersion=$appVersion", "/DSourceDir=$appOutput", "/DOutputDir=$installerOutput",
-                       "/DSecurityPreflight=$preflightEncoded")
+                       "/DSecurityPreflight=$preflightEncoded", "/DServicePowerCapability=$capabilityEncoded")
     if ($signing.Enabled) {
         $powershellPath = Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe'
         $innoArguments += Get-EliproInnoSigningArguments -Signing $signing `

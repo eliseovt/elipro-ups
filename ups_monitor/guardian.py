@@ -11,7 +11,6 @@ from collections import deque
 from datetime import datetime, timezone
 import argparse
 import json
-import math
 import os
 import secrets
 from pathlib import Path
@@ -110,12 +109,9 @@ def parse_args(argv=None):
     parser.add_argument("--forza-url", default="http://127.0.0.1:15179/Forza")
     parser.add_argument("--data-dir", type=Path, default=default_data_dir())
     parser.add_argument("--dry-run", action="store_true")
-    parser.add_argument("--observe-hours", type=float, default=0)
     args = parser.parse_args(argv)
     if not 1 <= args.port <= 65535:
         parser.error("--port debe estar entre 1 y 65535")
-    if not math.isfinite(args.observe_hours) or not (args.observe_hours == 0 or 0.01 <= args.observe_hours <= 168):
-        parser.error("--observe-hours debe ser 0 o un valor entre 0.01 y 168")
     try:
         url = urlsplit(args.forza_url)
         if (url.scheme != "http" or url.hostname not in {"127.0.0.1", "localhost"}
@@ -131,7 +127,7 @@ def parse_args(argv=None):
 def child_command(options):
     command = runtime_command("monitor", "--port", str(options.port),
                "--source", options.source, "--forza-url", options.forza_url,
-               "--data-dir", str(options.data_dir), "--observe-hours", str(options.observe_hours))
+               "--data-dir", str(options.data_dir))
     if options.dry_run:
         command.append("--dry-run")
     return command

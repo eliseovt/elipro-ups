@@ -43,6 +43,12 @@ def child_command(role, *arguments):
         "qs-worker": ("ups_monitor.hid_windows", "--qs-worker"),
         "battery-worker": ("ups_monitor.hid_windows", "--battery-worker"),
         "battery-diagnostic": ("ups_monitor.battery_diagnostics",),
+        "ups-power-diagnostic": ("ups_monitor.ups_power_diagnostics",),
+        "control-worker": ("ups_monitor.hid_windows", "--control-worker"),
+        "cancel-test-worker": ("ups_monitor.hid_windows", "--cancel-test-worker"),
+        "authorize-ups-cancel-test": ("ups_monitor.ups_test_authorization",),
+        "battery-test-worker": ("ups_monitor.hid_windows", "--battery-test-worker"),
+        "authorize-ups-battery-test": ("ups_monitor.ups_test_authorization", "--battery-test"),
         "service": ("ups_monitor.windows_service",),
         "agent": ("ups_monitor.session_agent",),
     }

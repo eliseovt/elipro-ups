@@ -1,6 +1,5 @@
-"""Download and API integration using isolated SQLite and no native I/O."""
+"""Internal diagnostics and history API integration using isolated SQLite and no native I/O."""
 import csv
-from contextlib import closing
 import io
 import json
 from pathlib import Path
@@ -11,14 +10,12 @@ import unittest
 from email.message import Message
 from unittest.mock import Mock, patch
 from urllib.parse import urlencode
-import zipfile
 
 from ups_monitor.alerts import DEFAULT_NOTIFICATION_SETTINGS
 from ups_monitor.core import DEFAULT_POLICY, Store, iso_utc
-from ups_monitor.persistence import HistoryUnavailable, ResilientStore
-from ups_monitor.reports import backup_archive, csv_cell, diagnostics, save_validation, validation_record
+from ups_monitor.persistence import ResilientStore
+from ups_monitor.reports import csv_cell, diagnostics
 from ups_monitor.server import Handler, Monitor, archive_options, write_events_csv
-from ups_monitor.stability import StabilityObservation
 
 
 TEST_ROOT = Path(__file__).resolve().parents[1] / ".test-data"
@@ -41,7 +38,6 @@ class IsolatedMonitorTests(unittest.TestCase):
         self.monitor.health_status = Mock(return_value={"state": "healthy", "reader_alive": True,
             "supervisor_alive": True, "read_age_seconds": 1, "read_failures": 0,
             "process": {"memory_bytes": 1000, "cpu_percent": 0.1}})
-        self.monitor.observation = StabilityObservation(self.monitor, self.root / "stability")
 
     def tearDown(self):
         self.action.assert_not_called()
@@ -73,15 +69,6 @@ class IsolatedMonitorTests(unittest.TestCase):
         code = args[2] if len(args) > 2 else kwargs.get("code", 200)
         return json.loads(args[0]), code
 
-    def physical_record(self):
-        value = {"schema_version": 1,
-                 "real_cut": {"status": "passed", "date": "2026-10-17", "seconds_detected": 11.9,
-                              "session_preserved_user_confirmed": True, "visual_and_sound_user_confirmed": True},
-                 "physical_usb_reconnection": {"status": "pending"},
-                 "real_windows_shutdown": {"status": "not_tested_disabled"}}
-        (self.root / "validation.json").write_text(json.dumps(value), encoding="utf-8")
-        return value
-
 
 class ReportTests(IsolatedMonitorTests):
     def test_diagnostics_strip_tokens_and_nested_private_keys_without_mutating_source(self):
@@ -91,69 +78,16 @@ class ReportTests(IsolatedMonitorTests):
         snapshot["notifications"]["delivery"]["debug"] = [{"device_path": "HID-PATH-PRIVATE", "secret": "SECRET-PRIVATE", "ready": True}]
         snapshot["sample"] = {"battery_voltage": 27.4, "usb_path": "USB-PATH-PRIVATE"}
         snapshot["meta"]["authorization"] = "AUTH-PRIVATE"
-        physical = self.physical_record()
-        physical["nested"] = {"password": "VALIDATION-PRIVATE", "safe": "keep"}
-        (self.root / "validation.json").write_text(json.dumps(physical), encoding="utf-8")
         with patch.object(self.monitor, "snapshot", return_value=snapshot):
             report = diagnostics(self.monitor)
         payload = json.dumps(report)
         for secret in ("LIVE-TOKEN-PRIVATE", "NESTED-TOKEN-PRIVATE", "LOCAL-PATH-PRIVATE", "HID-PATH-PRIVATE",
-                       "SECRET-PRIVATE", "USB-PATH-PRIVATE", "AUTH-PRIVATE", "VALIDATION-PRIVATE"):
+                       "SECRET-PRIVATE", "USB-PATH-PRIVATE", "AUTH-PRIVATE"):
             self.assertNotIn(secret, payload)
         self.assertEqual(report["current_sample"]["battery_voltage"], 27.4)
         self.assertTrue(report["health"]["details"]["ok"])
         self.assertEqual(snapshot["csrf_token"], "LIVE-TOKEN-PRIVATE")
         self.assertIn("access_token", snapshot["health"]["details"])
-
-    def test_backup_contains_consistent_database_settings_manifest_and_physical_validation(self):
-        physical = self.physical_record()
-        self.backend.add_event("power_lost", "Corte confirmado")
-        self.store.add_event("power_restored", "Pendiente en memoria")
-        data = backup_archive(self.monitor)
-        with zipfile.ZipFile(io.BytesIO(data)) as archive:
-            self.assertEqual(set(archive.namelist()), {"history.sqlite3", "configuration.json", "manifest.json", "validation.json", "stability.json", "README.txt"})
-            saved = json.loads(archive.read("configuration.json"))
-            manifest = json.loads(archive.read("manifest.json"))
-            validation = json.loads(archive.read("validation.json"))
-            self.assertEqual(saved["policy"]["on_battery_seconds"], 420)
-            self.assertFalse(saved["policy"]["enabled"])
-            self.assertFalse(saved["notification_settings"]["sound_enabled"])
-            self.assertEqual(manifest["pending_in_memory_at_request"], 1)
-            self.assertFalse(manifest["restored_automatically"])
-            self.assertEqual(validation["record"], physical)
-            target = self.root / "downloaded.sqlite3"
-            target.write_bytes(archive.read("history.sqlite3"))
-        with closing(sqlite3.connect(target)) as database:
-            self.assertEqual(database.execute("PRAGMA integrity_check").fetchone()[0], "ok")
-            self.assertEqual(database.execute("SELECT COUNT(*) FROM events").fetchone()[0], 1)
-            actual = {key: json.loads(value) for key, value in database.execute("SELECT key,value FROM settings")}
-        self.assertEqual(actual, saved)
-        self.assertEqual(manifest["database_snapshot"]["event_count"], 1)
-
-    def test_backup_accepts_relative_data_directory_and_cleans_temporary_folder(self):
-        self.store.path = Path(self.store.path).relative_to(Path.cwd())
-        data = backup_archive(self.monitor)
-        self.assertTrue(data.startswith(b"PK"))
-        self.assertEqual(list(self.root.glob("elipro-backup-*")), [])
-
-    def test_corrupt_configuration_is_a_backup_failure_and_gate_is_released(self):
-        self.backend._db.execute("UPDATE settings SET value='{' WHERE key='policy'")
-        self.backend._db.commit()
-        with self.assertRaises(HistoryUnavailable):
-            backup_archive(self.monitor)
-        self.backend.set_setting("policy", DEFAULT_POLICY)
-        self.assertTrue(backup_archive(self.monitor).startswith(b"PK"))
-
-    def test_save_validation_preserves_physical_confirmation_and_reports_missing_or_invalid_files(self):
-        self.assertFalse(validation_record(self.monitor)["available"])
-        physical = self.physical_record()
-        result = {"schema_version": 1, "source": "isolated_simulation", "passed": True}
-        self.assertTrue(save_validation(self.monitor, result))
-        record = validation_record(self.monitor)["record"]
-        self.assertEqual(record["real_cut"], physical["real_cut"])
-        self.assertEqual(record["automated_scenarios"], result)
-        (self.root / "validation.json").write_text("{broken", encoding="utf-8")
-        self.assertFalse(validation_record(self.monitor)["available"])
 
     def test_csv_formula_text_is_inert_and_normal_values_preserved(self):
         for text in ("=HYPERLINK(\"https://x\")", "+SUM(1)", "-1+1", "@SUM(1)", "  =1", "\tname", "\rname", "\nname"):
@@ -204,6 +138,49 @@ class ReportsApiTests(IsolatedMonitorTests):
                 self.assertEqual(self.response(handler)[1], 400)
         self.assertTrue(self.store.status()["available"])
 
+    def test_incident_sort_parameters_are_exact_and_not_available_on_event_routes(self):
+        for path in ("/api/incidents?sort=message", "/api/incidents?sort=", "/api/incidents?direction=asc",
+                     "/api/incidents?sort=type&direction=up", "/api/incidents?sort=type&direction=",
+                     "/api/incidents?sort=type&sort=status", "/api/incidents?sort=type&direction=asc&direction=desc",
+                     "/api/events/search?sort=type", "/api/events/export.csv?direction=asc"):
+            with self.subTest(path=path):
+                handler = self.handler(path)
+                handler.do_GET()
+                self.assertEqual(self.response(handler)[1], 400)
+        self.assertTrue(self.store.status()["available"])
+
+    def test_incident_sort_is_global_and_expired_anchor_returns_a_localized_client_error(self):
+        self.backend.add_event("power_lost", "Corte")
+        self.backend.add_event("power_restored", "Regresó")
+        self.backend.add_event("connection_lost", "USB")
+        self.backend.add_event("connection_restored", "USB recuperado")
+        self.backend.add_event("power_lost", "Otro corte")
+        self.backend.add_event("power_restored", "Regresó de nuevo")
+        options = {"sort": "type", "direction": "asc", "limit": 1}
+        handler = self.handler("/api/incidents?" + urlencode(options))
+        handler.do_GET()
+        first, code = self.response(handler)
+        self.assertEqual(code, 200)
+        self.assertEqual(first["incidents"][0]["type"], "power")
+        self.assertEqual(first["total"], 3)
+        self.assertEqual(first["sort"], "type")
+        handler = self.handler("/api/incidents?" + urlencode({**options, "cursor": first["next_cursor"]}))
+        handler.do_GET()
+        second, code = self.response(handler)
+        self.assertEqual(code, 200)
+        self.assertEqual(second["incidents"][0]["type"], "power")
+        self.assertEqual(second["as_of"], first["as_of"])
+        self.assertNotEqual(second["incidents"][0]["id"], first["incidents"][0]["id"])
+        with self.backend._db:
+            self.backend._db.execute("DELETE FROM events WHERE id=?", (first["incidents"][0]["opening_event_id"],))
+        handler = self.handler("/api/incidents?" + urlencode({**options, "cursor": first["next_cursor"]}))
+        handler.do_GET()
+        expired, code = self.response(handler)
+        self.assertEqual(code, 400)
+        self.assertEqual(expired["code"], "incident_cursor_expired")
+        self.assertIn("Vuelve a consultar incidentes", expired["error"])
+        self.assertTrue(self.store.status()["available"])
+
     def test_archive_aliases_are_exact_and_empty_filters_mean_all_history(self):
         self.assertEqual(archive_options("from=&to=&kind=&q="),
                          {"start": None, "end": None, "kind": None, "query": None, "limit": 50, "cursor": None})
@@ -211,90 +188,16 @@ class ReportsApiTests(IsolatedMonitorTests):
         self.assertEqual(values["query"], "energía")
         self.assertEqual(values["start"], "2026-10-17T12:00:00Z")
 
-    def test_download_routes_return_download_types_without_csrf_token(self):
-        self.physical_record()
-        handler = self.handler("/api/diagnostics", **{"X-UPS-Token": ""})
-        handler.do_GET()
-        data, mime = handler._send.call_args.args[:2]
-        self.assertIn("application/json", mime)
-        self.assertNotIn(self.monitor.csrf_token, data.decode())
-        self.assertIn("attachment", handler._send.call_args.kwargs["extra"]["Content-Disposition"])
-        handler = self.handler("/api/backup.zip", **{"X-UPS-Token": ""})
-        handler.do_GET()
-        data, mime = handler._send.call_args.args[:2]
-        self.assertEqual(mime, "application/zip")
-        self.assertTrue(data.startswith(b"PK"))
-        handler = self.handler("/api/validation")
-        handler.do_GET()
-        self.assertTrue(self.response(handler)[0]["available"])
-
     def test_host_and_origin_deny_all_new_read_routes_before_backend_access(self):
-        paths = ("/api/events/search", "/api/incidents", "/api/events/export.csv", "/api/diagnostics", "/api/backup.zip", "/api/validation", "/api/stability", "/api/stability/report")
-        with patch.object(self.store, "backup") as backup, patch.object(self.store, "events_page") as search:
+        paths = ("/api/events/search", "/api/incidents", "/api/events/export.csv")
+        with patch.object(self.store, "events_page") as search:
             for path in paths:
                 for headers in ({"Host": "127.0.0.1.evil:8765"}, {"Origin": "https://evil.example"}, {"Origin": "null"}):
                     with self.subTest(path=path, headers=headers):
                         handler = self.handler(path, **headers)
                         handler.do_GET()
                         self.assertEqual(self.response(handler)[1], 403)
-            backup.assert_not_called()
             search.assert_not_called()
-
-    def test_validation_and_stability_mutations_require_csrf_and_same_origin(self):
-        for path in ("/api/validation/run", "/api/stability/start", "/api/stability/stop"):
-            for headers in ({"X-UPS-Token": ""}, {"X-UPS-Token": "wrong"}, {"Origin": "https://evil.example"}):
-                with self.subTest(path=path, headers=headers):
-                    handler = self.handler(path, **headers)
-                    handler.do_POST()
-                    self.assertEqual(self.response(handler)[1], 403)
-        self.assertEqual(self.monitor.observation.status()["state"], "idle")
-
-    def test_validation_route_runs_only_isolated_scenarios_and_preserves_physical_record(self):
-        physical = self.physical_record()
-        handler = self.handler("/api/validation/run")
-        with patch("ups_monitor.server.windows_action") as windows_action:
-            handler.do_POST()
-        result, code = self.response(handler)
-        self.assertEqual(code, 200)
-        self.assertTrue(result["passed"])
-        self.assertEqual(result["source"], "isolated_simulation")
-        self.assertEqual(result["os_actions_executed"], 0)
-        self.assertFalse(result["live_settings_changed"])
-        self.assertTrue(result["saved"])
-        windows_action.assert_not_called()
-        record = validation_record(self.monitor)["record"]
-        self.assertEqual(record["real_cut"], physical["real_cut"])
-        self.assertTrue(record["automated_scenarios"]["passed"])
-
-    def test_stability_start_validates_body_duration_and_stopped_monitor(self):
-        for body in ({"unknown": 1}, [], {"hours": True}, {"hours": "24"}, {"hours": -1}, {"hours": 169}):
-            with self.subTest(body=body):
-                handler = self.handler("/api/stability/start", body)
-                handler.do_POST()
-                self.assertEqual(self.response(handler)[1], 400)
-        self.monitor.stop_event.set()
-        handler = self.handler("/api/stability/start", {"hours": 24})
-        handler.do_POST()
-        self.assertEqual(self.response(handler)[1], 400)
-
-    def test_stability_routes_use_cached_observation_without_ups_queries(self):
-        with patch("ups_monitor.stability.threading.Thread") as thread:
-            handler = self.handler("/api/stability/start", {"hours": 24})
-            handler.do_POST()
-        payload, code = self.response(handler)
-        self.assertEqual(code, 200)
-        self.assertEqual(payload["state"], "running")
-        self.assertEqual(payload["target_seconds"], 86400)
-        thread.return_value.start.assert_called_once()
-        handler = self.handler("/api/stability")
-        handler.do_GET()
-        self.assertEqual(self.response(handler)[0]["state"], "running")
-        handler = self.handler("/api/stability/report")
-        handler.do_GET()
-        self.assertIn("application/json", handler._send.call_args.args[1])
-        handler = self.handler("/api/stability/stop")
-        handler.do_POST()
-        self.assertEqual(self.response(handler)[1], 200)
 
     def test_history_read_failure_is_503_without_changing_protection_or_memory_cache(self):
         self.store.add_event("power_lost", "Corte en memoria")

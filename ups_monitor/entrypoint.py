@@ -36,7 +36,7 @@ def main(argv=None):
     command, remaining = arguments[0], arguments[1:]
     if command in ("--help", "-h"):
         parser = argparse.ArgumentParser(description="Elipro UPS para Windows x64")
-        parser.add_argument("command", nargs="?", choices=("monitor", "guardian", "qs-worker", "battery-diagnostic", "smoke-test", "service", "agent"),
+        parser.add_argument("command", nargs="?", choices=("monitor", "guardian", "qs-worker", "battery-diagnostic", "ups-power-diagnostic", "authorize-ups-cancel-test", "authorize-ups-battery-test", "smoke-test", "service", "agent"),
                             help="Instalado: abre panel/agente; service gestiona el servicio; smoke-test no accede al UPS")
         parser.print_help()
         return 0
@@ -66,6 +66,24 @@ def main(argv=None):
     if command == "battery-diagnostic":
         from .battery_diagnostics import main as battery_diagnostic_main
         return battery_diagnostic_main(remaining)
+    if command == "ups-power-diagnostic":
+        from .ups_power_diagnostics import main as ups_power_diagnostic_main
+        return ups_power_diagnostic_main(remaining)
+    if command == "control-worker":
+        from .hid_windows import control_worker_main
+        return control_worker_main(remaining)
+    if command == "cancel-test-worker":
+        from .hid_windows import cancel_test_worker_main
+        return cancel_test_worker_main(remaining)
+    if command == "authorize-ups-cancel-test":
+        from .ups_test_authorization import main as authorize_test_main
+        return authorize_test_main(remaining)
+    if command == "battery-test-worker":
+        from .hid_windows import battery_test_worker_main
+        return battery_test_worker_main(remaining)
+    if command == "authorize-ups-battery-test":
+        from .ups_test_authorization import battery_main
+        return battery_main(remaining)
     if command == "service":
         from .windows_service import main as service_main
         return service_main(remaining)

@@ -16,7 +16,8 @@ from collections import deque
 from dataclasses import dataclass
 
 from .alerts import CRITICAL_HISTORY_EVENTS, DEFAULT_NOTIFICATION_SETTINGS, validate_notification_settings
-from .core import DEFAULT_POLICY, SAMPLE_FIELDS, Store, _timestamp, battery_estimate_fields, iso_utc, validate_policy
+from .core import (DEFAULT_POLICY, SAMPLE_FIELDS, IncidentCursorExpired, Store, _timestamp,
+                   battery_estimate_fields, iso_utc, validate_policy)
 
 
 class HistoryUnavailable(RuntimeError):
@@ -254,6 +255,8 @@ class ResilientStore:
                 backend = self._backend
             try:
                 result = getattr(backend, method)(*args, **kwargs)
+            except IncidentCursorExpired:
+                raise
             except Exception as exc:
                 self._failed(exc, "read")
                 raise HistoryUnavailable("No se pudo leer el historial: " + str(exc)[:300]) from exc
@@ -279,18 +282,17 @@ class ResilientStore:
         return self._read("events_page", start=start, end=end, kind=kind, query=query,
                           limit=limit, cursor=cursor)
 
-    def incidents(self, *, start=None, end=None, limit=50, cursor=None):
+    def incidents(self, *, start=None, end=None, limit=50, cursor=None, sort=None, direction=None):
         filters = Store._event_filters(start, end)
         Store._page_limit(limit)
-        Store._decode_cursor(cursor, filters, "incidents")
-        return self._read("incidents", start=start, end=end, limit=limit, cursor=cursor)
+        sort, direction = Store._incident_order(sort, direction)
+        Store._decode_incident_cursor(cursor, filters, sort, direction)
+        return self._read("incidents", start=start, end=end, limit=limit, cursor=cursor,
+                          sort=sort, direction=direction)
 
     def iter_events(self, *, start=None, end=None, kind=None, query=None):
         Store._event_filters(start, end, kind, query)
         return self._export("iter_events", start=start, end=end, kind=kind, query=query)
-
-    def backup(self, destination):
-        return self._read("backup", destination)
 
     def _export(self, method, **options):
         iterator = None

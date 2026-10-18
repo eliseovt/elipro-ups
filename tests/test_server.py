@@ -1,5 +1,6 @@
 import io
 import json
+import subprocess
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -10,7 +11,7 @@ from unittest.mock import Mock, patch
 
 from ups_monitor.core import Store, iso_utc
 from ups_monitor.adapters import TelemetryError
-from ups_monitor.server import Handler, Monitor, main, windows_action
+from ups_monitor.server import Handler, Monitor, WindowsActionUnconfirmed, main, windows_action
 
 
 class ServerTests(unittest.TestCase):
@@ -103,11 +104,107 @@ class ServerTests(unittest.TestCase):
 
     def test_test_countdown_never_calls_operating_system(self):
         with patch("ups_monitor.server.time.monotonic", return_value=100):
-            self.monitor.test()
-        with patch("ups_monitor.server.time.monotonic", return_value=116):
+            started = self.monitor.test()
+        self.assertEqual(started["protection"]["countdown_remaining"], 15)
+        with patch("ups_monitor.server.time.monotonic", return_value=110):
+            self.assertEqual(self.monitor.snapshot()["protection"]["countdown_remaining"], 5)
+        with patch("ups_monitor.server.time.monotonic", return_value=114):
+            self.assertEqual(self.monitor.snapshot()["protection"]["countdown_remaining"], 1)
+        with patch("ups_monitor.server.time.monotonic", return_value=115):
+            finished = self.monitor.snapshot()
             self.monitor.snapshot()
+        self.assertEqual(finished["protection"]["state"], "idle")
+        self.assertEqual(finished["protection"]["countdown_remaining"], 0)
+        self.assertIsNone(finished["protection"]["deadline"])
+        self.assertIsNone(self.monitor.test_deadline)
         self.action.assert_not_called()
-        self.assertTrue(any("finalizada" in event["message"] for event in self.store.events()))
+        self.assertEqual(sum("finalizada" in event["message"] for event in self.store.events()), 1)
+
+    def test_ups_delay_api_persists_supported_minutes_without_power_actions(self):
+        for minutes in (1, 3, 9):
+            with self.subTest(minutes=minutes):
+                handler = self.handler(body={"countdown_seconds": 15,
+                    "ups_poweroff_delay_seconds": minutes * 60})
+                handler.do_POST()
+                policy = handler._json.call_args.args[0]["policy"]
+                self.assertEqual(policy["ups_poweroff_delay_seconds"], minutes * 60)
+                self.assertEqual(self.store.get_setting("policy"), policy)
+                restarted = Monitor(self.store, self.adapter, action_callback=self.action)
+                self.assertEqual(restarted.engine.policy, policy)
+        for value in (59, 61, 600, True, "180"):
+            with self.subTest(invalid=value):
+                before = self.store.get_setting("policy")
+                handler = self.handler(body={"ups_poweroff_delay_seconds": value})
+                handler.do_POST()
+                self.assertEqual(handler._json.call_args.args[1], 400)
+                self.assertEqual(self.store.get_setting("policy"), before)
+        self.action.assert_not_called()
+
+    def test_ups_simulation_cannot_add_ups_cut_when_its_option_is_off(self):
+        self.monitor.set_policy({"enabled": False, "ups_poweroff": False,
+            "countdown_seconds": 15, "ups_poweroff_delay_seconds": 540})
+        with patch("ups_monitor.server.time.monotonic", return_value=100):
+            first = self.monitor.test(include_ups=True)
+        self.assertIsNone(self.monitor.test_ups_delay)
+        with patch("ups_monitor.server.time.monotonic", return_value=115):
+            last = self.monitor.snapshot()
+        self.assertEqual(first["protection"]["countdown_remaining"], 15)
+        self.assertNotEqual(last["protection"]["phase"], "ups_delay")
+        self.assertIsNone(self.monitor.test_ups_simulation)
+        self.action.assert_not_called()
+
+    def test_test_countdown_uses_saved_duration_without_changing_policy(self):
+        for seconds in (10, 60, 120):
+            with self.subTest(seconds=seconds):
+                self.monitor.set_policy({"enabled": False, "countdown_seconds": seconds, "action": "hibernate"})
+                saved = self.store.get_setting("policy")
+                with patch("ups_monitor.server.time.monotonic", return_value=100):
+                    snapshot = self.monitor.test()
+                self.assertEqual(self.monitor.test_deadline, 100 + seconds)
+                self.assertEqual(snapshot["protection"]["countdown_remaining"], seconds)
+                self.assertEqual(snapshot["protection"]["state"], "countdown")
+                self.assertTrue(snapshot["protection"]["simulation"])
+                self.assertFalse(snapshot["meta"]["dry_run"])
+                self.assertEqual(snapshot["policy"], saved)
+                self.assertEqual(self.monitor.engine.policy, saved)
+                self.assertEqual(self.store.get_setting("policy"), saved)
+                self.assertEqual(self.store.events()[0]["message"],
+                                 f"Prueba de aviso iniciada ({seconds} segundos, sin apagado).")
+                with patch("ups_monitor.server.time.monotonic", return_value=101 + seconds):
+                    finished = self.monitor.snapshot()
+                self.assertEqual(finished["protection"]["state"], "idle")
+                self.assertEqual(self.store.get_setting("policy"), saved)
+                self.action.assert_not_called()
+
+    def test_cancelled_test_countdown_never_finishes_or_changes_saved_settings(self):
+        self.monitor.set_policy({"enabled": False, "countdown_seconds": 60})
+        saved = self.store.get_setting("policy")
+        with patch("ups_monitor.server.time.monotonic", return_value=100):
+            self.monitor.test()
+        with patch("ups_monitor.server.time.monotonic", return_value=120):
+            cancelled = self.monitor.cancel()
+        with patch("ups_monitor.server.time.monotonic", return_value=200):
+            self.monitor.snapshot()
+        self.assertIsNone(self.monitor.test_deadline)
+        self.assertEqual(cancelled["protection"]["state"], "idle")
+        self.assertFalse(cancelled["protection"]["simulation"])
+        self.assertEqual(self.store.get_setting("policy"), saved)
+        self.assertFalse(any("finalizada" in event["message"] for event in self.store.events()))
+        self.action.assert_not_called()
+
+    def test_test_api_uses_persisted_duration_after_monitor_restart(self):
+        self.monitor.set_policy({"enabled": False, "countdown_seconds": 90})
+        saved = self.store.get_setting("policy")
+        self.monitor = Monitor(self.store, self.adapter, action_callback=self.action)
+        handler = self.handler(path="/api/protection/test")
+        with patch("ups_monitor.server.time.monotonic", return_value=100):
+            handler.do_POST()
+        snapshot = handler._json.call_args.args[0]
+        self.assertEqual(snapshot["protection"]["countdown_remaining"], 90)
+        self.assertTrue(snapshot["protection"]["simulation"])
+        self.assertFalse(snapshot["policy"]["enabled"])
+        self.assertEqual(self.store.get_setting("policy"), saved)
+        self.action.assert_not_called()
 
     def test_windows_shutdown_never_forces_application_termination(self):
         with patch("ups_monitor.server.os.name", "nt"), patch("ups_monitor.server.subprocess.run") as run:
@@ -116,6 +213,33 @@ class ServerTests(unittest.TestCase):
             args = run.call_args.args[0]
         self.assertEqual(args[-3:], ["/s", "/t", "0"])
         self.assertNotIn("/f", args)
+
+    def test_windows_hibernation_never_forces_application_termination(self):
+        with patch("ups_monitor.server.os.name", "nt"), patch("ups_monitor.server.subprocess.run") as run:
+            run.return_value.returncode = 0
+            windows_action("hibernate")
+            args = run.call_args.args[0]
+        self.assertEqual(args[-1:], ["/h"])
+        self.assertNotIn("/f", args)
+
+    def test_windows_process_timeout_is_uncertain_not_rejection_and_never_exposes_raw_negative_timeout(self):
+        for action in ("hibernate", "shutdown"):
+            with self.subTest(action=action), patch("ups_monitor.server.os.name", "nt"), \
+                    patch("ups_monitor.server.subprocess.run", side_effect=subprocess.TimeoutExpired("private-command", -302)) as run:
+                with self.assertRaises(WindowsActionUnconfirmed) as caught:
+                    windows_action(action)
+                self.assertNotIn("rechaz", str(caught.exception).lower())
+                self.assertNotIn("-302", str(caught.exception))
+                self.assertNotIn("private-command", str(caught.exception))
+                run.assert_called_once()
+                self.assertNotIn("/f", run.call_args.args[0])
+
+    def test_windows_explicit_nonzero_exit_remains_a_rejection(self):
+        with patch("ups_monitor.server.os.name", "nt"), patch("ups_monitor.server.subprocess.run") as run:
+            run.return_value.returncode = 1
+            with self.assertRaisesRegex(RuntimeError, "rechazó") as caught:
+                windows_action("hibernate")
+            self.assertNotIsInstance(caught.exception, WindowsActionUnconfirmed)
 
     def test_dry_run_blocks_real_action(self):
         monitor = Monitor(self.store, self.adapter, dry_run=True, action_callback=self.action)

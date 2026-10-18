@@ -34,6 +34,12 @@ _EVENTS = {
     "policy_countdown": ("Protección: cuenta regresiva", "critical"),
     "policy_cancelled": ("Protección cancelada", "info"),
     "policy_action_failed": ("No se pudo ejecutar la protección", "critical"),
+    "ups_poweroff_unconfirmed": ("Corte del UPS sin confirmar", "critical"),
+    "ups_cancel_test_unconfirmed": ("Prueba del UPS sin confirmar", "critical"),
+    "ups_battery_test_unconfirmed": ("Prueba del UPS en batería sin confirmar", "critical"),
+    "ups_battery_test_windows_unconfirmed": ("Solicitud de hibernación sin confirmar", "info"),
+    "windows_action_unconfirmed": ("Solicitud a Windows sin confirmar", "info"),
+    "ups_poweroff_reviewed": ("Revisión del corte del UPS cerrada", "info"),
     "simulation": ("Prueba de protección sin apagado", "info"),
 }
 _PERSISTENT = frozenset(("battery_low", "overload", "ups_fault", "policy_countdown"))
@@ -45,6 +51,11 @@ CRITICAL_HISTORY_EVENTS = frozenset((
     "connection_lost", "connection_restored", "monitor_error", "monitor_restarted",
     "policy_countdown", "policy_cancelled", "policy_action_started", "policy_action_failed",
     "policy_unknown",
+    "ups_poweroff_submitted", "ups_poweroff_unconfirmed", "ups_poweroff_cancel_requested", "ups_poweroff_blocked",
+    "ups_cancel_test_unconfirmed", "ups_cancel_test_reviewed",
+    "ups_battery_test_unconfirmed", "ups_battery_test_reviewed",
+    "ups_battery_test_windows_unconfirmed", "windows_action_unconfirmed",
+    "ups_poweroff_reviewed",
 ))
 _CONDITION_MESSAGES = {
     "battery_low": "El UPS continúa indicando batería baja. Revisa el estado del equipo.",

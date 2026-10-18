@@ -66,12 +66,13 @@ def parse_qs(frame: bytes, *, preserve_battery_precision=False) -> dict:
         raise QsProtocolError("Anchuras de campos QS/T inválidas.")
     values = tuple(int.from_bytes(field, "big") for field in fields)
     input_raw, input_scale, output_raw, output_scale, load, divisor, dividend, battery_raw, battery_scale, flags, ratings = values
-    if divisor == 0:
+    output_is_off = bool(flags & 0x02) and output_raw == 0
+    if divisor == 0 and not output_is_off:
         raise QsProtocolError("Divisor de frecuencia QS igual a cero.")
 
     input_voltage = _bounded("Voltaje de entrada", (input_raw * input_scale // 51) / 256, 0, 400)
     output_voltage = _bounded("Voltaje de salida", (output_raw * output_scale // 51) / 256, 0, 400)
-    frequency = _bounded("Frecuencia", dividend / divisor, 40, 70)
+    frequency = 0.0 if output_is_off and (divisor == 0 or dividend == 0) else _bounded("Frecuencia", dividend / divisor, 40, 70)
     battery_voltage = _bounded("Voltaje de batería", battery_raw * battery_scale / 510, 0, 100)
     if battery_voltage == 0:
         raise QsProtocolError("Voltaje de batería QS no verificable.")

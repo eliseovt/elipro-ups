@@ -51,6 +51,20 @@ class PolicyTests(unittest.TestCase):
         self.advance(10)
         self.assertEqual(self.actions, ["shutdown"])
 
+    def test_policy_change_explains_why_it_is_waiting_without_raw_state_message(self):
+        self.engine.evaluate(self.sample(low_battery=True))
+        self.assertEqual(self.engine.status()["state"], "countdown")
+        updated = {**self.engine.policy, "countdown_seconds": 20}
+        status = self.engine.update_policy(updated)
+        self.assertEqual(status["state"], "unknown")
+        self.assertIn("Esperando una lectura válida", status["reason"])
+        self.assertEqual(self.events[-1][0], "policy_unknown")
+        self.assertEqual(self.events[-1][1], status["reason"])
+        self.assertEqual(status["countdown_remaining"], None)
+        self.assertEqual(self.actions, [])
+        self.engine.update_policy({**updated, "enabled": False})
+        self.assertEqual(self.events[-1][1], "Protección automática desactivada.")
+
     def test_restored_power_cancels(self):
         self.engine.evaluate(self.sample(low_battery=True))
         self.advance(5, on_battery=False)
@@ -117,10 +131,35 @@ class PolicyTests(unittest.TestCase):
 
     def test_default_disabled_and_strict_validation(self):
         self.assertFalse(DEFAULT_POLICY["enabled"])
+        self.assertEqual(DEFAULT_POLICY["countdown_seconds"], 15)
+        self.assertEqual(DEFAULT_POLICY["ups_poweroff_delay_seconds"], 180)
         for bad in [{"enabled": "false"}, {"on_battery_seconds": True}, {"action": "restart"},
                     {"countdown_seconds": 0}, {"extra": 1}, {"battery_percent": 2}]:
             with self.assertRaises(ValueError):
                 validate_policy(bad)
+
+    def test_ups_delay_accepts_only_supported_whole_minutes_and_preserves_legacy_settings(self):
+        for minutes in range(1, 10):
+            with self.subTest(minutes=minutes):
+                self.assertEqual(validate_policy({"ups_poweroff_delay_seconds": minutes * 60})[
+                    "ups_poweroff_delay_seconds"], minutes * 60)
+        for value in (0, 59, 61, 599, 600, True, None, "180", 180.0):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                validate_policy({"ups_poweroff_delay_seconds": value})
+        legacy = {key: value for key, value in DEFAULT_POLICY.items() if key != "ups_poweroff_delay_seconds"}
+        legacy.update(countdown_seconds=30, action="hibernate", enabled=True)
+        migrated = validate_policy(legacy)
+        self.assertEqual(migrated["ups_poweroff_delay_seconds"], 180)
+        for key, value in legacy.items():
+            self.assertEqual(migrated[key], value)
+
+    def test_countdown_accepts_ten_to_one_hundred_twenty_seconds_without_coercion(self):
+        for value in (10, 11, 30, 120):
+            with self.subTest(value=value):
+                self.assertEqual(validate_policy({"countdown_seconds": value})["countdown_seconds"], value)
+        for value in (9, 121, 3600, 10.0, "10", True, None):
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, "entero entre 10 y 120"):
+                validate_policy({"countdown_seconds": value})
 
     def test_disable_and_reenable_resets_manual_cancel(self):
         self.engine.evaluate(self.sample(low_battery=True))

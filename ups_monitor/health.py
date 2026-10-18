@@ -111,6 +111,16 @@ class MonitorHealth:
         with self.lock:
             self.last_supervisor_check = iso_utc()
 
+    def reset_progress_after_resume(self):
+        """Sleeping time is not reader execution time; retain real failure totals."""
+        with self.lock:
+            self.read_started_monotonic = None
+            self.last_read_finished_monotonic = self.clock()
+
+    def abandon_read(self):
+        with self.lock:
+            self.read_started_monotonic = None
+
     def read_stalled(self, seconds):
         with self.lock:
             return self.read_started_monotonic is not None and self.clock() - self.read_started_monotonic > seconds

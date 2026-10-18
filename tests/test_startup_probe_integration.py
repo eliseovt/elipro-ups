@@ -264,8 +264,7 @@ class StartupProbeIntegrationTests(unittest.TestCase):
         self.assertEqual(self.monitor.events(), initial_events)
         self.assertEqual(self.broker.status()["retained_records"], 0)
         self.socket.assert_not_called()
-        with patch("ups_monitor.reports.validation_record", return_value={"available": False}), \
-             patch("ups_monitor.reports.guardian_status", return_value={"available": False}):
+        with patch("ups_monitor.reports.guardian_status", return_value={"available": False}):
             report = diagnostics(self.monitor)
         self.assertEqual(report["health"]["usb_ownership"], ownership)
         encoded = json.dumps(report, allow_nan=False)

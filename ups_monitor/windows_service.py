@@ -2,8 +2,8 @@
 
 The service owns USB, policy and history. Desktop delivery is delegated to the
 per-session agent. Installation deliberately keeps --dry-run unless an
-administrator explicitly registers --allow-power-actions. That capability never
-enables the saved policy; both gates must allow a real action independently.
+administrator explicitly registers --allow-power-actions. Physical UPS power-off
+also requires --allow-ups-poweroff. Neither capability enables a saved policy.
 
 SCM contracts: https://learn.microsoft.com/windows/win32/services/service-programs
 """
@@ -16,6 +16,7 @@ import logging
 from logging.handlers import RotatingFileHandler
 import os
 from pathlib import Path
+import shlex
 import subprocess
 import sys
 import threading
@@ -38,6 +39,8 @@ SC_MANAGER_CONNECT, SC_MANAGER_CREATE_SERVICE = 1, 2
 SERVICE_QUERY_CONFIG, SERVICE_CHANGE_CONFIG, SERVICE_QUERY_STATUS = 1, 2, 4
 SERVICE_START, SERVICE_STOP, DELETE = 0x10, 0x20, 0x10000
 ERROR_SERVICE_DOES_NOT_EXIST, ERROR_SERVICE_NOT_ACTIVE, ERROR_SERVICE_ALREADY_RUNNING = 1060, 1062, 1056
+SERVICE_CONTROL_POWEREVENT, SERVICE_ACCEPT_POWEREVENT = 0x0D, 0x40
+PBT_APMSUSPEND, PBT_APMRESUMESUSPEND, PBT_APMRESUMEAUTOMATIC = 4, 7, 18
 
 
 class SERVICE_STATUS(ctypes.Structure):
@@ -67,6 +70,10 @@ class SC_ACTION(ctypes.Structure):
 class FAILURE_ACTIONS(ctypes.Structure):
     _fields_ = [("reset", DWORD), ("reboot", ctypes.c_wchar_p), ("command", ctypes.c_wchar_p),
                 ("count", DWORD), ("actions", ctypes.POINTER(SC_ACTION))]
+
+
+class TOKEN_USER(ctypes.Structure):
+    _fields_ = [("sid", HANDLE), ("attributes", DWORD)]
 
 
 def _error(operation):
@@ -104,8 +111,8 @@ def _apis():
     return api
 
 
-def _validate_modes(self_test, allow_power_actions, simulate=False):
-    if any(type(value) is not bool for value in (self_test, allow_power_actions, simulate)):
+def _validate_modes(self_test, allow_power_actions, simulate=False, allow_ups_poweroff=False):
+    if any(type(value) is not bool for value in (self_test, allow_power_actions, simulate, allow_ups_poweroff)):
         raise ValueError("Las opciones de servicio deben ser booleanas.")
     if self_test and allow_power_actions:
         raise ValueError("--self-test no admite --allow-power-actions.")
@@ -113,10 +120,17 @@ def _validate_modes(self_test, allow_power_actions, simulate=False):
         raise ValueError("--simulate no admite --allow-power-actions.")
     if simulate and self_test:
         raise ValueError("--simulate no admite --self-test.")
+    if self_test and allow_ups_poweroff:
+        raise ValueError("--self-test no admite --allow-ups-poweroff.")
+    if simulate and allow_ups_poweroff:
+        raise ValueError("--simulate no admite --allow-ups-poweroff.")
+    if allow_ups_poweroff and not allow_power_actions:
+        raise ValueError("--allow-ups-poweroff requiere --allow-power-actions.")
 
 
-def service_command(data_dir, port=8765, *, self_test=False, allow_power_actions=False, simulate=False):
-    _validate_modes(self_test, allow_power_actions, simulate)
+def service_command(data_dir, port=8765, *, self_test=False, allow_power_actions=False, simulate=False,
+                    allow_ups_poweroff=False):
+    _validate_modes(self_test, allow_power_actions, simulate, allow_ups_poweroff)
     if not 1 <= port <= 65535:
         raise ValueError("Puerto inválido.")
     command = child_command("service", "run", "--data-dir", Path(data_dir).resolve(), "--port", port)
@@ -126,6 +140,8 @@ def service_command(data_dir, port=8765, *, self_test=False, allow_power_actions
         command.append("--allow-power-actions")
     if simulate:
         command.append("--simulate")
+    if allow_ups_poweroff:
+        command.append("--allow-ups-poweroff")
     return command
 
 
@@ -179,12 +195,95 @@ def _owned_binary(binary_path):
     return binary_path == expected or binary_path.startswith(expected + " ")
 
 
-def manage(command, *, data_dir=None, port=8765, self_test=False, allow_power_actions=False, simulate=False, api=None):
-    _validate_modes(self_test, allow_power_actions, simulate)
+def _registration_modes(binary_path):
+    # Registrations are generated with list2cmdline; preserve quoted paths so
+    # flag text inside a data-directory name cannot grant a capability.
+    arguments = shlex.split(binary_path, posix=False)
+    return {"self_test": "--self-test" in arguments,
+            "allow_power_actions": "--allow-power-actions" in arguments,
+            "allow_ups_poweroff": "--allow-ups-poweroff" in arguments,
+            "simulation": "--simulate" in arguments}
+
+
+def _token_apis():
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    security = ctypes.WinDLL("advapi32", use_last_error=True)
+    kernel.GetCurrentProcess.argtypes, kernel.GetCurrentProcess.restype = [], HANDLE
+    kernel.CloseHandle.argtypes, kernel.CloseHandle.restype = [HANDLE], ctypes.c_int
+    security.OpenProcessToken.argtypes = [HANDLE, DWORD, ctypes.POINTER(HANDLE)]
+    security.OpenProcessToken.restype = ctypes.c_int
+    security.GetTokenInformation.argtypes = [HANDLE, ctypes.c_int, HANDLE, DWORD, ctypes.POINTER(DWORD)]
+    security.GetTokenInformation.restype = ctypes.c_int
+    security.IsWellKnownSid.argtypes, security.IsWellKnownSid.restype = [HANDLE, ctypes.c_int], ctypes.c_int
+    return kernel, security
+
+
+def _is_local_system():
+    """Check the process token's user SID, never a forgeable account variable."""
+    if os.name != "nt":
+        return False
+    try:
+        kernel, security = _token_apis()
+        token = HANDLE()
+        if (not security.OpenProcessToken(kernel.GetCurrentProcess(), 0x0008, ctypes.byref(token))  # TOKEN_QUERY
+                or not token.value):
+            return False
+        try:
+            needed = DWORD()
+            security.GetTokenInformation(token, 1, None, 0, ctypes.byref(needed))  # TokenUser
+            if not ctypes.sizeof(TOKEN_USER) <= needed.value <= 65536:
+                return False
+            buffer = ctypes.create_string_buffer(needed.value)
+            if not security.GetTokenInformation(token, 1, buffer, needed.value, ctypes.byref(needed)):
+                return False
+            user = ctypes.cast(buffer, ctypes.POINTER(TOKEN_USER)).contents
+            return bool(user.sid) and bool(security.IsWellKnownSid(user.sid, 22))  # WinLocalSystemSid
+        finally:
+            kernel.CloseHandle(token)
+    except Exception:
+        return False
+
+
+def control_worker_authorized():
+    """Read-only gate for every control worker, including direct CLI invocation."""
+    try:
+        if not _is_local_system():
+            return False
+        api = _apis()
+        manager = api.OpenSCManagerW(None, None, SC_MANAGER_CONNECT)
+        if not manager:
+            return False
+        handle = None
+        try:
+            handle = api.OpenServiceW(manager, NAME, SERVICE_QUERY_STATUS | SERVICE_QUERY_CONFIG)
+            if not handle:
+                return False
+            status = _query(api, handle)
+            if status.get("installed") is not True or status.get("state") != "running":
+                return False
+            binary = _configuration(api, handle)["binary_path"]
+            if not _owned_binary(binary):
+                return False
+            modes = _registration_modes(binary)
+            return (modes["allow_power_actions"] and modes["allow_ups_poweroff"]
+                    and not modes["self_test"] and not modes["simulation"])
+        finally:
+            if handle:
+                api.CloseServiceHandle(handle)
+            api.CloseServiceHandle(manager)
+    except Exception:
+        return False
+
+
+def manage(command, *, data_dir=None, port=8765, self_test=False, allow_power_actions=False, simulate=False,
+           allow_ups_poweroff=False, api=None):
+    _validate_modes(self_test, allow_power_actions, simulate, allow_ups_poweroff)
     if allow_power_actions and command != "install":
         raise ValueError("--allow-power-actions requiere registrar el servicio con install.")
     if simulate and command != "install":
         raise ValueError("--simulate requiere registrar el servicio con install.")
+    if allow_ups_poweroff and command != "install":
+        raise ValueError("--allow-ups-poweroff requiere registrar el servicio con install.")
     api = api or _apis()
     access = SC_MANAGER_CONNECT | (SC_MANAGER_CREATE_SERVICE if command == "install" else 0)
     manager = api.OpenSCManagerW(None, None, access)
@@ -206,7 +305,8 @@ def manage(command, *, data_dir=None, port=8765, self_test=False, allow_power_ac
             raise _error("abrir")
         if command == "install":
             vector = service_command(data_dir or service_data_dir(), port, self_test=self_test,
-                                     allow_power_actions=allow_power_actions, simulate=simulate)
+                                     allow_power_actions=allow_power_actions, simulate=simulate,
+                                     allow_ups_poweroff=allow_ups_poweroff)
             binary = subprocess.list2cmdline(vector)
             if handle:
                 if not _owned_binary(_configuration(api, handle)["binary_path"]):
@@ -227,12 +327,13 @@ def manage(command, *, data_dir=None, port=8765, self_test=False, allow_power_ac
             if not api.ChangeServiceConfig2W(handle, 4, ctypes.byref(on_failure)):
                 raise _error("configurar errores de")
             return {**_query(api, handle), "self_test": self_test,
-                    "allow_power_actions": allow_power_actions, "simulation": simulate}
+                    "allow_power_actions": allow_power_actions, "allow_ups_poweroff": allow_ups_poweroff,
+                    "simulation": simulate}
         if not handle:
             if command == "start":
                 raise RuntimeError("El servicio Elipro no está instalado.")
             return {"name": NAME, "installed": False, "state": "absent", "pid": 0,
-                    "self_test": False, "allow_power_actions": False, "simulation": False}
+                    "self_test": False, "allow_power_actions": False, "allow_ups_poweroff": False, "simulation": False}
         configuration = _configuration(api, handle)
         if command != "status" and not _owned_binary(configuration["binary_path"]):
             raise RuntimeError("El servicio EliproUPS existente usa otro ejecutable; no se modificará.")
@@ -246,13 +347,12 @@ def manage(command, *, data_dir=None, port=8765, self_test=False, allow_power_ac
                 if not api.DeleteService(handle):
                     raise _error("eliminar")
                 return {"name": NAME, "installed": False, "state": "absent", "pid": 0,
-                        "self_test": False, "allow_power_actions": False, "simulation": False}
+                        "self_test": False, "allow_power_actions": False, "allow_ups_poweroff": False,
+                        "simulation": False}
             result = _query(api, handle)
         else:
             result = _query(api, handle)
-        return {**result, "self_test": "--self-test" in configuration["binary_path"],
-                "allow_power_actions": "--allow-power-actions" in configuration["binary_path"],
-                "simulation": "--simulate" in configuration["binary_path"]}
+        return {**result, **_registration_modes(configuration["binary_path"])}
     finally:
         if handle:
             api.CloseServiceHandle(handle)
@@ -261,9 +361,11 @@ def manage(command, *, data_dir=None, port=8765, self_test=False, allow_power_ac
 
 class ServiceHost:
     def __init__(self, args, *, api=None, target=None):
-        _validate_modes(args.self_test, getattr(args, "allow_power_actions", False), getattr(args, "simulate", False))
+        _validate_modes(args.self_test, getattr(args, "allow_power_actions", False), getattr(args, "simulate", False),
+                        getattr(args, "allow_ups_poweroff", False))
         self.args, self.api, self.target = args, api or _apis(), target
         self.stop_event = threading.Event()
+        self.monitor = None
         self.handle = None
         self._state_lock = threading.RLock()
         self._last_status = None
@@ -272,7 +374,7 @@ class ServiceHost:
 
     def _report(self, state, *, exit_code=0):
         with self._state_lock:
-            accepted = 1 | 4 if state == RUNNING else 0  # STOP | SHUTDOWN
+            accepted = 1 | 4 | SERVICE_ACCEPT_POWEREVENT if state == RUNNING else 0  # STOP | SHUTDOWN | POWEREVENT
             pending = state in (START_PENDING, STOP_PENDING)
             status = SERVICE_STATUS(0x10, state, accepted, exit_code, 1 if exit_code else 0,
                                     1 if pending else 0, 30000 if pending else 0)
@@ -288,9 +390,24 @@ class ServiceHost:
                 pass
             finally:
                 self.stop_event.set()
+        elif code == SERVICE_CONTROL_POWEREVENT and not self.stop_event.is_set():
+            event = {PBT_APMSUSPEND: "suspend", PBT_APMRESUMEAUTOMATIC: "resume",
+                     PBT_APMRESUMESUSPEND: "resume"}.get(_event_type)
+            monitor = self.monitor
+            if event is not None and monitor is not None:
+                try:
+                    # Monitor only sets a gate and pending flags here. Never do
+                    # USB, disk, notifications, waits or restarts in SCM's handler.
+                    monitor.handle_power_event(event)
+                except Exception:
+                    # Exceptions must not cross the native callback or trigger
+                    # blocking error logging while Windows is entering sleep.
+                    pass
         return 0
 
-    def _ready(self):
+    def _ready(self, monitor=None):
+        if monitor is not None:
+            self.monitor = monitor
         self._report(STOP_PENDING if self.stop_event.is_set() else RUNNING)
 
     def _run_target(self):
@@ -308,6 +425,9 @@ class ServiceHost:
                   "--port", str(self.args.port)]
         if simulated or not getattr(self.args, "allow_power_actions", False):
             vector.append("--dry-run")
+        if (not simulated and getattr(self.args, "allow_power_actions", False)
+                and getattr(self.args, "allow_ups_poweroff", False)):
+            vector.append("--allow-ups-poweroff")
         target(vector, stop_event=self.stop_event,
                ready_callback=self._ready)
 
@@ -326,6 +446,7 @@ class ServiceHost:
             self._log_failure(exc)
         finally:
             self.stop_event.set()
+            self.monitor = None
             self._report(STOPPED, exit_code=failure)
 
     def _log_failure(self, exc):
@@ -362,6 +483,8 @@ def main(argv=None):
     parser.add_argument("--simulate", action="store_true", help="Monitor y política reales con telemetría simulada; bloquea acciones Windows")
     parser.add_argument("--allow-power-actions", action="store_true",
                         help="Opt-in administrativo al registrar/ejecutar el servicio; no activa la política guardada")
+    parser.add_argument("--allow-ups-poweroff", action="store_true",
+                        help="Autoriza el apagado físico del UPS; requiere --allow-power-actions y servicio nativo")
     args = parser.parse_args(argv)
     if not 1 <= args.port <= 65535:
         parser.error("Puerto fuera de rango")
@@ -373,11 +496,18 @@ def main(argv=None):
         parser.error("--simulate solo se admite con install o run")
     if args.allow_power_actions and args.command not in ("install", "run"):
         parser.error("--allow-power-actions solo se admite con install o run")
+    if args.allow_ups_poweroff and args.command not in ("install", "run"):
+        parser.error("--allow-ups-poweroff solo se admite con install o run")
+    try:
+        _validate_modes(args.self_test, args.allow_power_actions, args.simulate, args.allow_ups_poweroff)
+    except ValueError as exc:
+        parser.error(str(exc))
     try:
         if args.command == "run":
             return ServiceHost(args).run()
         print(json.dumps(manage(args.command, data_dir=args.data_dir, port=args.port, self_test=args.self_test,
-                                allow_power_actions=args.allow_power_actions, simulate=args.simulate), ensure_ascii=False))
+                                allow_power_actions=args.allow_power_actions, simulate=args.simulate,
+                                allow_ups_poweroff=args.allow_ups_poweroff), ensure_ascii=False))
         return 0
     except (OSError, RuntimeError, ValueError) as exc:
         print(str(exc), file=sys.stderr)

@@ -23,20 +23,36 @@ from urllib.parse import parse_qs, urlsplit
 from . import __version__
 from .adapters import TelemetryError
 from .native_adapter import make_adapter
-from .core import (BATTERY_ESTIMATE_FIELDS, DEFAULT_POLICY, SAMPLE_FIELDS, PolicyEngine,
+from .core import (BATTERY_ESTIMATE_FIELDS, DEFAULT_POLICY, SAMPLE_FIELDS, IncidentCursorExpired, PolicyEngine,
                    TelemetryRingBuffer, battery_estimate_fields, iso_utc, validate_policy)
 from .alerts import AlertManager, DEFAULT_NOTIFICATION_SETTINGS
 from .instance_guard import MonitorInstanceGuard, InstanceGuardError
 from .health import MonitorHealth
 from .persistence import ResilientStore, HistoryUnavailable
 from .windows_notifications import WindowsNotifier
-from .reports import backup_archive, csv_cell, diagnostics, save_validation, validation_record
-from .stability import StabilityObservation
+from .reports import csv_cell
 from .guardian import request_parent_stop
 from .runtime import default_data_dir, resource_root
+from .ups_power import UpsPowerCoordinator, UpsPowerBlocked
+from .ups_cancel_test import UpsCancellationTest
+from .ups_battery_test import UpsBatteryTest
+from .ups_reserve import UpsReserveTracker
+from .ups_sequence import UpsSequenceTracker
 
 ROOT = resource_root()
 LOGGER = logging.getLogger("elipro.monitor")
+
+
+class _PowerTransition(Exception):
+    """A read crossed a known Windows sleep boundary and must be discarded."""
+
+
+class _ReadDeferred(Exception):
+    """An explicit control transaction temporarily owns the USB reader."""
+
+
+class WindowsActionUnconfirmed(RuntimeError):
+    """The request may have acted; lack of process completion is not rejection."""
 
 
 def log_failure(message, exc):
@@ -50,15 +66,19 @@ def windows_action(action):
     executable = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "shutdown.exe"
     # Countdown is handled by us. /t > 0 would imply forced app termination.
     args = [str(executable), "/s", "/t", "0"] if action == "shutdown" else [str(executable), "/h"]
-    result = subprocess.run(args, capture_output=True, timeout=10,
-                            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    try:
+        result = subprocess.run(args, capture_output=True, timeout=10,
+                                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except subprocess.TimeoutExpired:
+        raise WindowsActionUnconfirmed(
+            "No se confirmó el resultado de la solicitud a Windows dentro del plazo; podría haber suspendido o hibernado el equipo.") from None
     if result.returncode:
         raise RuntimeError("Windows rechazó la acción. Revisa permisos o disponibilidad de hibernación.")
 
 
 def archive_options(query, *, incidents=False, pagination=True):
     values = parse_qs(query, keep_blank_values=True)
-    allowed = {"from", "to"} | (set() if incidents else {"kind", "q"})
+    allowed = {"from", "to"} | ({"sort", "direction"} if incidents else {"kind", "q"})
     if pagination:
         allowed |= {"limit", "cursor"}
     if set(values) - allowed or any(len(value) != 1 for value in values.values()):
@@ -68,6 +88,10 @@ def archive_options(query, *, incidents=False, pagination=True):
     if not incidents:
         result.update(kind=values.get("kind", [""])[0] or None,
                       query=values.get("q", [""])[0] or None)
+    else:
+        for name in ("sort", "direction"):
+            if name in values:
+                result[name] = values[name][0]
     if pagination:
         result.update(limit=int(values.get("limit", ["50"])[0]),
                       cursor=values.get("cursor", [""])[0] or None)
@@ -85,10 +109,20 @@ def write_events_csv(store, options, target):
 
 class Monitor:
     def __init__(self, store, adapter, *, dry_run=False, action_callback=None, alerts=None, health_clock=None,
-                 telemetry_capacity=256, poll_interval=2):
+                 telemetry_capacity=256, poll_interval=2, allow_ups_poweroff=False, ups_power=None, ups_journal_path=None,
+                 ups_cancel_test=None, ups_cancel_test_journal=None, ups_battery_test=None, ups_battery_test_journal=None):
         self.store, self.adapter = store, adapter
         self.simulation_source = getattr(adapter, "simulation", False) is True
         self.dry_run = bool(dry_run) or self.simulation_source
+        if type(allow_ups_poweroff) is not bool:
+            raise ValueError("allow_ups_poweroff debe ser booleano")
+        self.allow_ups_poweroff = allow_ups_poweroff and not self.dry_run
+        self.ups_power = ups_power if ups_power is not None else UpsPowerCoordinator(ups_journal_path)
+        self.ups_cancel_test = ups_cancel_test if ups_cancel_test is not None else UpsCancellationTest(ups_cancel_test_journal)
+        self.ups_battery_test = ups_battery_test if ups_battery_test is not None else UpsBatteryTest(ups_battery_test_journal)
+        self._cancel_test_io = threading.Event()
+        self._windows_request = None
+        self._ups_error = None
         self.alerts = alerts
         self.lock = threading.RLock()
         self.settings_lock = threading.Lock()
@@ -107,7 +141,16 @@ class Monitor:
         self._poll_failures = 0
         self._next_poll_at = None
         self.health = MonitorHealth(clock=health_clock)
+        self.ups_reserve = UpsReserveTracker(clock=self.health.clock)
+        self.ups_sequence = UpsSequenceTracker(clock=self.health.clock)
         self._health_fault = threading.Event()
+        self._power_lock = threading.RLock()
+        self._power_gate = threading.Event()
+        self._poll_wake = threading.Event()
+        self._power_state = "running"
+        self._power_generation = self._power_applied_generation = 0
+        self._power_resume_deadline = None
+        self._resume_silent = False
         self._pending_health_failure = None
         self._last_health_notice = None
         self._reader_dead_since = None
@@ -123,15 +166,28 @@ class Monitor:
         self.low = self.overload = False
         self.test_deadline = None
         self.test_finished = False
+        self.test_ups_delay = None
+        self.test_ups_simulation = None
         self.csrf_token = secrets.token_urlsafe(32)
         self.action_callback = action_callback or windows_action
+        migrated_countdown = False
         try:
-            policy = validate_policy(store.get_setting("policy", DEFAULT_POLICY))
+            saved_policy = store.get_setting("policy", DEFAULT_POLICY)
+            if isinstance(saved_policy, dict) and type(saved_policy.get("countdown_seconds")) is int and 120 < saved_policy["countdown_seconds"] <= 3600:
+                saved_policy = {**saved_policy, "countdown_seconds": 120}
+                migrated_countdown = True
+            policy = validate_policy(saved_policy)
         except Exception as exc:
             self._history_failed("settings", exc)
             policy = dict(DEFAULT_POLICY)
         self.engine = PolicyEngine(policy,
                                    self._act, event_callback=self._policy_event)
+        if migrated_countdown:
+            try:
+                store.set_setting("policy", policy)
+                self._record_event("policy_changed", "Tiempo para cancelar ajustado al máximo admitido de 120 segundos.")
+            except Exception as exc:
+                self._history_failed("settings_write", exc)
 
     def _history_failed(self, operation, exc):
         if operation not in self._history_failures:
@@ -197,6 +253,8 @@ class Monitor:
         return self.snapshot()
 
     def _policy_event(self, kind, message, data):
+        if kind == "policy_unknown" and self.system_power_status()["state"] != "running":
+            return
         if self.power_actions_blocked and kind == "policy_action_started":
             return
         # Routine online/disabled states add no noise to the incident history.
@@ -205,11 +263,424 @@ class Monitor:
                 data = {**(data or {}), **self.engine.status(), "simulation": self.power_actions_blocked}
             self._event(kind, message, data)
 
+    def handle_power_event(self, event):
+        """SCM callback: only bounded memory updates, never USB, disk or decision locks."""
+        if self.stop_event.is_set() or event not in ("suspend", "resume"):
+            return
+        if event == "suspend":
+            self.ups_power.signal_interruption()
+            self.ups_battery_test.signal_interruption()
+            self.ups_cancel_test.signal_interruption()
+        with self._power_lock:
+            if event == "suspend":
+                if self._power_state == "suspended":
+                    return
+                if self._power_state == "running":
+                    self._resume_silent = self.connection == "connected" and not self._health_fault.is_set()
+                self._power_state = "suspended"
+                self._power_resume_deadline = None
+            else:
+                # Windows also sends a user-resume after its automatic-resume.
+                # Duplicates must neither extend grace nor reset fresh telemetry.
+                if self._power_state != "suspended":
+                    return
+                self._power_state = "resuming"
+                self._power_resume_deadline = self.health.clock() + 15
+            self._power_generation += 1
+            self._power_gate.set()
+            self._poll_wake.set()
+
+    def system_power_status(self):
+        with self._power_lock:
+            return {"state": self._power_state, "generation": self._power_generation,
+                    "resume_remaining": max(0, round(self._power_resume_deadline - self.health.clock(), 1))
+                    if self._power_resume_deadline is not None else None}
+
+    def ups_cancel_test_status(self):
+        native = not self.power_actions_blocked and getattr(self.adapter, "bridge_required", True) is False
+        try:
+            operation = self.ups_power.status()
+        except Exception:
+            operation = {"state": "review_required"}
+        blocked = (not native or self.stop_event.is_set() or self._power_gate.is_set()
+                   or self.engine.policy["ups_poweroff"] or self.ups_battery_test.pending()
+                   or operation.get("state") not in ("idle", "cancelled", "completed"))
+        return self.ups_cancel_test.status(device=getattr(self.adapter, "device_identity", None), sample=self.sample,
+                                           policy_enabled=self.engine.policy["enabled"], blocked=blocked)
+
+    def physical_test_pending(self):
+        return self.ups_cancel_test.pending() or self.ups_battery_test.pending()
+
+    def ups_battery_test_status(self):
+        native = not self.power_actions_blocked and getattr(self.adapter, "bridge_required", True) is False
+        blocked = (not native or self.stop_event.is_set() or self._power_gate.is_set()
+                   or self.engine.policy["ups_poweroff"] or self.ups_cancel_test.pending()
+                   or self.ups_power.status().get("state") not in ("idle", "cancelled", "completed"))
+        return self.ups_battery_test.status(device=getattr(self.adapter, "device_identity", None), sample=self.sample,
+                                            policy_enabled=self.engine.policy["enabled"], blocked=blocked)
+
+    def _observe_battery_test(self, sample):
+        before = self.ups_battery_test_status()
+        self.ups_battery_test.observe(device=getattr(self.adapter, "device_identity", None), sample=sample)
+        after = self.ups_battery_test_status()
+        if (after["state"], after.get("result")) != (before["state"], before.get("result")):
+            self._record_event("ups_battery_test", after["message"],
+                               {"operation_id": after.get("operation_id"), "state": after["state"],
+                                "result": after.get("result"), "production_validated": False})
+
+    def confirm_ups_battery_observation(self, data):
+        with self.settings_lock, self.lock:
+            result = self.ups_battery_test.confirm_observation(
+                device=getattr(self.adapter, "device_identity", None), sample=self.sample, **data)
+            self._record_event("ups_battery_test_reviewed", result["message"],
+                               {"operation_id": result["operation_id"], "result": result.get("result"),
+                                "source": "user_physical_observation", "production_validated": False})
+            return self.snapshot()
+
+    def run_ups_battery_test(self, *, acknowledge_risk=False):
+        # Only an explicit authenticated POST enters this path. Loss of mains,
+        # polling, starting the service and resuming Windows never start a test.
+        with self.settings_lock:
+            if (self.stop_event.is_set() or self._power_gate.is_set() or self.power_actions_blocked
+                    or getattr(self.adapter, "bridge_required", True) is not False):
+                raise UpsPowerBlocked("La prueba requiere el servicio USB nativo y Windows sin transición de energía.")
+            if acknowledge_risk is not True:
+                raise UpsPowerBlocked("Confirma el riesgo de corte real y la hibernación inmediata de esta PC.")
+            generation = self.system_power_status()["generation"]
+
+            def guard():
+                if self.stop_event.is_set() or self._power_gate.is_set() or not self._read_generation_current(generation):
+                    raise UpsPowerBlocked("Windows cambió de estado; no se enviarán nuevas órdenes de prueba.")
+
+            windows_result = {"requested": False, "error": None}
+
+            def request_hibernation():
+                # Invoked immediately after a possible USB write, before any
+                # post-write journal/status I/O. Stopping the service alone
+                # must not abandon Windows with an armed UPS output cutoff.
+                try:
+                    if self._power_gate.is_set() or not self._read_generation_current(generation):
+                        raise WindowsActionUnconfirmed("Windows ya cambió de estado; no se repetirá su solicitud de hibernación.")
+                    self.action_callback("hibernate")
+                    if self._power_gate.is_set() or not self._read_generation_current(generation):
+                        raise WindowsActionUnconfirmed("Se observó una transición de energía durante la solicitud; no se repetirá.")
+                    windows_result["requested"] = True
+                except (WindowsActionUnconfirmed, subprocess.TimeoutExpired) as exc:
+                    windows_result["requested"] = None
+                    windows_result["error"] = (str(exc)[:200] if isinstance(exc, WindowsActionUnconfirmed) else
+                                               "La solicitud a Windows no confirmó su resultado dentro del plazo.")
+                except Exception as exc:
+                    if self._power_gate.is_set() or not self._read_generation_current(generation):
+                        windows_result["requested"] = None
+                        windows_result["error"] = "La solicitud atravesó una transición de energía; su resultado no se deduce del proceso."
+                    else:
+                        windows_result["error"] = str(exc)[:200]
+
+            self._cancel_test_io.set()
+            try:
+                if not self._read_lock.acquire(timeout=2):
+                    raise UpsPowerBlocked("El lector está ocupado; no se envió la orden de prueba.")
+                try:
+                    with self.lock:
+                        guard()
+                        if (self.engine.policy["enabled"] or self.engine.policy["ups_poweroff"]
+                                or self.ups_cancel_test.pending()
+                                or self.ups_power.status().get("state") not in ("idle", "cancelled", "completed")):
+                            raise UpsPowerBlocked("Desactiva y guarda la protección y resuelve las demás operaciones del UPS.")
+                        sample = self.adapter.read()
+                        guard()
+                        if not self._fresh_sample(sample):
+                            raise UpsPowerBlocked("No hay una lectura reciente para iniciar la prueba en batería.")
+                        device = getattr(self.adapter, "device_identity", None)
+                        self.ups_battery_test.observe(device=device, sample=sample)
+                        result = self.ups_battery_test.start(device=device, sample=sample, policy_enabled=False,
+                                                             blocked=False, acknowledge_risk=True, guard=guard,
+                                                             on_submission=request_hibernation)
+                finally:
+                    self._read_lock.release()
+                if result.get("operation_id") is None:
+                    raise UpsPowerBlocked("No se creó una operación propia de prueba; no se solicitó hibernación.")
+                if self._power_gate.is_set() or not self._read_generation_current(generation):
+                    windows_result["requested"] = None
+                    windows_result["error"] = "Se observó una transición de energía durante la prueba; no se repetirá la solicitud a Windows."
+                if not windows_result["requested"]:
+                    self.ups_battery_test.record_windows_request(windows_result["requested"], error=windows_result["error"])
+                    if not self._power_gate.is_set() and self._read_generation_current(generation):
+                        try:
+                            if not self._read_lock.acquire(timeout=2):
+                                raise UpsPowerBlocked("No se obtuvo una lectura inmediata para cancelar.")
+                            try:
+                                current = self.adapter.read()
+                                guard()
+                                self.ups_battery_test.cancel_after_windows_failure(device=device, sample=current, guard=guard)
+                            finally:
+                                self._read_lock.release()
+                        except Exception:
+                            pass  # Preserve the durable uncertain result, never retry.
+                    uncertain = windows_result["requested"] is None
+                    transitioned = self.system_power_status()["generation"] != generation
+                    if transitioned:
+                        self._event("ups_battery_test_windows_unconfirmed", "Hubo una transición de energía; el resultado del proceso no confirma la finalización. "
+                                    "Registra la observación física; no se repetirán órdenes.")
+                    else:
+                        self._event("ups_battery_test_windows_unconfirmed" if uncertain else "ups_battery_test_unconfirmed",
+                                    ("No se confirmó el resultado de la solicitud de hibernación. " if uncertain else "Windows rechazó la hibernación. ") +
+                                    "El corte del UPS podría seguir pendiente; no repitas la prueba. "
+                                    "Si Windows sigue activo, guarda tu trabajo e hiberna manualmente cuanto antes.")
+                else:
+                    self.ups_battery_test.record_windows_request(True)
+                    self._record_event("ups_battery_test", "Prueba en batería: hibernación solicitada a Windows; "
+                                       "no significa que haya terminado de guardar la memoria.",
+                                       {"operation_id": result["operation_id"], "production_validated": False})
+            finally:
+                self._cancel_test_io.clear()
+                self._poll_wake.set()
+            return self.snapshot()
+
+    def _observe_cancel_test(self, sample):
+        before = self.ups_cancel_test_status()
+        self.ups_cancel_test.observe(device=getattr(self.adapter, "device_identity", None), sample=sample)
+        after = self.ups_cancel_test_status()
+        if (after["state"], after.get("result")) != (before["state"], before.get("result")):
+            payload = {"operation_id": after["operation_id"], "state": after["state"],
+                       "result": after.get("result"), "production_validated": False}
+            if after["state"] == "uncertain":
+                self._event("ups_cancel_test_unconfirmed", after["message"], payload)
+            else:
+                self._record_event("ups_cancel_test", after["message"], payload)
+
+    def close_ups_cancel_test(self, data):
+        with self.settings_lock, self.lock:
+            result = self.ups_cancel_test.close_observed_cut(
+                device=getattr(self.adapter, "device_identity", None), sample=self.sample, **data)
+            self._record_event("ups_cancel_test_reviewed", result["message"],
+                               {"operation_id": result["operation_id"], "result": result["result"],
+                                "source": "user_physical_observation", "production_validated": False})
+            return self.snapshot()
+
+    def confirm_ups_cancel_observation(self, data):
+        with self.settings_lock, self.lock:
+            result = self.ups_cancel_test.confirm_observation(
+                device=getattr(self.adapter, "device_identity", None), sample=self.sample, **data)
+            self._record_event("ups_cancel_test_reviewed", result["message"],
+                               {"operation_id": result["operation_id"], "result": result["result"],
+                                "source": "user_independent_load", "production_validated": False})
+            return self.snapshot()
+
+    def run_ups_cancel_test(self, *, cancel=False, acknowledge_risk=False):
+        with self.settings_lock:
+            return self._run_ups_cancel_test(cancel=cancel, acknowledge_risk=acknowledge_risk)
+
+    def _run_ups_cancel_test(self, *, cancel=False, acknowledge_risk=False):
+        # Both HTTP operations are manual. Nothing in polling, policy or resume
+        # can enter this path, and USB remains exclusive across query + control.
+        if self.stop_event.is_set() or self._power_gate.is_set() or self.power_actions_blocked:
+            raise UpsPowerBlocked("La prueba requiere el servicio nativo activo y Windows sin transición de energía.")
+        if getattr(self.adapter, "bridge_required", True) is not False:
+            raise UpsPowerBlocked("La prueba física requiere el lector USB nativo.")
+        if not cancel and acknowledge_risk is not True:
+            raise UpsPowerBlocked("Debes confirmar el riesgo de una prueba física real.")
+        self._cancel_test_io.set()
+        power_generation = self.system_power_status()["generation"]
+        def check_power_transition():
+            if self.stop_event.is_set() or self._power_gate.is_set() or not self._read_generation_current(power_generation):
+                raise UpsPowerBlocked("Windows cambió de estado; la prueba queda bloqueada.")
+        try:
+            if not self._read_lock.acquire(timeout=2):
+                raise UpsPowerBlocked("El lector está ocupado; no se envió ninguna orden de prueba.")
+            try:
+                with self.lock:
+                    if self.stop_event.is_set() or self._power_gate.is_set():
+                        raise UpsPowerBlocked("Windows cambió de estado; no se enviará una orden de prueba.")
+                    if not cancel and (self.engine.policy["enabled"] or self.engine.policy["ups_poweroff"]):
+                        raise UpsPowerBlocked("Desactiva y guarda la protección automática antes de una prueba física.")
+                    if self.ups_battery_test.pending():
+                        raise UpsPowerBlocked("Resuelve primero la prueba en batería; no se enviará otra orden.")
+                    if self.ups_power.status().get("state") not in ("idle", "cancelled", "completed"):
+                        raise UpsPowerBlocked("Hay una operación de producción del UPS pendiente; no se iniciará una prueba.")
+                    sample = self.adapter.read()
+                    check_power_transition()
+                    if not self._fresh_sample(sample):
+                        raise UpsPowerBlocked("No se obtuvo una lectura reciente; no se envió control.")
+                    device = getattr(self.adapter, "device_identity", None)
+                    self._observe_cancel_test(sample)
+                    if cancel:
+                        result = self.ups_cancel_test.cancel(device=device, sample=sample, guard=check_power_transition)
+                    else:
+                        result = self.ups_cancel_test.start(device=device, sample=sample, policy_enabled=False,
+                                                            blocked=False, acknowledge_risk=acknowledge_risk, guard=check_power_transition)
+                    self._record_event("ups_cancel_test", "Prueba física manual de cancelación: " + result["state"],
+                                       {"operation_id": result["operation_id"], "state": result["state"],
+                                        "production_validated": False})
+            finally:
+                self._read_lock.release()
+        finally:
+            self._cancel_test_io.clear()
+            self._poll_wake.set()
+        return self.snapshot()
+
+    def _read_generation_current(self, generation):
+        with self._power_lock:
+            return self._power_state != "suspended" and generation == self._power_generation
+
+    def _sync_power_state(self):
+        """Called under the decision lock; no Windows callback waits for this work."""
+        with self._power_lock:
+            state, generation = self._power_state, self._power_generation
+            changed = generation != self._power_applied_generation
+            expired = (state == "resuming" and self._power_resume_deadline is not None
+                       and self.health.clock() >= self._power_resume_deadline)
+            if expired:
+                self._power_state, self._power_resume_deadline = "running", None
+        if changed:
+            self.ups_reserve.invalidate()
+            self.ups_sequence.invalidate()
+            self._power_applied_generation = generation
+            self.sample = None
+            self._pending_health_failure = self._last_health_notice = None
+            self._last_processed_at = self.health.clock()
+            self._next_poll_at = None
+            self._poll_failures = 0
+            self._reader_dead_since = None
+            self.health.reset_progress_after_resume()
+            self.engine.evaluate(None)
+            self.ups_cancel_test.interrupted()
+            self.ups_battery_test.interrupted()
+            self.ups_power.interrupted()
+            if state == "resuming":
+                pending_ups = self.ups_power.status()
+                started = pending_ups.get("started_monotonic")
+                if (pending_ups.get("state") == "review_required" and pending_ups.get("submission_complete") is True
+                        and pending_ups.get("owner_pid") == os.getpid() and type(started) in (int, float)
+                        and math.isfinite(started)):
+                    remaining = pending_ups.get("delay_seconds", 0) + 30 - (self.health.clock() - started)
+                    if remaining > 0:
+                        self._event("ups_poweroff_unconfirmed", "Windows se reanudó antes de terminar el plazo de la orden del UPS. "
+                                    "El corte todavía podría ocurrir: hiberna la PC y no repitas órdenes al UPS.",
+                                    {"operation_id": pending_ups.get("operation_id"), "nominal_remaining_seconds": math.ceil(remaining)})
+            self._record_event("system_" + state, "Windows suspendió el equipo; lecturas del UPS en pausa."
+                               if state == "suspended" else "Windows se reanudó; comprobando lecturas nuevas del UPS.")
+            self.test_deadline = self.test_ups_delay = self.test_ups_simulation = None
+            self.connection = state
+            self.error = ("Windows suspendió las lecturas del UPS."
+                          if state == "suspended" else "Esperando una lectura nueva del UPS después de reanudar Windows.")
+            self.error_kind = None
+        if expired:
+            self._resume_silent = False
+            self._unavailable("El UPS no volvió a entregar datos válidos en los 15 segundos posteriores a reanudar Windows.",
+                              kind="resume")
+        return state != "running" and not expired
+
     @property
     def power_actions_blocked(self):
         return self.dry_run or self.simulation_source
 
+    def ups_power_status(self, action=None, *, policy=None):
+        policy = self.engine.policy if policy is None else policy
+        action = action or policy["action"]
+        device = getattr(self.adapter, "device_identity", None)
+        try:
+            capability = self.ups_power.capabilities(device=device, action=action,
+                delay_seconds=policy["ups_poweroff_delay_seconds"])
+            operation = self.ups_power.status()
+            if not isinstance(capability, dict) or not isinstance(operation, dict):
+                raise ValueError("Estado de control del UPS no válido")
+        except Exception as exc:
+            self._ups_error = "No se pudo consultar el control del UPS: " + str(exc)[:200]
+            capability = {"available": False, "validation": "pending", "reason": self._ups_error,
+                          "delay_seconds": None, "manual_restart": False}
+            operation = {"state": "review_required", "reason": self._ups_error, "confirmation": "unconfirmed"}
+        raw_validation = capability.get("validation")
+        result = {**capability, "validation": raw_validation if raw_validation in ("validated", "incompatible") else "pending",
+                  "reason_code": raw_validation, "manual_restart": capability.get("manual_restart", False),
+                  "authorized": self.allow_ups_poweroff, "operation": operation,
+                  "state": operation.get("state", "idle"), "windows_request": self._windows_request,
+                  "enabled": policy["ups_poweroff"]}
+        result["manual_restart_verified"] = capability.get("manual_restart") is True
+        review_check = getattr(self.ups_power, "can_review", None)
+        result["can_review"] = bool(callable(review_check) and review_check(device=device, sample=self.sample))
+        result["state"] = {"review_required": "unconfirmed", "uncertain": "unconfirmed", "arming": "pending",
+                           "armed": "pending", "cancel_submitted": "pending", "cancelling": "pending"}.get(result["state"], result["state"])
+        native = not self.simulation_source and getattr(self.adapter, "bridge_required", True) is False
+        if not native:
+            result.update(available=False, reason="El corte del UPS requiere lectura USB nativa; puente y simulación no envían controles.")
+        elif device is None or self.connection != "connected" or not self._fresh_sample(self.sample):
+            result.update(available=False, reason="El corte del UPS requiere identidad y lecturas USB recientes.")
+        result["can_configure"] = (result["available"] is True and native and self.allow_ups_poweroff
+                                   and not self.power_actions_blocked and not self.stop_event.is_set()
+                                   and not self._power_gate.is_set() and not self.physical_test_pending()
+                                   and operation.get("state") in ("idle", "cancelled", "completed"))
+        if operation.get("state") in ("review_required", "arming", "submitted", "armed", "uncertain", "cancelling", "cancel_submitted"):
+            result.update(available=False, reason=operation.get("reason", "La operación anterior del UPS requiere revisión."))
+        if self.physical_test_pending():
+            result.update(available=False, reason="Resuelve la prueba física pendiente antes de habilitar el corte automático del UPS.")
+        if not self.allow_ups_poweroff or self.power_actions_blocked:
+            result["available"] = False
+            if raw_validation == "validated" and native:
+                result["reason"] = "Falta la habilitación administrativa de acciones reales del UPS."
+        if self.sample is not None and self.sample.get("low_battery") is not False:
+            result.update(available=False, reason="Con batería baja o sin confirmar solo se solicita la protección de Windows.")
+        if capability.get("reserve_mode") == "observed_sequence":
+            result["reserve_remaining_seconds"] = None
+            admission = self.ups_sequence.status(capability, sample=self.sample, policy=policy)
+            result["sequence_admission"] = admission
+            if result["available"] and admission.get("available") is not True:
+                result.update(available=False, reason=admission.get("reason") or "Fuera de la secuencia de hibernación comprobada; se conserva la protección de Windows.")
+        else:
+            result["reserve_remaining_seconds"] = self.ups_reserve.remaining(capability, self.sample)
+            if result["available"] and (result["reserve_remaining_seconds"] is None
+                    or result["reserve_remaining_seconds"] < (capability.get("delay_seconds") or 180)):
+                result.update(available=False, reason="No hay reserva restante verificable para cubrir el corte del UPS; se conserva la protección de Windows.")
+        if not result["available"] and result["state"] == "idle":
+            result["state"] = "blocked"
+        result["simulation_delay_seconds"] = policy["ups_poweroff_delay_seconds"]
+        result["validated_delay"] = capability.get("delay_hardware_validated",
+            raw_validation == "validated" and capability.get("delay_seconds") is not None)
+        if self._ups_error:
+            result["last_error"] = self._ups_error
+        if self.test_ups_simulation is not None:
+            result["simulation"] = dict(self.test_ups_simulation)
+        restart_observation = self.ups_battery_test.compatibility(device)
+        if restart_observation is not None:
+            result.update(restart_observation)
+            if raw_validation == "profile_unvalidated":
+                result["reason"] = "El retorno automático de las salidas al volver la electricidad está aceptado. Falta completar el perfil de control y la reserva para el corte automático."
+        return result
+
+    def _observe_ups(self, sample):
+        try:
+            self.ups_power.observe(device=getattr(self.adapter, "device_identity", None), sample=sample)
+        except Exception as exc:
+            self._ups_error = "No se pudo confirmar el estado del corte del UPS: " + str(exc)[:200]
+
+    def complete_ups_review(self, data):
+        with self.settings_lock, self.lock:
+            if self.stop_event.is_set() or self._power_gate.is_set():
+                raise UpsPowerBlocked("Espera a recuperar lecturas recientes antes de cerrar la revisión.")
+            result = self.ups_power.complete_review(device=getattr(self.adapter, "device_identity", None),
+                                                     sample=self.sample, **data)
+            self._record_event("ups_poweroff_reviewed", "Revisión cerrada por el usuario; el corte anterior no se confirma automáticamente.",
+                               {"operation_id": result.get("operation_id"), "physical_confirmation": False})
+            return self.snapshot()
+
+    def _cancel_own_ups_after_windows_failure(self):
+        # A cancel can also turn an output back on. Never issue it based only on
+        # an old journal or a successful write: obtain fresh shutdown-state evidence.
+        if not self._read_lock.acquire(timeout=0.25):
+            raise UpsPowerBlocked("No se pudo verificar el UPS para cancelar su corte pendiente.")
+        try:
+            sample = self.adapter.read()
+        finally:
+            self._read_lock.release()
+        self._observe_ups(sample)
+        return self.ups_power.cancel(device=getattr(self.adapter, "device_identity", None), sample=sample)
+
     def _act(self, action):
+        if self.physical_test_pending():
+            raise RuntimeError("Hay una prueba física del UPS pendiente; las acciones automáticas están bloqueadas.")
+        power_generation = self.system_power_status()["generation"]
+        if self._power_gate.is_set():
+            raise RuntimeError("Windows está suspendido o esperando lecturas nuevas tras reanudar; acción bloqueada.")
         if self.stop_event.is_set():
             raise RuntimeError("Monitor detenido; acción bloqueada.")
         if self._health_fault.is_set():
@@ -227,7 +698,95 @@ class Monitor:
                 raise RuntimeError("Sin telemetría reciente; acción bloqueada.")
             if self.stop_event.is_set():
                 raise RuntimeError("Monitor detenido; acción bloqueada.")
-            self.action_callback(action)
+            attempted_ups = False
+            windows_attempted, windows_failure = False, None
+            windows_invoked = False
+
+            def request_windows_after_submission():
+                nonlocal windows_attempted, windows_failure, windows_invoked
+                windows_attempted = True
+                self._windows_request = "pending"
+                try:
+                    if self._power_gate.is_set() or not self._read_generation_current(power_generation):
+                        raise WindowsActionUnconfirmed("Windows cambió de estado antes de solicitar el cierre; no se repetirá.")
+                    windows_invoked = True
+                    self.action_callback(action)
+                    if self._power_gate.is_set() or not self._read_generation_current(power_generation):
+                        raise WindowsActionUnconfirmed("Se observó una transición de energía durante la solicitud a Windows; no se repetirá.")
+                    self._windows_request = "requested"
+                except (WindowsActionUnconfirmed, subprocess.TimeoutExpired) as exc:
+                    windows_failure = (exc if isinstance(exc, WindowsActionUnconfirmed) else WindowsActionUnconfirmed(
+                        "La solicitud a Windows no confirmó su resultado dentro del plazo."))
+                    self._windows_request = "unconfirmed"
+                except Exception as exc:
+                    if self._power_gate.is_set() or not self._read_generation_current(power_generation):
+                        windows_failure = WindowsActionUnconfirmed("La solicitud atravesó una transición de energía; su resultado no se deduce del proceso.")
+                        self._windows_request = "unconfirmed"
+                    else:
+                        windows_failure = exc
+                        self._windows_request = "failed"
+
+            if self.engine.policy["ups_poweroff"]:
+                capability = self.ups_power_status(action)
+                if capability["available"]:
+                    if self._power_gate.is_set() or not self._read_generation_current(power_generation):
+                        raise RuntimeError("Windows cambió de estado antes de programar el UPS; acción bloqueada.")
+                    try:
+                        previous_operation = self.ups_power.status().get("operation_id")
+                        try:
+                            reserve = capability.get("reserve_remaining_seconds")
+                            arm_options = {"reserve_seconds": reserve, "on_submission": request_windows_after_submission,
+                                           "delay_seconds": self.engine.policy["ups_poweroff_delay_seconds"]}
+                            if capability.get("reserve_mode") == "observed_sequence":
+                                arm_options["sequence_evidence"] = capability.get("sequence_admission", {}).get("evidence")
+                            submitted = self.ups_power.arm(action, device=self.adapter.device_identity, sample=self.sample, **arm_options)
+                        finally:
+                            attempted_ups = self.ups_power.status().get("operation_id") not in (None, previous_operation)
+                        if submitted.get("state") in ("submitted", "armed"):
+                            self._event("ups_poweroff_submitted", "Corte retardado del UPS solicitado; Windows aún debe cerrar.")
+                        else:
+                            self._ups_error = submitted.get("reason", "El resultado del corte del UPS es incierto.")
+                            self._event("ups_poweroff_unconfirmed", "Envío al UPS sin confirmar; se solicita el cierre de Windows.")
+                    except Exception as exc:
+                        self._ups_error = str(exc)[:300]
+                        self._event("ups_poweroff_unconfirmed", "El corte del UPS no se confirmó. Se conserva el cierre de Windows.")
+                else:
+                    self._event("ups_poweroff_blocked", capability.get("reason") or "Corte del UPS bloqueado; se conserva el cierre de Windows.")
+            if not windows_attempted:
+                request_windows_after_submission()
+            if attempted_ups and self._windows_request == "requested":
+                try:
+                    self.ups_power.mark_windows_requested()
+                except Exception as exc:
+                    self._ups_error = "No se pudo registrar la solicitud de Windows: " + str(exc)[:200]
+            try:
+                if windows_failure is not None:
+                    raise windows_failure
+            except Exception:
+                uncertain = (isinstance(windows_failure, WindowsActionUnconfirmed) or self._power_gate.is_set()
+                             or not self._read_generation_current(power_generation))
+                self._windows_request = "unconfirmed" if uncertain else "failed"
+                if attempted_ups and (self._power_gate.is_set() or not self._read_generation_current(power_generation)):
+                    # Windows may already be entering sleep independently. Do
+                    # not send controls across that boundary or replay on wake.
+                    self._ups_error = "Windows cambió de estado con una operación propia del UPS pendiente; requiere revisión."
+                    self._event("ups_poweroff_unconfirmed", self._ups_error)
+                elif attempted_ups:
+                    try:
+                        cancellation = self._cancel_own_ups_after_windows_failure()
+                        self._event("ups_poweroff_cancel_requested", "Cancelación del corte del UPS solicitada; pendiente de corroborar.",
+                                    {"state": cancellation.get("state")})
+                    except Exception as exc:
+                        self._ups_error = str(exc)[:300]
+                        self._event("ups_poweroff_unconfirmed", ("No se confirmó la solicitud a Windows" if uncertain else "Windows rechazó el cierre") +
+                                    " y no se confirmó la cancelación del corte del UPS.")
+                if uncertain:
+                    self._event("windows_action_unconfirmed", "El resultado de la solicitud a Windows es incierto; una transición observada impide repetirla o enviar controles al despertar.")
+                    if (windows_invoked or attempted_ups) and self.system_power_status()["generation"] != power_generation:
+                        # The command's wait crossed sleep/resume. Do not turn
+                        # an observed transition into a false policy failure.
+                        return
+                raise
 
     @staticmethod
     def _fresh_sample(sample):
@@ -239,6 +798,16 @@ class Monitor:
             return False
 
     def _unavailable(self, message, state="disconnected", kind="telemetry", *, notify=True):
+        self.ups_reserve.invalidate()
+        self.ups_sequence.invalidate()
+        self.ups_power.interrupted()
+        if self.ups_battery_test.pending():
+            self.ups_battery_test.interrupted()
+        if self.ups_cancel_test.pending():
+            if not self.stop_event.is_set() and self.ups_cancel_test_status()["state"] != "review_required":
+                self._event("ups_cancel_test_unconfirmed", "Se perdió la comunicación durante una prueba real del UPS. "
+                            "El corte podría seguir pendiente: hiberna Windows y no repitas la orden.")
+            self.ups_cancel_test.interrupted()
         changed = self.connection != state or self.error_kind != kind
         self.connection, self.error, self.sample, self.error_kind = state, message, None, kind
         self._health_fault.set()
@@ -256,6 +825,8 @@ class Monitor:
         self.engine.evaluate(None)
 
     def _check_health(self):
+        if not self.stop_event.is_set() and self._sync_power_state():
+            return
         if self.stop_event.is_set():
             self._unavailable("Monitor detenido. Protección suspendida.", kind="stopped")
         elif self.thread is not None and not self.thread.is_alive():
@@ -267,12 +838,13 @@ class Monitor:
 
     def health_status(self):
         status = self.health.snapshot()
+        power_state = self.system_power_status()["state"]
         supervisor_failed = self.supervisor_thread is not None and not self.supervisor_thread.is_alive()
         processor_failed = self.processor_thread is not None and not self.processor_thread.is_alive()
         status.update({
             "reader_alive": self.thread is not None and self.thread.is_alive(),
             "supervisor_alive": self.supervisor_thread is not None and self.supervisor_thread.is_alive(),
-            "state": "stopped" if self.stop_event.is_set() else (
+            "state": "stopped" if self.stop_event.is_set() else power_state if power_state != "running" else (
                 "degraded" if self._health_fault.is_set() or self.error is not None or supervisor_failed or processor_failed else (
                     "healthy" if self.connection == "connected" else "starting")),
             "message": ("El supervisor del lector dejó de ejecutarse. Las acciones automáticas están bloqueadas."
@@ -289,13 +861,13 @@ class Monitor:
         ownership_status = getattr(type(self.adapter), "ownership_status", None)
         if callable(ownership_status):
             status["usb_ownership"] = self.adapter.ownership_status()
-        observation = getattr(self, "observation", None)
-        if observation is not None:
-            status["observation"] = observation.status()
         return status
 
     def _health_problem(self):
         """Inspect independent counters without waiting for the reader's lock."""
+        with self._power_lock:
+            if self._power_state != "running":
+                return None
         if self.thread is not None and not self.thread.is_alive():
             return ("El lector dejó de ejecutarse. Protección suspendida.", "disconnected", "backend")
         if self.processor_thread is not None and not self.processor_thread.is_alive():
@@ -316,7 +888,10 @@ class Monitor:
         if self.stop_event.is_set():
             return
         self.health.check()
+        power_generation = self.system_power_status()["generation"]
         problem = self._health_problem()
+        if not self._read_generation_current(power_generation) or self.system_power_status()["state"] != "running":
+            problem = None
         if problem is not None:
             # This gate is set before acquiring the decision lock. A blocked
             # consumer must not resume an old countdown while we wait for it.
@@ -331,6 +906,9 @@ class Monitor:
             return
         try:
             if self.stop_event.is_set():
+                return
+            if self._sync_power_state():
+                self._update_alerts()
                 return
             if self._pending_health_failure is not None:
                 message, state, kind = self._pending_health_failure
@@ -373,22 +951,40 @@ class Monitor:
 
     def _read_hardware(self):
         """Only the dedicated polling worker (or synchronous test tick) owns USB."""
+        with self._power_lock:
+            generation = self._power_generation
+            if self._power_state == "suspended":
+                raise _PowerTransition()
         if not self._read_lock.acquire(blocking=False):
+            if self._cancel_test_io.is_set():
+                raise _ReadDeferred()
             raise RuntimeError("Ya hay una lectura de hardware en curso")
         try:
             self.health.begin_read()
             try:
                 sample = self.adapter.read()
             except Exception as exc:
+                if not self._read_generation_current(generation):
+                    self.health.abandon_read()
+                    raise _PowerTransition() from None
                 known = isinstance(exc, (TelemetryError, OSError, ValueError))
                 kind = "telemetry" if known else "backend"
-                self.health.finish_read(False, error_kind=kind)
+                if self.system_power_status()["state"] == "resuming":
+                    self.health.abandon_read()
+                else:
+                    self.health.finish_read(False, error_kind=kind)
                 if not known:
                     raise
                 return None, str(exc), kind
+            if not self._read_generation_current(generation):
+                self.health.abandon_read()
+                raise _PowerTransition()
             fresh = self._fresh_sample(sample)
-            self.health.finish_read(fresh, timestamp=sample.get("timestamp") if isinstance(sample, dict) else None,
-                                    error_kind=None if fresh else "stale")
+            if not fresh and self.system_power_status()["state"] == "resuming":
+                self.health.abandon_read()
+            else:
+                self.health.finish_read(fresh, timestamp=sample.get("timestamp") if isinstance(sample, dict) else None,
+                                        error_kind=None if fresh else "stale")
             return sample, None, None
         finally:
             self._read_lock.release()
@@ -399,17 +995,32 @@ class Monitor:
             return
         if self.processor_thread is not None and threading.current_thread() is not self.thread:
             raise RuntimeError("El sondeo dedicado ya está activo")
-        sample, error, kind = self._read_hardware()
+        with self.lock:
+            self._sync_power_state()
+        generation = self.system_power_status()["generation"]
+        try:
+            sample, error, kind = self._read_hardware()
+        except (_PowerTransition, _ReadDeferred):
+            return
+        if not self._read_generation_current(generation):
+            return
         if error is not None:
             with self.lock:
-                if not self.stop_event.is_set():
+                if not self.stop_event.is_set() and not self._sync_power_state():
                     self._unavailable(error, "stale" if "obsoleto" in error else "disconnected", kind)
             return
-        self._process_sample(sample)
+        self._process_sample(sample, power_generation=generation)
 
-    def _process_sample(self, sample):
+    def _process_sample(self, sample, *, power_generation=None):
         with self.lock:
             if self.stop_event.is_set():
+                return
+            self._sync_power_state()
+            if power_generation is None:
+                power_generation = self.system_power_status()["generation"]
+            if not self._read_generation_current(power_generation):
+                return
+            if self.system_power_status()["state"] == "suspended":
                 return
             if self._processing_sequence is not None and not self.telemetry.is_latest(self._processing_sequence):
                 # A result superseded while waiting for this lock cannot reset
@@ -417,9 +1028,17 @@ class Monitor:
                 self.engine.evaluate(None)
                 return
             if not self._fresh_sample(sample):
+                if self.system_power_status()["state"] == "resuming":
+                    return
                 self.health.problem("stale")
                 self._unavailable("La lectura no contiene una fecha reciente y válida. Protección suspendida.", "stale")
                 return
+            resuming = self.system_power_status()["state"] == "resuming"
+            if resuming:
+                with self._power_lock:
+                    if not self._read_generation_current(power_generation):
+                        return
+                    self._power_state, self._power_resume_deadline = "running", None
             if self._health_fault.is_set():
                 # The supervisor may have detected a stalled reader before it
                 # could acquire this lock. Reset continuity before fresh data.
@@ -431,12 +1050,15 @@ class Monitor:
             self._health_fault.clear()
             self._last_health_notice = None
             self._restart_failures = 0
-            if self.connection != "connected":
+            if self.connection != "connected" and not (resuming and self._resume_silent):
                 self._event("connection_restored", "Telemetría del UPS conectada.")
             self.connection, self.error, self.error_kind = "connected", None, None
             previous_sample = self.sample
             sample = {**sample, **battery_estimate_fields(sample)}
             self.sample, self.last_success = sample, sample["timestamp"]
+            with self._power_lock:
+                if self._read_generation_current(power_generation):
+                    self._power_gate.clear()
             power = sample.get("on_battery")
             if power is True and self.last_power is not True:
                 self._event("power_lost", "UPS funcionando con batería: suministro de red interrumpido.")
@@ -455,8 +1077,23 @@ class Monitor:
             if overload and not self.overload:
                 self._event("overload", "La carga reportada alcanzó o superó el 100 %.")
             self.low, self.overload = low, overload
+            try:
+                reserve_capability = self.ups_power.capabilities(device=getattr(self.adapter, "device_identity", None),
+                                                               action=self.engine.policy["action"])
+                self.ups_reserve.observe(sample, reserve_capability)
+                self.ups_sequence.observe(sample, reserve_capability)
+            except Exception:
+                self.ups_reserve.invalidate()
+                self.ups_sequence.invalidate()
             # Decisions use fresh telemetry even if recording it fails.
-            self.engine.evaluate(sample)
+            self._observe_ups(sample)
+            self._observe_cancel_test(sample)
+            self._observe_battery_test(sample)
+            own_shutdown = (sample.get("raw_status") == "Shutdown mode" and
+                            self._windows_request in ("pending", "requested") and
+                            self.ups_power_status()["operation"].get("state") in ("submitted", "armed", "uncertain"))
+            if not own_shutdown and self._read_generation_current(power_generation):
+                self.engine.evaluate(sample)
             if (time.monotonic() - self.last_saved >= 10 or changed) and sample["timestamp"] != self.last_saved_timestamp:
                 try:
                     self.store.add_sample(sample)
@@ -468,18 +1105,33 @@ class Monitor:
     def run(self):
         """Hardware thread: no database, alert delivery, or decision lock."""
         while not self.stop_event.is_set():
+            if self._cancel_test_io.is_set():
+                self.stop_event.wait(0.1)
+                continue
+            if self.system_power_status()["state"] == "suspended":
+                self._poll_wake.wait(0.25)
+                self._poll_wake.clear()
+                continue
+            generation = self.system_power_status()["generation"]
             try:
                 self._next_poll_at = None
                 sample, error, kind = self._read_hardware()
                 if self.stop_event.is_set():
                     return
-                self.telemetry.publish(sample, error=error, error_kind=kind,
-                                       captured_at=self.health.clock())
+                with self._power_lock:
+                    if not self._read_generation_current(generation):
+                        continue
+                    self.telemetry.publish(sample, error=error, error_kind=kind,
+                                           captured_at=self.health.clock(), power_generation=generation)
                 self._poll_failures = self._poll_failures + 1 if error is not None else 0
+            except (_PowerTransition, _ReadDeferred):
+                continue
             except Exception as exc:
+                if not self._read_generation_current(generation):
+                    continue
                 self._poll_failures += 1
                 self.telemetry.publish(error="Error interno al leer telemetría. Protección suspendida.",
-                                       error_kind="backend", captured_at=self.health.clock())
+                                       error_kind="backend", captured_at=self.health.clock(), power_generation=generation)
                 # Do not touch the logfile from hardware polling. The consumer
                 # records the bounded backend error through its normal path.
             delay = self.poll_interval if not self._poll_failures else min(
@@ -488,7 +1140,8 @@ class Monitor:
             if type(retry_after) in (int, float) and math.isfinite(retry_after):
                 delay = max(delay, retry_after)
             self._next_poll_at = self.health.clock() + delay
-            self.stop_event.wait(delay)
+            self._poll_wake.wait(delay)
+            self._poll_wake.clear()
 
     def _consume_once(self):
         entries, overflow = self.telemetry.drain()
@@ -501,6 +1154,11 @@ class Monitor:
             return
         with self.lock:
             if self.stop_event.is_set():
+                return
+            paused = self._sync_power_state()
+            generation = self.system_power_status()["generation"]
+            entries = [entry for entry in entries if entry.get("power_generation", 0) == generation]
+            if not entries or self.system_power_status()["state"] == "suspended":
                 return
             if overflow is not None or len(entries) > 1:
                 # No unobserved interval or replayed online state may count as
@@ -524,11 +1182,12 @@ class Monitor:
             self._processing_sequence = latest["sequence"]
             try:
                 if latest["error"] is not None:
-                    self._unavailable(latest["error"], "disconnected", latest["error_kind"] or "telemetry")
+                    if not paused:
+                        self._unavailable(latest["error"], "disconnected", latest["error_kind"] or "telemetry")
                 elif (latest["captured_at"] is not None and self.health.clock() - latest["captured_at"] > 15):
                     self._unavailable("La entrega de telemetría tiene más de 15 segundos. Protección suspendida.", "stale")
                 else:
-                    self._process_sample(latest["sample"])
+                    self._process_sample(latest["sample"], power_generation=latest.get("power_generation", 0))
                 self._last_processed_at = self.health.clock()
             finally:
                 self._processing_sequence = None
@@ -561,9 +1220,15 @@ class Monitor:
 
     def stop(self):
         self.stop_event.set()
+        self._poll_wake.set()
         self._health_fault.set()
         if self.lock.acquire(timeout=1):
             try:
+                self.ups_cancel_test.interrupted()
+                self.ups_battery_test.interrupted()
+                self.ups_power.interrupted()
+                self.ups_reserve.invalidate()
+                self.ups_sequence.invalidate()
                 self.sample = None
                 self.engine.evaluate(None)
             finally:
@@ -593,7 +1258,7 @@ class Monitor:
             events = []
         for event in events:
             kind = event["kind"]
-            event["severity"] = "critical" if kind in ("overload", "ups_fault", "policy_action_failed", "monitor_error") else (
+            event["severity"] = "critical" if kind in ("overload", "ups_fault", "policy_action_failed", "monitor_error", "ups_poweroff_unconfirmed", "ups_cancel_test_unconfirmed", "ups_battery_test_unconfirmed") else (
                 "warning" if kind in ("power_lost", "battery_low", "connection_lost", "policy_countdown", "policy_unknown") else "info")
         return events
 
@@ -607,17 +1272,34 @@ class Monitor:
             notice = self.test_deadline is not None and raw["state"] != "countdown"
             simulation = self.power_actions_blocked or notice
             reason = raw["reason"]
+            if raw["state"] == "action_started" and self._windows_request == "unconfirmed":
+                state = "blocked"
+                reason = "La solicitud a Windows quedó sin confirmar; una transición de energía no prueba que haya terminado."
+            phase = "windows_countdown"
             if self.power_actions_blocked and raw["state"] == "action_started":
                 reason = "Acción simulada; Windows sigue encendido."
             if notice:
-                remaining = max(0, int(self.test_deadline - time.monotonic() + 0.999))
+                elapsed_deadline = self.test_deadline
+                remaining = max(0, math.ceil(elapsed_deadline - time.monotonic()))
+                if self.test_ups_delay is not None and remaining == 0:
+                    phase = "ups_delay"
+                    remaining = max(0, math.ceil(elapsed_deadline + self.test_ups_delay - time.monotonic()))
                 state = "countdown" if remaining else "idle"
+                if self.test_ups_delay is not None:
+                    self.test_ups_simulation = {"phase": phase if remaining else "complete", "remaining": remaining,
+                                                "delay_seconds": self.test_ups_delay,
+                                                "windows_requested": phase == "ups_delay", "ups_cut_simulated": not bool(remaining),
+                                                "validated_delay": self.ups_power_status().get("validated_delay", False)}
                 if not remaining and not self.test_finished:
                     self.test_finished = True
                     self._record_event("simulation", "Prueba finalizada. No se ejecutó ninguna acción en Windows.")
                 if not remaining:
                     self.test_deadline = None
+                    phase = "complete"
                 reason = "Prueba sin apagado real"
+            elif self.test_ups_simulation is not None:
+                phase = self.test_ups_simulation["phase"]
+                simulation = True
             return {
                 "csrf_token": self.csrf_token,
                 "connection": {"state": self.connection, "source": self.adapter.source,
@@ -627,14 +1309,21 @@ class Monitor:
                 "events": self.events(),
                 "history": self.history_status(),
                 "health": self.health_status(),
+                "system_power": self.system_power_status(),
                 "policy": dict(self.engine.policy),
+                "ups_poweroff": self.ups_power_status(),
+                "ups_cancel_test": self.ups_cancel_test_status(),
+                "ups_battery_test": self.ups_battery_test_status(),
                 "notifications": self.notification_status(),
                 "protection": {"state": state, "reason": reason,
+                               "phase": phase, "windows_request": self._windows_request,
+                               "cancelable": state == "countdown" and phase == "windows_countdown",
                                "countdown_remaining": remaining, "simulation": simulation,
                                "deadline": iso_utc(datetime.now(timezone.utc) + timedelta(seconds=remaining)) if remaining else None},
                 "meta": {"name": "Elipro UPS", "model": "Forza NT-2402PRO", "capacity_watts": 1200,
                          "capacity_va": 2400, "history_interval_seconds": 10, "retention_days": self.store.retention_days,
                          "dry_run": self.power_actions_blocked, "simulation_source": self.simulation_source, "version": __version__,
+                         "allow_ups_poweroff": self.allow_ups_poweroff,
                          "runtime_mode": getattr(self, "runtime_mode", "session"),
                          "source": "simulation" if self.simulation_source else (
                              "bridge" if getattr(self.adapter, "bridge_required", True) else "native"),
@@ -643,12 +1332,21 @@ class Monitor:
 
     def set_policy(self, policy):
         value = validate_policy(policy)
+        if value["enabled"] and self.physical_test_pending():
+            raise ValueError("Resuelve la prueba física del UPS antes de activar la protección automática.")
+        if (value["ups_poweroff"] and (value["enabled"] or not self.engine.policy["ups_poweroff"])
+                and not self.ups_power_status(value["action"], policy=value)["can_configure"]):
+            raise ValueError("No se puede habilitar el corte del UPS: " + str(self.ups_power_status(value["action"], policy=value)["reason"]))
         # A settings request may wait for disk, but never while holding the
         # telemetry/decision lock. Serialize requests to preserve write order.
         with self.settings_lock:
+            if value["enabled"] and self.physical_test_pending():
+                raise ValueError("Resuelve la prueba física del UPS antes de activar la protección automática.")
             if not value["enabled"]:
                 with self.lock:
                     self.test_deadline = None
+                    self.test_ups_delay = None
+                    self.test_ups_simulation = None
                     self.engine.update_policy(value)
             try:
                 self.store.set_setting("policy", value)
@@ -661,31 +1359,40 @@ class Monitor:
             self._history_failures.pop("settings_write", None)
             with self.lock:
                 self.test_deadline = None
+                self.test_ups_delay = None
+                self.test_ups_simulation = None
                 if value["enabled"]:
                     self.engine.update_policy(value)
-                observation = getattr(self, "observation", None)
-                if observation is not None:
-                    try:
-                        observation.record_policy_change(value["enabled"], self.power_actions_blocked)
-                    except Exception as exc:
-                        log_failure("No se pudo registrar el cambio de política en la observación", exc)
                 self._event("policy_changed", "Protección automática " + ("activada." if value["enabled"] else "desactivada."))
                 return self.snapshot()
 
     def cancel(self):
         with self.lock:
             if self.test_deadline is not None:
+                if self.test_ups_delay is not None and time.monotonic() >= self.test_deadline:
+                    raise ValueError("La cuenta para cancelar terminó. La espera del UPS solo representa el corte programado.")
                 self.test_deadline = None
                 self._record_event("simulation", "Prueba cancelada sin acción en Windows.")
+                if self.test_ups_simulation is not None:
+                    self.test_ups_simulation.update(phase="cancelled", remaining=0, ups_cut_simulated=False)
+                self.test_ups_delay = None
             self.engine.cancel()
             return self.snapshot()
 
-    def test(self):
+    def test(self, *, include_ups=False):
         with self.lock:
+            if self.physical_test_pending():
+                raise ValueError("Resuelve la prueba física del UPS antes de iniciar una simulación.")
+            if type(include_ups) is not bool:
+                raise ValueError("include_ups debe ser booleano")
             if self.engine.policy["enabled"]:
                 raise ValueError("Desactiva la protección automática antes de probar el aviso sin apagado.")
-            self.test_deadline, self.test_finished = time.monotonic() + 15, False
-            self._record_event("simulation", "Prueba de aviso iniciada (15 segundos, sin apagado).")
+            seconds = self.engine.policy["countdown_seconds"]
+            self.test_ups_delay = (self.engine.policy["ups_poweroff_delay_seconds"]
+                if include_ups and self.engine.policy["ups_poweroff"] else None)
+            self.test_ups_simulation = None
+            self.test_deadline, self.test_finished = time.monotonic() + seconds, False
+            self._record_event("simulation", f"Prueba de aviso iniciada ({seconds} segundos, sin apagado).")
             return self.snapshot()
 
 
@@ -783,21 +1490,6 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(self.monitor.store.incidents(**archive_options(parsed.query, incidents=True)))
             if parsed.path == "/api/health":
                 return self._json(self.monitor.health_status())
-            if parsed.path == "/api/validation":
-                return self._json(validation_record(self.monitor))
-            if parsed.path == "/api/stability":
-                return self._json(self.monitor.observation.status())
-            if parsed.path == "/api/stability/report":
-                payload = json.dumps(self.monitor.observation.report(), ensure_ascii=False, indent=2, allow_nan=False).encode("utf-8")
-                return self._send(payload, "application/json; charset=utf-8",
-                                  extra={"Content-Disposition": 'attachment; filename="elipro-stability.json"'})
-            if parsed.path == "/api/diagnostics":
-                payload = json.dumps(diagnostics(self.monitor), ensure_ascii=False, indent=2, allow_nan=False).encode("utf-8")
-                return self._send(payload, "application/json; charset=utf-8",
-                                  extra={"Content-Disposition": 'attachment; filename="elipro-diagnostics.json"'})
-            if parsed.path == "/api/backup.zip":
-                return self._send(backup_archive(self.monitor), "application/zip",
-                                  extra={"Content-Disposition": 'attachment; filename="elipro-backup.zip"'})
             if parsed.path == "/api/notifications":
                 return self._json(self.monitor.notification_status())
             if parsed.path == "/api/history":
@@ -811,6 +1503,8 @@ class Handler(BaseHTTPRequestHandler):
                 mime = "image/vnd.microsoft.icon" if filename.endswith(".ico") else "text/html" if filename.endswith("html") else "text/javascript" if filename.endswith("js") else "text/css"
                 return self._send((ROOT / "static" / filename).read_bytes(), mime if filename.endswith(".ico") else mime + "; charset=utf-8")
             self._json({"error": "No encontrado."}, 404)
+        except IncidentCursorExpired as exc:
+            self._json({"error": str(exc), "code": "incident_cursor_expired"}, 400)
         except HistoryUnavailable as exc:
             self._json({"error": str(exc), "history": self.monitor.history_status()}, 503)
         except (ValueError, TypeError):
@@ -847,22 +1541,52 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(broker.poll(data))
             if path == "/api/protection/cancel":
                 return self._json(self.monitor.cancel())
+            if path == "/api/ups/cancel-test/start":
+                if not isinstance(data, dict) or set(data) != {"acknowledge_risk"} or data["acknowledge_risk"] is not True:
+                    raise ValueError("La prueba real requiere confirmación explícita del riesgo.")
+                return self._json(self.monitor.run_ups_cancel_test(acknowledge_risk=True))
+            if path == "/api/ups/cancel-test/cancel":
+                if data != {}:
+                    raise ValueError("La cancelación solo admite una operación propia corroborada.")
+                return self._json(self.monitor.run_ups_cancel_test(cancel=True))
+            if path == "/api/ups/cancel-test/close":
+                required = {"operation_id", "output_cut_observed", "pending_signal_not_reported", "manual_start_observed"}
+                if (not isinstance(data, dict) or set(data) != required or not isinstance(data.get("operation_id"), str)
+                        or any(data[key] is not True for key in required - {"operation_id"})):
+                    raise ValueError("El cierre requiere confirmar el corte observado, la señal ausente y el encendido manual.")
+                return self._json(self.monitor.close_ups_cancel_test(data))
+            if path == "/api/ups/cancel-test/confirm-observation":
+                if (not isinstance(data, dict) or set(data) != {"operation_id", "outputs_stayed_on", "independent_load_observed"}
+                        or not isinstance(data["operation_id"], str) or type(data["outputs_stayed_on"]) is not bool
+                        or data["independent_load_observed"] is not True):
+                    raise ValueError("Confirma la observación de una carga independiente después del plazo completo.")
+                return self._json(self.monitor.confirm_ups_cancel_observation(data))
+            if path == "/api/ups/battery-test/start":
+                if not isinstance(data, dict) or set(data) != {"acknowledge_risk"} or data["acknowledge_risk"] is not True:
+                    raise ValueError("La prueba en batería requiere confirmación explícita del corte y la hibernación real.")
+                return self._json(self.monitor.run_ups_battery_test(acknowledge_risk=True))
+            if path == "/api/ups/battery-test/confirm-observation":
+                required = {"operation_id", "cut_observed", "ac_restored", "off_after_ac_seconds", "manual_restart",
+                            "hibernate_resumed", "acknowledge_observation", "automatic_return_observed"}
+                if (not isinstance(data, dict) or set(data) != required or not isinstance(data["operation_id"], str)
+                        or any(type(data[key]) is not bool for key in required - {"operation_id", "off_after_ac_seconds"})
+                        or data["acknowledge_observation"] is not True
+                        or type(data["off_after_ac_seconds"]) not in (int, float)
+                        or not math.isfinite(data["off_after_ac_seconds"]) or not 0 <= data["off_after_ac_seconds"] <= 3600):
+                    raise ValueError("Registra las observaciones físicas y el tiempo sin tensión después de restaurar la electricidad.")
+                return self._json(self.monitor.confirm_ups_battery_observation(data))
+            if path == "/api/ups/poweroff/review":
+                if (not isinstance(data, dict) or set(data) != {"operation_id", "acknowledge_review"}
+                        or not isinstance(data["operation_id"], str) or data["acknowledge_review"] is not True):
+                    raise ValueError("Confirma la revisión de la operación propia del UPS.")
+                return self._json(self.monitor.complete_ups_review(data))
             if path == "/api/protection/test":
-                return self._json(self.monitor.test())
-            if path == "/api/validation/run":
-                from .validation import run_controlled
-                result = run_controlled()
-                result["saved"] = save_validation(self.monitor, result)
-                return self._json(result)
-            if path == "/api/stability/start":
-                if not isinstance(data, dict) or set(data) - {"hours"}:
-                    raise ValueError("La observación solo admite la duración en horas.")
-                if self.monitor.stop_event.is_set():
-                    raise ValueError("El monitor se está deteniendo.")
-                return self._json(self.monitor.observation.start(hours=data.get("hours", 48)))
-            if path == "/api/stability/stop":
-                return self._json(self.monitor.observation.stop())
+                if not isinstance(data, dict) or set(data) - {"include_ups"}:
+                    raise ValueError("La simulación solo admite include_ups.")
+                return self._json(self.monitor.test(include_ups=data.get("include_ups", False)))
             if path == "/api/service/stop":
+                if self.monitor.physical_test_pending():
+                    raise ValueError("No cierres el monitor mientras la prueba del UPS esté pendiente.")
                 mark_exit = getattr(self.server, "mark_exit_requested", None)
                 if callable(mark_exit):
                     mark_exit()
@@ -893,15 +1617,14 @@ def main(argv=None, *, stop_event=None, ready_callback=None):
     parser.add_argument("--dry-run", action="store_true", help="Bloquea acciones reales en Windows para desarrollo")
     parser.add_argument("--diagnose", action="store_true", help="Lee una muestra real y termina")
     parser.add_argument("--headless", action="store_true", help=argparse.SUPPRESS)
-    parser.add_argument("--observe-hours", type=float, default=0,
-                        help="Inicia una observación de estabilidad (0 desactiva; hasta 168 horas)")
+    parser.add_argument("--allow-ups-poweroff", action="store_true", help="Permiso adicional para perfiles UPS físicamente validados")
     args = parser.parse_args(argv)
+    if args.allow_ups_poweroff and (not args.headless or args.dry_run or args.source != "native"):
+        parser.error("--allow-ups-poweroff requiere servicio nativo y acciones reales de Windows.")
     if args.source == "simulation":
         args.dry_run = True
         if args.usb_info:
             parser.error("La simulación no permite inspeccionar USB")
-    if not math.isfinite(args.observe_hours) or not (args.observe_hours == 0 or 0.01 <= args.observe_hours <= 168):
-        parser.error("--observe-hours debe ser 0 o un valor entre 0.01 y 168")
     if args.usb_info:
         from .hid_windows import enumerate_ups
         print(json.dumps(enumerate_ups(), indent=2, ensure_ascii=False))
@@ -927,7 +1650,7 @@ def main(argv=None, *, stop_event=None, ready_callback=None):
 
 def _run_owned_monitor(args, ownership, *, stop_event=None, ready_callback=None):
     """Release process ownership only after the reader and persistence stop."""
-    monitor = server = alerts = store = log_handler = observation = None
+    monitor = server = alerts = store = log_handler = None
     safe_to_release = True
     try:
         if args.source == "simulation":
@@ -952,10 +1675,12 @@ def _run_owned_monitor(args, ownership, *, stop_event=None, ready_callback=None)
         else:
             notifier = WindowsNotifier(f"http://127.0.0.1:{args.port}")
         alerts = AlertManager(store, notifier)
-        monitor = Monitor(store, adapter, dry_run=args.dry_run, alerts=alerts)
+        monitor = Monitor(store, adapter, dry_run=args.dry_run, alerts=alerts,
+                          allow_ups_poweroff=getattr(args, "allow_ups_poweroff", False),
+                          ups_journal_path=args.data_dir / "ups-power-operation.json",
+                          ups_cancel_test_journal=args.data_dir / "ups-cancel-test-operation.json",
+                          ups_battery_test_journal=args.data_dir / "ups-battery-test-operation.json")
         monitor.runtime_mode = "service" if getattr(args, "headless", False) else "session"
-        observation = StabilityObservation(monitor, args.data_dir / "stability")
-        monitor.observation = observation
         notifier.cancel_callback = lambda: monitor.cancel() if not monitor.stop_event.is_set() else None
         server = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
         server.monitor = monitor
@@ -982,8 +1707,6 @@ def _run_owned_monitor(args, ownership, *, stop_event=None, ready_callback=None)
             monitor._event("monitor_restarted", "Elipro se reinició tras un cierre inesperado. Verificando la conexión con el UPS.",
                            {"restart_count": restart_count})
         monitor.start()
-        if args.observe_hours:
-            observation.start(hours=args.observe_hours)
         if stop_event is not None:
             def wait_for_service_stop():
                 stop_event.wait()
@@ -991,7 +1714,7 @@ def _run_owned_monitor(args, ownership, *, stop_event=None, ready_callback=None)
                 server.shutdown()
             threading.Thread(target=wait_for_service_stop, name="elipro-service-stop", daemon=True).start()
         if ready_callback is not None:
-            ready_callback()
+            ready_callback(monitor)
         print(f"Elipro UPS disponible en http://127.0.0.1:{args.port}", flush=True)
         print("Protección automática: " + ("activada" if monitor.engine.policy["enabled"] else "desactivada"), flush=True)
         server.serve_forever(poll_interval=0.5)
@@ -1003,8 +1726,6 @@ def _run_owned_monitor(args, ownership, *, stop_event=None, ready_callback=None)
         if monitor is not None:
             monitor.stop_event.set()
         try:
-            if observation is not None:
-                observation.close(timeout=2)
             if monitor is not None:
                 monitor.stop()
         finally:

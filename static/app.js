@@ -64,22 +64,22 @@
     historyInterval: 10000,
     statusGeneration: 0,
     recordVersion: 0,
-    recordsLoaded: false,
+    recordDates: "",
+    archiveFilters: "",
     incidents: [],
     incidentCursor: null,
     incidentQuery: "",
     incidentsBusy: false,
+    incidentSort: "started_at",
+    incidentDirection: "desc",
+    incidentAppliedSort: "started_at",
+    incidentAppliedDirection: "desc",
     archive: [],
     archiveCursor: null,
     archiveBusy: false,
     archiveQuery: "",
     downloadBusy: false,
     stopAcknowledged: false,
-    validationBusy: false,
-    observation: null,
-    observationLoaded: false,
-    observationBusy: false,
-    physicalTestsBusy: false,
     activeView: "overview",
     navigationReady: false,
     incidentsLoaded: false,
@@ -92,14 +92,16 @@
     criticalFocusTarget: null,
     criticalBatterySources: new Set(),
     criticalCountdownVisible: false,
+    criticalCountdownAcknowledged: null,
+    criticalResultAcknowledged: null,
+    upsPowerReviewNeedsStatus: false,
+    upsPowerReviewOperation: null,
   };
   const views = {
     overview: { hash: "resumen", title: "Resumen", description: "Lo esencial de tu UPS, en tiempo real." },
-    incidents: { hash: "incidentes", title: "Incidentes", description: "Cortes eléctricos y problemas de comunicación, con su recuperación." },
-    history: { hash: "historial", title: "Historial", description: "Consulta mediciones y eventos, busca por fecha y exporta tus registros." },
-    protection: { hash: "proteccion", title: "Protección", description: "Configura cuándo proteger tu sesión y comprueba las reglas de forma segura." },
-    notifications: { hash: "avisos", title: "Avisos", description: "Notificaciones de Windows y sonido, incluso con el panel cerrado." },
-    system: { hash: "sistema", title: "Sistema", description: "Salud del monitor, observación de estabilidad, diagnóstico y respaldos." },
+    protection: { hash: "proteccion", title: "Protección", description: "Elige qué hacer cuando se corte la luz." },
+    history: { hash: "historial", title: "Historial", description: "" },
+    system: { hash: "sistema", title: "Sistema", description: "" },
   };
   const clockFormat = new Intl.DateTimeFormat("es-PE", { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false });
   const shortClockFormat = new Intl.DateTimeFormat("es-PE", { hour: "2-digit", minute: "2-digit", hour12: false });
@@ -134,8 +136,17 @@
   ];
   const criticalKinds = new Set(criticalDefinitions.map((definition) => definition.kind));
 
+  function powerTransition() {
+    const power = state.status?.system_power?.state;
+    const connection = state.status?.connection?.state;
+    return ["suspended", "resuming"].includes(power) ? power
+      : ["suspended", "resuming"].includes(connection) ? connection : null;
+  }
+
   function telemetryContext() {
     if (!state.serviceAvailable) return { sample: null, quality: state.stopAcknowledged ? "stopped" : state.lastStatusAt ? "disconnected" : "starting", mode: "unknown" };
+    const transition = powerTransition();
+    if (transition) return { sample: null, quality: transition, mode: "unknown" };
     const connection = state.status?.connection || {};
     if (connection.state !== "connected") return { sample: null, quality: connection.state === "stale" ? "stale" : "disconnected", mode: "unknown" };
     const sample = state.status?.sample;
@@ -147,6 +158,15 @@
 
   function acknowledgeCritical(closeDialog = true) {
     if (!state.criticalOpen) return;
+    const protection = state.status?.protection;
+    state.criticalResultAcknowledged = protectionResultKey(protection);
+    if (protection?.state === "countdown") state.criticalCountdownAcknowledged = {
+      deadline: parseDate(protection.deadline)?.getTime() ?? null,
+      remaining: finite(protection.countdown_remaining) ? protection.countdown_remaining : null,
+      simulation: !!protection.simulation,
+      action: state.status?.policy?.action,
+      phase: protection.phase || "windows_countdown",
+    };
     for (const kind of state.criticalItems.keys()) {
       if (state.criticalKnown.get(kind) === true) state.criticalAcknowledged.add(kind);
     }
@@ -162,16 +182,33 @@
 
   function renderCriticalCountdown() {
     const protection = state.status?.protection;
+    const phase = simulationPhase();
+    const sequenceNote = protection?.simulation && phase === "ups_delay" ? `La solicitud a Windows solo se representa. ${simulationDelayDescription()}. No se confirma que Windows haya terminado ni se corta la energía.`
+      : protection?.simulation && phase === "complete" ? "Secuencia simulada finalizada. No se ejecutaron acciones de Windows ni se cortó la energía del UPS."
+      : protection?.simulation && phase === "windows_countdown" ? state.status?.ups_poweroff?.simulation
+        ? "Simulación de la cuenta atrás de Windows. Después se representará la espera del UPS; no se ejecutan acciones reales."
+        : "Simulación de la cuenta atrás de Windows. No se ejecutan acciones reales."
+      : protection?.state === "executed" && !protection.simulation ? "La solicitud enviada a Windows no confirma que el apagado o la hibernación hayan terminado." : protection?.state === "countdown" && !protection.simulation ? "Cancelar protección anula Windows y UPS hasta el próximo corte. Todavía no se ha programado el corte del UPS." : "";
+    $("critical-sequence-note").hidden = !state.criticalOpen || !sequenceNote;
+    setText("critical-sequence-note", sequenceNote);
     const visible = state.criticalOpen && !state.stopAcknowledged && protection?.state === "countdown";
+    const cancelable = protection?.cancelable !== false && phase !== "ups_delay";
     $("critical-countdown").hidden = !visible;
+    $("critical-cancel").hidden = !visible || !cancelable;
     if (!visible) { state.criticalCountdownVisible = false; return; }
     if (!state.criticalCountdownVisible) $("critical-feedback").hidden = true;
     state.criticalCountdownVisible = true;
-    const label = protection.simulation ? "Cuenta atrás de prueba" : state.status?.policy?.action === "hibernate" ? "Hibernación programada" : "Apagado programado";
-    setText("critical-countdown-label", `${label}. Entendido no cancela esta cuenta atrás.${!state.serviceAvailable ? " Estado sin confirmar." : ""}`);
+    const label = protection.simulation ? phase === "ups_delay" ? "Espera simulada del UPS" : "Cuenta atrás de prueba" : state.status?.policy?.action === "hibernate" ? "Hibernación programada" : "Apagado programado";
+    setText("critical-countdown-label", `${label}. ${phase === "ups_delay" ? "Esta fase solo representa la espera del UPS." : "Cerrar el aviso no cancela la protección."}${!state.serviceAvailable ? " Estado sin confirmar." : ""}`);
     setText("critical-countdown-time", $("countdown").textContent);
-    $("critical-cancel").textContent = protection.simulation ? "Cancelar prueba" : "Cancelar esta acción";
-    $("critical-cancel").disabled = !state.serviceAvailable || !state.token || !!state.mutation;
+    $("critical-cancel").textContent = "Cancelar protección";
+    $("critical-cancel").disabled = !state.serviceAvailable || !state.token || !!state.mutation || !cancelable;
+  }
+
+  function protectionResultKey(protection) {
+    return ["blocked", "executed"].includes(protection?.state)
+      ? JSON.stringify([protection.state, !!protection.simulation, state.status?.policy?.action, protection.reason || ""])
+      : null;
   }
 
   function renderCriticalAlerts(sample, live) {
@@ -198,12 +235,44 @@
     } else {
       for (const item of state.criticalItems.values()) item.status = "unconfirmed";
     }
-    if (!state.criticalItems.size) return;
+    const protection = state.status?.protection || {};
+    const countdown = !state.stopAcknowledged && protection.state === "countdown";
+    const resultKey = !state.stopAcknowledged ? protectionResultKey(protection) : null;
+    if (!resultKey) state.criticalResultAcknowledged = null;
+    const resultAttention = resultKey !== null && state.criticalResultAcknowledged !== resultKey;
+    if (!countdown) state.criticalCountdownAcknowledged = null;
+    const acknowledged = state.criticalCountdownAcknowledged;
+    const deadline = parseDate(protection.deadline)?.getTime() ?? null;
+    if (acknowledged?.simulation && protection.simulation && acknowledged.phase === "windows_countdown" && simulationPhase() === "ups_delay") {
+      acknowledged.phase = "ups_delay";
+      acknowledged.deadline = deadline;
+      acknowledged.remaining = protection.countdown_remaining;
+    }
+    // The service reconstructs its wall-clock deadline from rounded seconds on every poll.
+    const newDeadline = deadline !== null && finite(acknowledged?.deadline) && Math.abs(deadline - acknowledged.deadline) > 2000;
+    const increasedRemaining = deadline === null && finite(protection.countdown_remaining) && finite(acknowledged?.remaining) && protection.countdown_remaining > acknowledged.remaining + 2;
+    if (countdown && state.serviceAvailable && acknowledged && (newDeadline || increasedRemaining || acknowledged.simulation !== !!protection.simulation || acknowledged.action !== state.status?.policy?.action)) state.criticalCountdownAcknowledged = null;
+    if (!state.criticalItems.size && (!countdown || state.criticalCountdownAcknowledged) && !resultAttention && !state.criticalOpen) {
+      renderCriticalCountdown();
+      return;
+    }
     const items = criticalDefinitions.map((definition) => state.criticalItems.get(definition.kind)).filter(Boolean);
     const active = items.filter((item) => item.status === "active");
     const unconfirmed = items.some((item) => item.status === "unconfirmed");
-    setText("critical-title", active.length ? active[0].definition.title : unconfirmed ? "Estado sin confirmar" : "Alerta resuelta");
-    setText("critical-description", active.length ? "El UPS requiere tu atención. Revisa las condiciones detectadas." : unconfirmed ? "No hay información suficiente para confirmar las condiciones detectadas. Revisa el estado y la conexión con el monitor." : "El UPS ya no reporta estas condiciones. El incidente permanece en el registro.");
+    let title = active.length ? active[0].definition.title : unconfirmed ? "Estado sin confirmar" : "Alerta resuelta";
+    let description = active.length ? "El UPS requiere tu atención. Revisa las condiciones detectadas." : unconfirmed ? "No hay información suficiente para confirmar las condiciones detectadas. Revisa el estado y la conexión con el monitor." : "El UPS ya no reporta estas condiciones. El incidente permanece en el registro.";
+    if (!items.length) {
+      const simulation = protection.simulation === true;
+      if (countdown) {
+        title = !state.serviceAvailable ? "Cuenta atrás sin confirmar" : simulation ? simulationPhase() === "ups_delay" ? "Simulación: espera para apagar el UPS" : "Cuenta atrás de prueba" : state.status?.policy?.action === "hibernate" ? "Hibernación programada" : "Apagado programado";
+        description = `${protection.reason || "Se alcanzó un límite de protección."} ${simulation ? "Esta prueba no apagará ni hibernará tu PC." : "Guarda tu trabajo. Puedes cancelar esta acción antes de que termine la cuenta atrás."}${!state.serviceAvailable ? " El monitor no está disponible; la cuenta atrás puede seguir activa y su cancelación no está confirmada." : ""}`;
+      } else {
+        title = state.stopAcknowledged ? "Elipro detenido" : protection.state === "cancelled" ? "Cuenta atrás cancelada" : simulationPhase() === "complete" ? "Simulación finalizada" : protection.state === "executed" ? simulation ? "Simulación finalizada" : "Solicitud enviada a Windows" : protection.state === "blocked" ? "La protección requiere atención" : "Cuenta atrás finalizada";
+        description = state.stopAcknowledged ? "Detuviste el monitor. La vigilancia se reanudará cuando vuelvas a iniciar Elipro." : simulationPhase() === "complete" ? "Windows y el UPS permanecen encendidos. La secuencia solo se ha representado." : protection.reason || "El monitor ya no reporta una cuenta atrás activa.";
+      }
+    }
+    setText("critical-title", title);
+    setText("critical-description", description);
     const list = $("critical-list");
     const signature = items.map((item) => `${item.definition.kind}:${item.status}:${item.message}`).join("|");
     if (list.dataset.signature !== signature) {
@@ -227,7 +296,7 @@
       }));
     }
     const dialog = $("critical-dialog");
-    dialog.dataset.state = active.length ? "active" : unconfirmed ? "unconfirmed" : "resolved";
+    dialog.dataset.state = active.length || countdown && state.serviceAvailable ? "active" : unconfirmed || countdown ? "unconfirmed" : "resolved";
     if (!state.criticalOpen) {
       state.criticalFocusTarget = document.activeElement;
       state.criticalOpen = true;
@@ -252,9 +321,10 @@
 
   function loadViewData() {
     if (!state.navigationReady || !state.serviceAvailable) return;
-    if (state.activeView === "incidents" && !state.incidentsLoaded) loadIncidents();
-    if (state.activeView === "history" && !state.archiveLoaded) loadArchive();
-    if (state.activeView === "system" && !state.observationLoaded) loadObservation();
+    if (state.activeView === "history") {
+      if (!state.incidentsLoaded) loadIncidents();
+      if (!state.archiveLoaded) loadArchive();
+    }
   }
 
   function activateView(name, { writeHash = false, focus = false } = {}) {
@@ -274,6 +344,9 @@
     sharedHistory.hidden = !showHistory;
     sharedHistory.inert = !showHistory;
     sharedHistory.setAttribute("aria-hidden", String(!showHistory));
+    const recentEvents = $("recent-events-card");
+    recentEvents.hidden = selected !== "overview";
+    recentEvents.inert = selected !== "overview";
     document.querySelectorAll(".sidebar-nav [data-view]").forEach((button) => {
       const active = button.dataset.view === selected;
       button.classList.toggle("active", active);
@@ -282,6 +355,7 @@
     document.body.dataset.view = selected;
     setText("view-title", view.title);
     setText("view-description", view.description);
+    $("view-description").hidden = !view.description;
     document.title = `${view.title} · Elipro UPS`;
     if (writeHash && window.location && window.location.hash !== `#${view.hash}`) window.location.hash = view.hash;
     if (showHistory) renderChart();
@@ -293,6 +367,8 @@
 
   function viewFromHash() {
     const hash = (window.location?.hash || "").slice(1).toLowerCase();
+    if (hash === "avisos") return "system";
+    if (hash === "incidentes") return "history";
     return Object.keys(views).find((name) => views[name].hash === hash) || "overview";
   }
 
@@ -320,7 +396,7 @@
     window.addEventListener?.("popstate", restore);
     restore();
     if (!Object.values(views).some((view) => `#${view.hash}` === window.location?.hash)) {
-      window.history?.replaceState?.(null, "", "#resumen");
+      window.history?.replaceState?.(null, "", `#${views[state.activeView].hash}`);
     }
     window.addEventListener?.("resize", () => {
       if (state.activeView === "history" || state.activeView === "overview") renderChart();
@@ -358,7 +434,9 @@
       }
       if (!response.ok) {
         const detail = data.error || data.detail || data.message;
-        throw new Error(typeof detail === "string" ? detail : `El servicio local devolvió un error (${response.status}).`);
+        const error = new Error(typeof detail === "string" ? detail : `El servicio local devolvió un error (${response.status}).`);
+        if (typeof data.code === "string") error.code = data.code;
+        throw error;
       }
       return data;
     } catch (error) {
@@ -386,38 +464,46 @@
     const unavailable = !state.serviceAvailable || !state.token;
     const busy = !!state.mutation;
     const enabled = !!state.status?.policy?.enabled;
-    $("save-policy").disabled = unavailable || busy;
-    $("cancel-shutdown").disabled = unavailable || busy;
-    $("critical-cancel").disabled = unavailable || busy || state.status?.protection?.state !== "countdown";
-    $("test-shutdown").disabled = unavailable || busy || enabled;
-    $("policy-form").querySelectorAll("input, select").forEach((field) => { field.disabled = busy; });
+    const transition = powerTransition();
+    const physicalTest = upsPhysicalTestActive();
+    $("save-policy").disabled = unavailable || busy || physicalTest;
+    $("critical-cancel").disabled = unavailable || busy || state.status?.protection?.state !== "countdown"
+      || state.status?.protection?.cancelable === false || simulationPhase() === "ups_delay";
+    $("test-shutdown").disabled = unavailable || busy || enabled || state.policyDirty || !!transition || physicalTest;
+    $("policy-form").querySelectorAll("input, select").forEach((field) => { field.disabled = busy || physicalTest; });
+    const canConfigureUps = typeof state.status?.ups_poweroff?.can_configure === "boolean" ? state.status.ups_poweroff.can_configure : state.status?.ups_poweroff?.available === true;
+    $("policy-ups-poweroff").disabled = unavailable || busy || physicalTest || (!canConfigureUps && !$("policy-ups-poweroff").checked);
+    $("ups-power-review-ack").disabled = !upsPowerCanReview();
+    $("ups-power-review-submit").disabled = !upsPowerCanReview() || !$("ups-power-review-ack").checked;
     const notificationSettingsMissing = !state.status?.notifications?.settings;
     $("notifications-form").querySelectorAll("input").forEach((field) => { field.disabled = unavailable || busy || notificationSettingsMissing; });
     $("notifications-persistent").disabled = unavailable || busy || typeof state.status?.notifications?.settings?.persistent_critical !== "boolean";
     $("save-notifications").disabled = unavailable || busy || notificationSettingsMissing;
     const delivery = state.status?.notifications?.delivery;
     $("test-notifications").disabled = unavailable || busy || notificationSettingsMissing || delivery?.available === false || delivery?.ready === false;
-    if (state.mutation !== "test-notifications") setText("test-notifications", state.status?.notifications?.settings?.sound_enabled === false ? "Probar aviso" : "Probar aviso y sonido");
+    if (state.mutation !== "test-notifications") setText("test-notifications-label", state.status?.notifications?.settings?.sound_enabled === false ? "Probar aviso" : "Probar aviso y sonido");
     $("test-notifications").title = unavailable ? "El panel debe recuperar la conexión con el monitor."
       : delivery?.available === false ? "Los avisos de escritorio no están disponibles. Consulta el diagnóstico."
       : delivery?.ready === false ? "Espera a que el canal de avisos esté listo." : "Envía una prueba desde el monitor. No apaga ni hiberna Windows.";
     $("test-shutdown").title = unavailable ? "El panel debe recuperar la conexión con el monitor."
-      : enabled ? "Desactiva y guarda la protección automática antes de probar el aviso." : "Simulación sin apagado ni hibernación.";
-    setText("test-description", unavailable ? state.stopAcknowledged ? "Elipro está detenido." : "Sin comunicación con el monitor." : enabled ? "Desactiva y guarda la protección antes de probar." : "Simulación: no apaga ni hiberna.");
-    for (const id of ["refresh-records", "apply-records", "search-events"]) $(id).disabled = unavailable;
-    if (state.navigationReady) for (const id of ["refresh-incidents", "apply-incidents"]) { if ($(id)) $(id).disabled = unavailable || state.incidentsBusy; }
+      : transition ? "Espera a que Windows reanude las lecturas antes de simular."
+      : enabled ? "Desactiva y guarda la protección automática antes de probar el aviso."
+      : state.policyDirty ? "Guarda la configuración para simular el tiempo que elegiste."
+      : !simulationIncludesUps() ? "Simula la cuenta atrás de Windows. El apagado adicional del UPS está desactivado o no disponible."
+      : "Simula la cuenta atrás guardada y la espera del UPS. No ejecuta acciones en Windows ni corta la energía.";
+    setText("test-description", unavailable ? state.stopAcknowledged ? "Elipro está detenido." : "Sin comunicación con el monitor."
+      : transition ? "Espera a que Windows reanude las lecturas antes de simular."
+      : enabled ? "Desactiva y guarda la protección antes de probar."
+      : state.policyDirty ? "Guarda los cambios antes de simular."
+      : !simulationIncludesUps() ? `Simulación de ${finite(state.status?.policy?.countdown_seconds) ? state.status.policy.countdown_seconds : 15} s para Windows. Sin apagado adicional del UPS. No ejecuta acciones reales.`
+      : `Simulación de ${finite(state.status?.policy?.countdown_seconds) ? state.status.policy.countdown_seconds : "—"} s guardados para Windows y ${simulationDelayDescription().toLocaleLowerCase("es")}. No apaga ni hiberna Windows ni corta la energía.`);
+    for (const id of ["apply-records", "search-events", "clear-records"]) $(id).disabled = unavailable;
     $("export-events").disabled = unavailable || state.downloadBusy;
     $("more-incidents").disabled = unavailable || state.incidentsBusy;
+    updateIncidentSortHeaders();
     $("more-events").disabled = unavailable || state.archiveBusy;
-    for (const id of ["download-diagnostics", "download-backup"]) $(id).disabled = unavailable || state.downloadBusy;
-    $("stop-monitor").disabled = unavailable || busy;
-    $("confirm-stop-monitor").disabled = unavailable || busy;
-    $("run-validation").disabled = unavailable || busy || state.validationBusy;
-    $("review-physical-tests").disabled = unavailable || state.physicalTestsBusy;
-    $("refresh-stability").disabled = unavailable || state.observationBusy;
-    $("start-stability").disabled = unavailable || state.observationBusy || state.observation?.state === "running";
-    $("stop-stability").disabled = unavailable || state.observationBusy;
-    $("download-stability").disabled = unavailable || state.downloadBusy;
+    $("stop-monitor").disabled = unavailable || busy || physicalTest;
+    $("confirm-stop-monitor").disabled = unavailable || busy || physicalTest;
   }
 
   function renderServiceState(error = "") {
@@ -439,7 +525,8 @@
     renderNotifications(state.status?.notifications);
     renderHistoryStatus();
     renderHealth(state.status?.health);
-    renderObservation();
+    renderUpsPoweroff();
+    renderManualUpsTestNotices();
   }
 
   function renderHistoryStatus() {
@@ -501,19 +588,28 @@
       updateFreshness();
       return;
     }
-    const status = context.quality === "live" ? "connected" : context.quality === "stale" || context.quality === "starting" ? "stale" : "disconnected";
-    showConnection(status, { connected: "UPS conectado", stale: "Datos desactualizados", disconnected: "Sin conexión al UPS" }[status]);
+    const transition = ["suspended", "resuming"].includes(context.quality) ? context.quality : null;
+    const status = transition || (context.quality === "live" ? "connected" : context.quality === "stale" || context.quality === "starting" ? "stale" : "disconnected");
+    showConnection(status, { connected: "UPS conectado", stale: "Datos desactualizados", disconnected: "Sin conexión al UPS",
+      suspended: "Lecturas en pausa por Windows", resuming: "Reanudando lectura del UPS" }[status]);
     const notice = $("connection-notice");
     notice.hidden = status === "connected";
-    if (status !== "connected") {
+    if (transition) {
+      notice.textContent = transition === "suspended"
+        ? "Lecturas en pausa por suspensión o hibernación de Windows. Elipro las retomará al reanudar."
+        : "Windows se está reanudando. Elipro está recuperando la lectura del UPS; la protección automática espera datos recientes.";
+    } else if (status !== "connected") {
       const prefix = status === "stale"
         ? "Las lecturas han dejado de actualizarse. La protección automática necesita datos recientes del UPS."
         : "No se reciben lecturas del UPS. Revisa el cable USB y la conexión del servicio de lectura.";
       notice.textContent = `${prefix}${connection.error ? ` ${String(connection.error)}` : ""}`;
     }
     if (!sample) {
-      setText("power-state", context.quality === "starting" ? "Esperando al UPS" : status === "stale" ? "Lecturas en pausa" : "UPS sin conexión");
-      setText("power-detail", "Esperando una lectura válida para mostrar el estado.");
+      setText("power-state", transition === "suspended" ? "Lecturas en pausa" : transition === "resuming" ? "Reanudando lecturas"
+        : context.quality === "starting" ? "Esperando al UPS" : status === "stale" ? "Lecturas en pausa" : "UPS sin conexión");
+      setText("power-detail", transition === "suspended" ? "Elipro retomará la vigilancia cuando Windows se reanude y llegue una lectura válida."
+        : transition === "resuming" ? "Esperando la primera lectura válida después de reanudar Windows."
+        : "Esperando una lectura válida para mostrar el estado.");
     } else if (sample.fault) {
       setText("power-state", "El UPS reporta una falla");
       setText("power-detail", "Revisa el equipo y sus indicadores físicos.");
@@ -579,7 +675,7 @@
   function eventCategory(event) {
     const kind = String(event.kind || "");
     if (/^connection_|^monitor_|^reader_|^supervisor_/.test(kind)) return "connection";
-    if (/^policy_|^simulation$/.test(kind)) return "protection";
+    if (/^policy_|^ups_poweroff_|^ups_battery_test|^ups_cancel_test|^windows_action_|^simulation$/.test(kind)) return "protection";
     return "power";
   }
 
@@ -603,8 +699,28 @@
       policy_disabled: "Protección automática desactivada",
       policy_online: "Red eléctrica confirmada",
       policy_on_battery: "Funcionando con batería",
+      ups_poweroff_submitted: "Corte del UPS solicitado",
+      ups_poweroff_unconfirmed: "Corte del UPS sin confirmar",
+      ups_poweroff_cancel_requested: "Cancelación del corte del UPS solicitada",
+      ups_poweroff_blocked: "Corte del UPS bloqueado",
+      ups_poweroff_reviewed: "Revisión del corte del UPS cerrada",
+      ups_battery_test_reviewed: "Observación física del UPS registrada",
+      ups_battery_test_windows_unconfirmed: "Solicitud de hibernación sin confirmar",
+      windows_action_unconfirmed: "Solicitud a Windows sin confirmar",
       simulation: "Simulación sin acción real",
     }[kind] || "Registro del monitor";
+  }
+
+  function eventMessage(event) {
+    const message = String(event.message || "");
+    if (event.kind === "ups_battery_test_reviewed") {
+      const result = event.data?.result;
+      if (result === "automatic_return_observed") return "Se observó que las salidas del UPS volvieron solas al regresar la electricidad. Este comportamiento está aceptado; quedan otras condiciones de habilitación por comprobar.";
+      if (result === "battery_cut_manual_restart_observed") return "Observación física favorable registrada; el perfil automático del UPS sigue sin validar.";
+      if (result === "physical_test_incomplete") return "Prueba física incompleta registrada; el apagado automático del UPS permanece bloqueado.";
+    }
+    if (event.kind === "policy_unknown" && (!message.trim() || message.trim() === "unknown")) return eventLabel(event.kind);
+    return message || eventLabel(event.kind);
   }
 
   function renderEvents(events, notify = true) {
@@ -623,7 +739,7 @@
         const newest = relevant[0];
         const severity = String(newest.severity || "");
         const prefix = relevant.length > 1 ? `${relevant.length} eventos nuevos. ` : "";
-        toast(`${prefix}${newest.message || "Cambió el estado del UPS."}`, /error|critical|danger/.test(severity), /warning/.test(severity));
+        toast(`${prefix}${eventMessage(newest)}`, /error|critical|danger/.test(severity), /warning/.test(severity));
       }
     }
     const filtered = state.eventFilter === "all" ? sorted : sorted.filter((event) => eventCategory(event) === state.eventFilter);
@@ -663,7 +779,7 @@
       const body = document.createElement("div");
       body.className = "event-body";
       const message = document.createElement("h3");
-      message.textContent = event.message || event.kind || "Evento del UPS";
+      message.textContent = eventMessage(event);
       const date = parseDate(event.timestamp);
       const time = document.createElement("time");
       if (date) {
@@ -682,23 +798,165 @@
     $("policy-battery-field").hidden = native;
     $("policy-runtime-field").hidden = native;
     $("policy-fields").classList.toggle("native-policy", native);
-    setText("policy-trigger-description", native
-      ? "Durante un corte, inicia una cuenta atrás al alcanzar el tiempo máximo con batería o cuando el UPS reporte la alerta real de batería baja."
-      : "Durante un corte, inicia una cuenta atrás cuando se alcance alguno de estos límites o el UPS avise batería baja.");
     const enabled = !!policy.enabled;
-    const tag = $("policy-state");
-    tag.textContent = enabled ? "Activado" : "Desactivado";
-    tag.classList.toggle("good", enabled);
+    const blocked = state.status?.meta?.dry_run === true || state.status?.meta?.simulation_source === true;
+    renderUpsPoweroff();
     updateMutationControls();
     if (state.policyInitialized && state.policyDirty) return;
     $("policy-enabled").checked = enabled;
-    $("policy-on-battery").value = finite(policy.on_battery_seconds) ? policy.on_battery_seconds / 60 : 5;
+    $("policy-on-battery").value = finite(policy.on_battery_seconds) ? policy.on_battery_seconds / 60 : 0;
     $("policy-low-battery").value = finite(policy.low_battery_percent) ? policy.low_battery_percent : 20;
     $("policy-runtime").value = finite(policy.min_runtime_seconds) ? policy.min_runtime_seconds : 180;
-    $("policy-countdown").value = finite(policy.countdown_seconds) ? policy.countdown_seconds : 60;
-    $("policy-action").value = policy.action === "hibernate" ? "hibernate" : "shutdown";
-    setText("enabled-label", enabled ? "Activada" : "Desactivada");
+    $("policy-countdown").value = finite(policy.countdown_seconds) ? policy.countdown_seconds : 15;
+    $("policy-ups-delay").value = configuredUpsDelay(policy) / 60;
+    $("policy-action").value = policy.action === "shutdown" ? "shutdown" : "hibernate";
+    $("policy-ups-poweroff").checked = policy.ups_poweroff === true;
+    setText("enabled-label", enabled ? blocked ? "Modo de prueba" : "Activada" : "Desactivada");
     state.policyInitialized = true;
+    updateMutationControls();
+  }
+
+  function renderUpsPoweroff() {
+    const capability = state.status?.ups_poweroff;
+    const automaticRestartObserved = capability?.restart_behavior === "automatic_on_mains" && capability?.restart_behavior_observed === true;
+    const observedSequence = capability?.reserve_mode === "observed_sequence";
+    const reason = friendlyUpsReason(capability?.reason);
+    const fallback = !capability ? "Este monitor no informa si puede apagar el UPS."
+      : observedSequence && capability.can_configure === true ? "Disponible para configurar; se comprobarán las condiciones antes de actuar."
+      : capability.available === true ? "Disponible para esta configuración."
+      : capability.validation === "incompatible" ? "Este equipo no es compatible con el apagado del UPS."
+      : capability.validation === "pending" ? "Pendiente de validación física. Esta opción todavía no puede activarse."
+      : "El apagado del UPS no está disponible en esta configuración.";
+    setText("ups-power-capability", !state.serviceAvailable ? "Sin comunicación con el monitor. La capacidad del UPS no está confirmada." : reason || fallback);
+    const operationState = capability?.operation?.state || capability?.state || "idle";
+    $("ups-power-capability").hidden = state.serviceAvailable && capability?.available === true && ["idle", "finished", "completed", "cancelled"].includes(operationState);
+    $("ups-power-capability").classList.toggle("ups-power-unavailable", (capability?.can_configure ?? capability?.available) !== true || !state.serviceAvailable);
+    setText("ups-power-restart", automaticRestartObserved ? "El UPS enciende sus salidas automáticamente cuando vuelve la luz."
+      : capability?.manual_restart_verified === true && capability?.manual_restart === true ? "En esta unidad se verificó el encendido manual de las salidas."
+      : "El comportamiento de las salidas al regresar la electricidad todavía no está confirmado para esta unidad.");
+    const policy = protectionDraft();
+    setText("ups-power-delay", `De 1 a 9 min, contados desde ${policy.action === "shutdown" ? "la solicitud de apagado" : "el inicio de la hibernación"}.`);
+    const admissionReason = !state.policyDirty && capability?.sequence_admission?.available === false ? friendlyUpsReason(capability.sequence_admission.reason) : "";
+    $("ups-power-sequence-warning").hidden = !admissionReason || admissionReason === reason;
+    setText("ups-power-sequence-warning", admissionReason && admissionReason !== reason ? admissionReason : "");
+    renderProtectionPreview();
+    const states = {
+      blocked: observedSequence && capability.can_configure === true ? "La opción del UPS puede guardarse. Antes de programarlo se comprobarán las condiciones recientes." : "El apagado del UPS está bloqueado; se conserva la protección de Windows.",
+      pending: "Hay una solicitud de apagado del UPS pendiente. La finalización de Windows no está confirmada.",
+      submitted: "Comando enviado al UPS. El corte físico no está confirmado.",
+      unconfirmed: "No se pudo confirmar el apagado del UPS.",
+      cancelled: "Apagado del UPS cancelado.",
+    };
+    $("ups-power-state").hidden = !states[capability?.state] || capability?.state === "blocked" && !!reason;
+    setText("ups-power-state", states[capability?.state] || "");
+    const operation = capability?.operation;
+    const canDisplayReview = state.serviceAvailable && capability?.can_review === true
+      && ["review_required", "submitted", "armed", "uncertain", "cancel_submitted"].includes(operation?.state)
+      && typeof operation?.operation_id === "string" && operation.operation_id.length > 0;
+    $("ups-power-review").hidden = !canDisplayReview;
+    if (!canDisplayReview || state.upsPowerReviewOperation !== operation.operation_id || !upsPowerCanReview()) $("ups-power-review-ack").checked = false;
+    state.upsPowerReviewOperation = canDisplayReview ? operation.operation_id : null;
+    $("ups-power-review-ack").disabled = !upsPowerCanReview();
+    $("ups-power-review-submit").disabled = !upsPowerCanReview() || !$("ups-power-review-ack").checked;
+  }
+
+  function upsPowerCanReview() {
+    const capability = state.status?.ups_poweroff;
+    const operation = capability?.operation;
+    const telemetry = telemetryContext();
+    return state.serviceAvailable && !!state.token && !state.mutation && !state.upsPowerReviewNeedsStatus
+      && !upsPhysicalTestActive() && !powerTransition() && capability?.can_review === true
+      && ["review_required", "submitted", "armed", "uncertain", "cancel_submitted"].includes(operation?.state)
+      && typeof operation?.operation_id === "string" && operation.operation_id.length > 0
+      && telemetry.quality === "live" && telemetry.sample?.on_battery === false
+      && telemetry.sample.low_battery === false && telemetry.sample.fault === false
+      && finite(telemetry.sample.output_voltage) && telemetry.sample.output_voltage > 0;
+  }
+
+  function friendlyUpsReason(value) {
+    if (typeof value !== "string" || !value.trim()) return "";
+    return /lectura, carga o tensión.*fuera.*secuencia observada|carga o tensión.*fuera.*secuencia observada/i.test(value)
+      ? "El UPS no está listo para un corte automático: revisa la carga y la batería."
+      : value;
+  }
+
+  function upsCancelTestActive() {
+    return ["arming", "submitted", "armed", "cancelling", "cancel_submitted", "cancelled", "observing", "uncertain", "review_required"].includes(state.status?.ups_cancel_test?.state);
+  }
+
+  function upsBatteryTestActive() {
+    return ["arming", "submitted", "uncertain", "windows_requested", "windows_failed", "cancelling", "cancel_submitted", "review_required"].includes(state.status?.ups_battery_test?.state);
+  }
+
+  function upsPhysicalTestActive() {
+    return upsCancelTestActive() || upsBatteryTestActive();
+  }
+
+  function renderManualUpsTestNotices() {
+    for (const [diagnostic, active, prefix] of [
+      [state.status?.ups_cancel_test, upsCancelTestActive(), "ups-cancel-test"],
+      [state.status?.ups_battery_test, upsBatteryTestActive(), "ups-battery-test"],
+    ]) {
+      $(prefix + "-urgent").hidden = !active;
+      if (!active) { setText(prefix + "-urgent-message", ""); continue; }
+      const review = diagnostic?.state === "review_required";
+      const rejected = diagnostic?.windows_request === "failed" || diagnostic?.state === "windows_failed";
+      const unconfirmed = diagnostic?.windows_request === "unconfirmed";
+      const pendingBitMissing = diagnostic?.result === "pending_bit_not_reported" || diagnostic?.reason_code === "pending_bit_not_reported";
+      const reportedMessage = typeof diagnostic?.message === "string" ? diagnostic.message.trim() : "";
+      let message = review ? "Una prueba manual anterior del UPS requiere revisión desde el diagnóstico. No se repetirán órdenes automáticamente."
+        : rejected ? "Windows rechazó la hibernación. El corte del UPS puede seguir pendiente y cualquier cancelación intentada no está confirmada."
+        : unconfirmed ? "La solicitud de hibernación quedó sin confirmar; esto no demuestra que Windows haya terminado. El corte del UPS puede seguir pendiente."
+        : pendingBitMissing && reportedMessage ? reportedMessage
+        : "Hay una prueba manual del UPS pendiente. El resultado del corte o de su cancelación no está confirmado. No repitas órdenes; la continuación requiere el diagnóstico.";
+      const remaining = finite(diagnostic?.remaining) ? Math.max(0, Math.ceil(diagnostic.remaining)) : null;
+      if (remaining !== null && !review) message += ` Tiempo calculado desde el envío: ${String(Math.floor(remaining / 60)).padStart(2, "0")}:${String(remaining % 60).padStart(2, "0")}.`;
+      if (!state.serviceAvailable) message += " Sin comunicación con Elipro: este es el último estado recibido; la operación no se considera cancelada.";
+      setText(prefix + "-urgent-message", message);
+    }
+  }
+
+  function simulationPhase() {
+    if (state.status?.protection?.simulation !== true) return null;
+    return state.status.protection.phase || state.status?.ups_poweroff?.simulation?.phase || null;
+  }
+
+  function configuredUpsDelay(policy = state.status?.policy) {
+    return finite(policy?.ups_poweroff_delay_seconds) ? policy.ups_poweroff_delay_seconds : 180;
+  }
+
+  function protectionDraft() {
+    const policy = state.status?.policy || {};
+    if (!state.policyDirty) return policy;
+    return { ...policy, action: $("policy-action").value, countdown_seconds: Number($("policy-countdown").value),
+      on_battery_seconds: Math.round(Number($("policy-on-battery").value) * 60), ups_poweroff: $("policy-ups-poweroff").checked,
+      ups_poweroff_delay_seconds: Number($("policy-ups-delay").value) * 60 };
+  }
+
+  function simulationIncludesUps() {
+    const capability = state.status?.ups_poweroff;
+    const canConfigure = typeof capability?.can_configure === "boolean" ? capability.can_configure : capability?.available === true;
+    return state.status?.policy?.ups_poweroff === true && canConfigure;
+  }
+
+  function simulationDelayDescription() {
+    const simulated = state.status?.ups_poweroff?.simulation;
+    const delay = finite(simulated?.delay_seconds) ? simulated.delay_seconds : configuredUpsDelay();
+    return `Retardo simulado del UPS de ${numeric(delay)} s desde el envío`;
+  }
+
+  function renderProtectionPreview() {
+    const policy = protectionDraft();
+    const wait = finite(policy.on_battery_seconds) ? Math.max(0, policy.on_battery_seconds) : 0;
+    const countdown = finite(policy.countdown_seconds) ? policy.countdown_seconds : 15;
+    const delay = configuredUpsDelay(policy);
+    const hibernate = policy.action !== "shutdown";
+    setText("protection-preview-countdown", "Se detecta el corte");
+    setText("protection-preview-wait", `${wait === 0 ? "" : `Tras ${runtimeLabel(wait)} con batería: `}${numeric(countdown)} s para cancelar toda la protección.`);
+    setText("protection-preview-action", hibernate ? "La PC empieza a hibernar" : "Windows empieza a apagarse");
+    setText("protection-preview-action-detail", hibernate ? "Conserva tu sesión sin cerrar aplicaciones." : "Windows solicita el cierre de las aplicaciones.");
+    setText("protection-preview-ups", policy.ups_poweroff === true ? `Unos ${runtimeLabel(delay)} después` : "El UPS permanece encendido");
+    setText("protection-preview-ups-detail", policy.ups_poweroff === true ? "El UPS corta la energía de sus salidas." : "No se programa un corte adicional.");
   }
 
   function renderProtection(protection) {
@@ -708,17 +966,18 @@
       setText("countdown", "—");
       return;
     }
-    const visible = ["countdown", "blocked", "executed"].includes(protection.state);
+    const visible = protection.state === "countdown";
     alert.hidden = !visible;
     if (!visible) return;
     const simulation = !!protection.simulation;
     const action = state.status?.policy?.action === "hibernate" ? "hibernación" : "apagado";
-    setText("protection-title", protection.state === "blocked" ? "La protección requiere atención" : protection.state === "executed" ? simulation ? "Simulación finalizada" : "Acción enviada a Windows" : simulation ? "Prueba del aviso · sin acción real" : `Cuenta atrás para ${action}`);
-    const reason = `${protection.reason || (simulation ? "Esta prueba no apagará ni hibernará tu PC." : "Se alcanzó un límite de protección.")}${simulation && protection.reason ? " No se apagará ni hibernará tu PC." : ""}`;
+    const phase = simulationPhase();
+    setText("protection-title", protection.state === "blocked" ? "La protección requiere atención" : phase === "complete" ? "Simulación finalizada" : protection.state === "executed" ? simulation ? "Simulación finalizada" : "Solicitud enviada a Windows" : simulation ? phase === "ups_delay" ? "Simulación: espera para apagar el UPS" : "Prueba del aviso · sin acción real" : `Cuenta atrás para ${action}`);
+    const reason = phase === "ups_delay" ? `La solicitud a Windows solo se representa. ${simulationDelayDescription()}. No se confirma que Windows haya terminado ni se corta la energía.`
+      : phase === "complete" ? "No se ejecutaron acciones en Windows ni se cortó la energía del UPS."
+      : `${protection.reason || (simulation ? "Esta prueba no apagará ni hibernará tu PC." : "Se alcanzó un límite de protección.")}${simulation && protection.reason ? " No se apagará ni hibernará tu PC." : ""}${protection.state === "executed" && !simulation ? " La solicitud no confirma que Windows haya terminado." : ""}`;
     const unconfirmed = !state.serviceAvailable ? ` Estado sin confirmar desde ${state.lastStatusAt ? clockFormat.format(state.lastStatusAt) : "la pérdida de comunicación"}. ${protection.state === "countdown" ? "La cuenta atrás puede seguir activa; su cancelación no está confirmada." : "No se ha podido consultar su estado actual."}` : "";
     setText("protection-reason", `${reason}${unconfirmed}`);
-    $("cancel-shutdown").hidden = protection.state !== "countdown";
-    $("cancel-shutdown").textContent = simulation ? "Cancelar prueba" : "Cancelar esta acción";
     updateCountdown();
   }
 
@@ -728,11 +987,12 @@
     const tag = $("notifications-state");
     const error = delivery.last_error || notifications?.last_error;
     const ready = state.serviceAvailable && settings && delivery.available !== false && delivery.ready === true;
-    tag.textContent = !state.serviceAvailable ? state.stopAcknowledged ? "Detenidos" : "Sin conexión" : !settings || delivery.available === false ? "No disponible" : ready ? "Listo" : "Iniciando";
+    setText("notifications-state-label", !state.serviceAvailable ? state.stopAcknowledged ? "Detenidos" : "Sin conexión" : !settings || delivery.available === false ? "No disponible" : ready ? "Listos" : "Iniciando");
     tag.classList.toggle("good", !!ready);
     tag.classList.toggle("warning", !ready);
     const lastDelivered = parseDate(delivery.last_delivered_at);
     const lastPopup = parseDate(delivery.last_popup_shown_at);
+    $("notifications-delivery").hidden = !!ready && settings.enabled !== false && !lastPopup && !lastDelivered;
     setText("notifications-delivery", !state.serviceAvailable
       ? state.stopAcknowledged ? "Elipro está detenido. Los avisos y el sonido automático se reanudarán cuando vuelvas a iniciarlo." : "El panel no puede confirmar el estado de los avisos. Comprueba que el monitor siga activo."
       : !settings ? "El monitor aún no informa un canal de avisos."
@@ -754,7 +1014,8 @@
     $("notifications-sound").checked = settings.sound_enabled === true;
     $("notifications-repeat").value = finite(settings.repeat_seconds) ? settings.repeat_seconds : 30;
     const supportsPersistent = typeof settings.persistent_critical === "boolean";
-    $("notifications-persistent-option").hidden = !supportsPersistent;
+    $("notifications-persistent-option").hidden = false;
+    setText("notifications-persistent-note", supportsPersistent ? "Hasta cerrarlos o resolverse la alerta." : "No disponible en esta versión del monitor.");
     $("notifications-persistent").checked = settings.persistent_critical === true;
     state.notificationsInitialized = true;
   }
@@ -767,133 +1028,62 @@
   function renderHealth(health) {
     const tag = $("health-state");
     const confirmed = state.serviceAvailable && health && typeof health === "object";
-    const healthy = confirmed && ["healthy", "ok", "running"].includes(health.state) && health.reader_alive === true && health.supervisor_alive === true;
-    tag.textContent = !state.serviceAvailable ? state.stopAcknowledged ? "Detenido" : "Sin confirmar" : !health ? "No disponible" : healthy ? "Supervisado" : "Revisar monitor";
+    const history = health?.history || state.status?.history;
+    const storageProblem = history?.available === false || history?.dropped > 0;
+    const stale = finite(health?.read_age_seconds) && health.read_age_seconds > 15;
+    const healthy = confirmed && ["healthy", "ok", "running"].includes(health.state) && health.reader_alive === true && health.supervisor_alive === true && health.processor_alive !== false && !storageProblem && !stale;
+    const transition = confirmed && ["suspended", "resuming"].includes(health.state) ? health.state : null;
+    setText("health-state-label", !state.serviceAvailable ? state.stopAcknowledged ? "Detenido" : "Sin confirmar" : !health ? "No disponible"
+      : transition === "suspended" ? "En pausa" : transition === "resuming" ? "Reanudando" : healthy ? "Operativo" : "Revisar monitor");
     tag.classList.toggle("good", !!healthy);
-    tag.classList.toggle("warning", !healthy);
-    setText("health-message", !state.serviceAvailable ? state.stopAcknowledged ? "Detuviste Elipro. La vigilancia está detenida y el lector y su supervisor se están cerrando. Inicia Elipro de nuevo para reanudarla." : "El panel perdió la comunicación. No puede confirmar si el monitor continúa funcionando." : !health ? "Esta versión del monitor no comunica su diagnóstico de funcionamiento." : health.message || (healthy ? "Lector y supervisor funcionando." : "Revisa el diagnóstico del monitor."));
+    tag.classList.toggle("warning", !healthy && !transition);
+    const message = !state.serviceAvailable ? state.stopAcknowledged ? "Detuviste Elipro. La vigilancia está detenida. Inicia Elipro de nuevo para reanudarla." : "El panel perdió la comunicación. No puede confirmar si el monitor continúa funcionando." : !health ? "El monitor aún no comunica su estado." : health.message || (transition === "suspended" ? "Las lecturas están en pausa por suspensión o hibernación de Windows."
+      : transition === "resuming" ? "Elipro está recuperando las lecturas después de reanudar Windows."
+      : history?.available === false ? "No se puede guardar el historial. La vigilancia continúa."
+      : history?.dropped > 0 ? `Se perdieron ${numeric(history.dropped)} registros del historial durante esta sesión.`
+      : stale ? "La última lectura tiene más de 15 segundos. Revisa la conexión con el UPS."
+      : healthy ? "" : "La supervisión del monitor requiere atención.");
+    setText("health-message", message);
+    $("health-message").hidden = !message;
     const data = confirmed ? health : {};
     setText("health-uptime", runtimeLabel(data.uptime_seconds));
-    setText("health-workers", confirmed ? `${data.reader_alive === true ? "Activo" : data.reader_alive === false ? "Detenido" : "Sin dato"} / ${data.supervisor_alive === true ? "Activo" : data.supervisor_alive === false ? "Detenido" : "Sin dato"}` : "—");
-    setText("health-reads", confirmed ? `${numeric(data.read_successes)} / ${numeric(data.read_failures)}${data.consecutive_failures > 0 ? ` (${numeric(data.consecutive_failures)} seguidas)` : ""}` : "—");
-    setText("health-recoveries", confirmed ? `${numeric(data.recoveries)}${finite(data.reader_restarts) ? ` · ${numeric(data.reader_restarts)} reinicios del lector` : ""}` : "—");
-    setText("health-last-reading", confirmed ? `${formatMoment(data.last_success)}${finite(data.read_age_seconds) ? ` · hace ${numeric(Math.max(0, data.read_age_seconds))} s` : ""}` : "—");
-    setText("health-last-error", confirmed ? data.last_error_at ? `${formatMoment(data.last_error_at)}${data.last_error_kind ? ` · ${String(data.last_error_kind)}` : ""}` : "Ninguno desde el inicio" : "—");
+    setText("health-last-reading", confirmed && finite(data.read_age_seconds) ? `Hace ${runtimeLabel(Math.max(0, data.read_age_seconds))}` : "—");
+    $("health-last-reading").title = confirmed ? formatMoment(data.last_success) : "";
     const process = data.process || {};
-    setText("health-resources", confirmed ? `${finite(process.memory_bytes) ? `${numeric(process.memory_bytes / 1048576, 1)} MB` : "Sin dato"} / ${finite(process.cpu_percent) ? `${numeric(process.cpu_percent, 1)} %` : "Midiendo"}` : "—");
-    const history = state.status?.history;
-    setText("health-storage", !confirmed ? "—" : !history ? "Sin diagnóstico" : `${history.available === false ? "Interrumpido" : "Disponible"} · ${numeric(history.pending ?? 0)} pendientes${history.last_success_at ? ` · ${formatMoment(history.last_success_at)}` : ""}`);
+    setText("health-resources", confirmed && finite(process.memory_bytes) ? `${numeric(process.memory_bytes / 1048576, 1)} MB RAM` : "—");
+    setText("health-cpu", confirmed ? `CPU ${finite(process.cpu_percent) ? `${numeric(process.cpu_percent, 1)} %` : "midiendo"}` : "—");
   }
 
-  function renderObservation(data) {
-    if (data && typeof data === "object") {
-      state.observation = data;
-      state.observationLoaded = true;
-      sectionError("stability-error", data.last_error ? new Error(String(data.last_error)) : null);
-    }
-    const observation = state.observation;
-    $("stop-stability").hidden = observation?.state !== "running";
-    $("download-stability").hidden = observation?.report_available !== true;
-    if (!state.serviceAvailable && observation) {
-      setText("stability-summary", state.stopAcknowledged ? "Elipro está detenido y la observación dejó de recopilar datos. Revisa el informe cuando vuelvas a iniciarlo." : "El panel no puede confirmar el estado de la observación hasta recuperar la comunicación con Elipro.");
-    } else if (observation) {
-      const label = { idle: "Sin observación activa", running: "Observación en curso", completed_pending_review: "Período completado; informe pendiente de revisión", interrupted: "Observación interrumpida" }[observation.state] || "Estado de observación sin confirmar";
-      const elapsed = finite(observation.elapsed_seconds) ? ` · ${runtimeLabel(observation.elapsed_seconds)}${finite(observation.target_seconds) ? ` de ${runtimeLabel(observation.target_seconds)}` : ""}` : "";
-      const samples = finite(observation.samples) ? ` · ${numeric(observation.samples)} comprobaciones` : "";
-      const failures = finite(observation.read_failures) ? ` · ${numeric(observation.read_failures)} errores de lectura` : "";
-      const dropped = observation.history_dropped > 0 ? ` · ${numeric(observation.history_dropped)} registros descartados` : "";
-      const memory = finite(observation.memory_peak_bytes) ? ` · memoria máxima ${numeric(observation.memory_peak_bytes / 1048576, 1)} MB` : "";
-      const cpu = finite(observation.cpu_peak_percent) ? ` · CPU máxima ${numeric(observation.cpu_peak_percent, 1)} %` : "";
-      const age = finite(observation.max_read_age_seconds) ? ` · mayor antigüedad de lectura ${numeric(observation.max_read_age_seconds, 1)} s` : "";
-      setText("stability-summary", `${label}${elapsed}${samples}${failures}${dropped}${memory}${cpu}${age}.`);
-    }
-    updateMutationControls();
-  }
-
-  async function loadObservation() {
-    if (!state.serviceAvailable || state.observationBusy) return;
-    state.observationBusy = true;
-    updateMutationControls();
-    sectionError("stability-error", null);
-    try {
-      const data = await request("/api/stability");
-      if (!data || typeof data.state !== "string") throw new Error("El monitor no devolvió un estado de observación válido.");
-      renderObservation(data);
-    } catch (error) { sectionError("stability-error", new Error(`No se pudo consultar la observación. ${error.message}`)); }
-    finally { state.observationBusy = false; updateMutationControls(); }
-  }
-
-  async function changeObservation(start) {
-    if (!state.serviceAvailable || state.observationBusy) return;
-    state.observationBusy = true;
-    updateMutationControls();
-    sectionError("stability-error", null);
-    try {
-      const data = await post(`/api/stability/${start ? "start" : "stop"}`, start ? { hours: 48 } : {});
-      if (!data || typeof data.state !== "string") throw new Error("El monitor no confirmó el cambio de observación.");
-      renderObservation(data);
-    } catch (error) { sectionError("stability-error", error); }
-    finally { state.observationBusy = false; updateMutationControls(); }
-  }
-
-  async function runValidation() {
-    if (!state.serviceAvailable || state.validationBusy || state.mutation) return;
-    state.validationBusy = true;
-    updateMutationControls();
-    setText("validation-summary", "Comprobando las reglas con datos simulados…");
-    $("validation-results").replaceChildren();
-    try {
-      const data = await post("/api/validation/run", {});
-      if (data.source !== "isolated_simulation" || data.os_actions_executed !== 0 || data.live_settings_changed !== false || !Array.isArray(data.scenarios)) throw new Error("El monitor no confirmó las condiciones de seguridad de esta comprobación.");
-      const passed = data.passed === true && data.scenarios.length > 0 && data.scenarios.every((scenario) => scenario.passed === true);
-      setText("validation-summary", passed ? "Comprobaciones simuladas superadas. No se ejecutaron acciones en Windows ni se cambiaron tus ajustes. Las pruebas físicas se revisan por separado." : "Hay comprobaciones que requieren revisión. No se ejecutaron acciones en Windows ni se cambiaron tus ajustes.");
-      for (const [index, scenario] of data.scenarios.entries()) {
-        const row = document.createElement("div");
-        row.className = `validation-result${scenario.passed === true ? " passed" : " failed"}`;
-        const name = document.createElement("strong");
-        name.textContent = `${scenario.passed === true ? "✓" : "!"} ${String(scenario.label || `Comprobación ${index + 1}`)}`;
-        row.append(name);
-        if (scenario.detail) appendDetail(row, String(scenario.detail));
-        $("validation-results").append(row);
-      }
-    } catch (error) { setText("validation-summary", `No se pudo completar la comprobación. ${error.message}`); }
-    finally { state.validationBusy = false; updateMutationControls(); }
-  }
-
-  async function reviewPhysicalTests() {
-    if (!state.serviceAvailable || state.physicalTestsBusy) return;
-    state.physicalTestsBusy = true;
-    updateMutationControls();
-    $("physical-test-summary").hidden = false;
-    setText("physical-test-summary", "Consultando las pruebas físicas registradas…");
-    try {
-      const data = await request("/api/validation");
-      const record = data.available === true && data.record;
-      if (!record) throw new Error("Aún no hay un registro de pruebas físicas disponible.");
-      const cut = record.real_cut;
-      const power = cut?.status === "passed" ? `Corte y regreso: registrados${cut.date ? ` el ${String(cut.date)}` : ""}${finite(cut.seconds_detected) ? ` (${numeric(cut.seconds_detected, 1)} s detectados)` : ""}.${cut.session_preserved_user_confirmed === true ? " Sesión conservada, confirmado por ti." : ""}${cut.visual_and_sound_user_confirmed === true ? " Aviso y sonido confirmados por ti." : ""}` : "Corte físico: sin una prueba confirmada en el registro.";
-      const usb = record.physical_usb_reconnection?.status === "passed" ? " Reconexión física del USB: comprobada." : " Reconexión física del USB: pendiente de comprobar contigo.";
-      const action = record.real_windows_shutdown?.status === "passed" ? " Acción real de Windows: comprobada según el registro." : " Apagado real de Windows: sin probar.";
-      const safety = state.status?.policy?.enabled === false ? " El apagado automático está desactivado." : state.status?.meta?.dry_run ? " Las acciones reales están bloqueadas en modo de prueba." : "";
-      setText("physical-test-summary", `${power}${usb}${action}${safety}`);
-    } catch (error) { setText("physical-test-summary", `No se pudo revisar el registro de pruebas. ${error.message}`); }
-    finally { state.physicalTestsBusy = false; updateMutationControls(); }
-  }
-
-  function recordFilters(includeEvents = false, incidents = false) {
+  function readRecordDates() {
     const params = new URLSearchParams();
-    const prefix = state.navigationReady && incidents && $("incidents-from") ? "incidents" : "records";
-    const values = [$(`${prefix}-from`).value, $(`${prefix}-to`).value];
+    const values = [$("records-from").value, $("records-to").value];
     const dates = values.map((value) => value ? parseDate(value) : null);
     if (values.some((value, index) => value && !dates[index])) throw new Error("Revisa las fechas de la consulta.");
     if (dates[0] && dates[1] && dates[0] > dates[1]) throw new Error("La fecha Desde debe ser anterior o igual a Hasta.");
     if (dates[0]) params.set("from", dates[0].toISOString());
     if (dates[1]) params.set("to", dates[1].toISOString());
-    if (includeEvents) {
-      if ($("event-kind").value) params.set("kind", $("event-kind").value);
-      if ($("event-search").value.trim()) params.set("q", $("event-search").value.trim());
-    }
     return params;
+  }
+
+  function readEventFilters() {
+    const params = new URLSearchParams();
+    if ($("event-kind").value) params.set("kind", $("event-kind").value);
+    if ($("event-search").value.trim()) params.set("q", $("event-search").value.trim());
+    return params.toString();
+  }
+
+  function recordFilters(includeEvents = false) {
+    const params = new URLSearchParams(state.recordDates);
+    if (includeEvents) for (const [key, value] of new URLSearchParams(state.archiveFilters)) params.set(key, value);
+    return params;
+  }
+
+  function renderRecordDates() {
+    const dates = new URLSearchParams(state.recordDates);
+    const start = dates.get("from"), end = dates.get("to");
+    const label = start && end ? `${formatMoment(start)} – ${formatMoment(end)}`
+      : start ? `Desde ${formatMoment(start)}` : end ? `Hasta ${formatMoment(end)}` : "Todas las fechas";
+    setText("records-feedback", `${label}. Fechas aplicadas a ambas tablas; la gráfica usa su propio período.`);
   }
 
   function sectionError(id, error) {
@@ -908,33 +1098,117 @@
     parent.append(paragraph);
   }
 
-  function renderIncidents() {
-    const list = $("incidents-list");
-    list.replaceChildren();
-    if (!state.incidents.length) return appendDetail(list, "No hay incidentes en este intervalo.", "section-empty");
-    for (const incident of state.incidents) {
-      const item = document.createElement("article");
-      item.className = `incident-item${incident.status === "open" ? " incident-open" : ""}`;
-      const heading = document.createElement("h4");
-      heading.textContent = `${incident.type === "power" ? "Corte eléctrico" : "Problema de comunicación"} · ${incident.status === "open" ? "Sin recuperación registrada" : "Recuperado"}`;
-      item.append(heading);
-      appendDetail(item, `${incident.start_known === false ? "Inicio no registrado" : formatMoment(incident.started_at)} → ${incident.ended_at ? formatMoment(incident.ended_at) : "Sin recuperación registrada"}`, "incident-dates");
-      const durationLabel = incident.status === "open" ? "Tiempo desde la detección" : `Duración detectada${incident.start_known === false ? " desde el primer registro disponible" : ""}`;
-      appendDetail(item, `${durationLabel}: ${finite(incident.duration_seconds) ? runtimeLabel(incident.duration_seconds) : "Sin confirmar"}`);
-      if (incident.status === "open") appendDetail(item, incident.type === "power" ? "Un registro sin cierre no confirma que el UPS siga en batería; consulta el estado actual de arriba." : "Un registro sin cierre no confirma que siga habiendo un problema de comunicación; consulta el estado actual de arriba.");
-      if (incident.message) appendDetail(item, String(incident.message));
-      const actions = Array.isArray(incident.actions) ? incident.actions : [];
-      appendDetail(item, actions.length ? `Protección: ${actions.map((event) => event.message || event.kind || "Evento de protección").join(" · ")}` : "Sin acciones de protección registradas durante este incidente.", "incident-actions");
-      list.append(item);
+  const incidentColumns = [
+    ["type", "Tipo"], ["status", "Estado"], ["started_at", "Inicio"],
+    ["ended_at", "Recuperación"], ["duration_seconds", "Duración"], ["action_result", "Protección"],
+  ];
+
+  function updateIncidentSortHeaders() {
+    for (const [key, label] of incidentColumns) {
+      const active = state.incidentSort === key;
+      const direction = active && state.incidentDirection === "asc" ? "desc" : "asc";
+      $(`incident-head-${key}`).setAttribute("aria-sort", active ? state.incidentDirection === "asc" ? "ascending" : "descending" : "none");
+      const button = $(`incident-sort-${key}`);
+      button.disabled = !state.serviceAvailable;
+      button.setAttribute("aria-label", `Ordenar por ${label.toLocaleLowerCase("es")}, ${direction === "asc" ? "ascendente" : "descendente"}`);
+      button.replaceChildren(document.createTextNode(`${label} `));
+      const indicator = document.createElement("span");
+      indicator.setAttribute("aria-hidden", "true");
+      indicator.textContent = active ? state.incidentDirection === "asc" ? "↑" : "↓" : "↕";
+      button.append(indicator);
     }
+  }
+
+  function renderIncidents(emptyMessage = "No hay incidentes en este intervalo.") {
+    const body = $("incidents-body");
+    body.replaceChildren();
+    updateIncidentSortHeaders();
+    if (!state.incidents.length) {
+      const row = document.createElement("tr");
+      const cell = document.createElement("td");
+      cell.colSpan = 7;
+      cell.className = "section-empty";
+      cell.textContent = emptyMessage;
+      row.append(cell);
+      body.append(row);
+      return;
+    }
+    const actionLabels = { failed: "Fallida", started: "Iniciada", cancelled: "Cancelada", simulated: "Simulada", none: "Sin acciones" };
+    state.incidents.forEach((incident, index) => {
+      const row = document.createElement("tr");
+      row.className = incident.status === "open" ? "incident-row incident-row-open" : "incident-row";
+      const type = incident.type === "power" ? "Corte eléctrico" : "Problema de comunicación";
+      const start = incident.start_known === false ? "Inicio no registrado" : formatMoment(incident.started_at);
+      const end = incident.ended_at ? formatMoment(incident.ended_at) : "Sin recuperación registrada";
+      const duration = finite(incident.duration_seconds) ? runtimeLabel(incident.duration_seconds) : "Sin confirmar";
+      for (const [column, value] of [type, incident.status === "open" ? "Sin recuperación registrada" : "Recuperado", start, end, duration, actionLabels[incident.action_result] || "Sin acciones"].entries()) {
+        const cell = document.createElement("td");
+        cell.textContent = value;
+        if (column === 1 && incident.status !== "open") cell.className = "incident-status-recovered";
+        if (column === 5 && incident.action_result === "started") cell.className = "incident-action-started";
+        row.append(cell);
+      }
+      const detailRow = document.createElement("tr");
+      detailRow.className = "incident-detail-row";
+      detailRow.hidden = true;
+      detailRow.id = `incident-detail-${index}`;
+      const detailCell = document.createElement("td");
+      detailCell.colSpan = 7;
+      const details = document.createElement("div");
+      details.className = "incident-details";
+      const durationLabel = incident.status === "open" ? "Tiempo desde la detección" : `Duración detectada${incident.start_known === false ? " desde el primer registro disponible" : ""}`;
+      appendDetail(details, `${durationLabel}: ${duration}`);
+      if (incident.status === "open") appendDetail(details, incident.type === "power" ? "Un registro sin cierre no confirma que el UPS siga en batería; consulta el estado actual de arriba." : "Un registro sin cierre no confirma que siga habiendo un problema de comunicación; consulta el estado actual de arriba.", "incident-warning");
+      if (incident.message) appendDetail(details, `Inicio: ${String(incident.message)}`);
+      if (incident.recovery_message) appendDetail(details, `Recuperación: ${String(incident.recovery_message)}`);
+      const actions = Array.isArray(incident.actions) ? incident.actions : [];
+      if (actions.length) {
+        appendDetail(details, "Secuencia de protección:", "incident-actions-label");
+        const sequence = document.createElement("ol");
+        sequence.className = "incident-action-sequence";
+        for (const action of actions) {
+          const item = document.createElement("li");
+          item.textContent = `${formatMoment(action.timestamp)} · ${eventMessage(action) || eventLabel(action.kind) || "Evento de protección"}`;
+          sequence.append(item);
+        }
+        details.append(sequence);
+      } else appendDetail(details, "Sin acciones de protección registradas durante este incidente.");
+      detailCell.append(details);
+      detailRow.append(detailCell);
+      const buttonCell = document.createElement("td");
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "button button-quiet incident-details-toggle";
+      button.textContent = "Ver detalles";
+      button.setAttribute("aria-expanded", "false");
+      button.setAttribute("aria-controls", detailRow.id);
+      button.setAttribute("aria-label", `Ver detalles: ${type}, ${start}`);
+      button.addEventListener("click", () => {
+        detailRow.hidden = !detailRow.hidden;
+        button.textContent = detailRow.hidden ? "Ver detalles" : "Ocultar detalles";
+        button.setAttribute("aria-expanded", String(!detailRow.hidden));
+        button.setAttribute("aria-label", `${detailRow.hidden ? "Ver" : "Ocultar"} detalles: ${type}, ${start}`);
+      });
+      buttonCell.append(button);
+      row.append(buttonCell);
+      body.append(row, detailRow);
+    });
   }
 
   async function loadIncidents(append = false) {
     if (!state.serviceAvailable || state.incidentsBusy) return;
-    const version = state.navigationReady ? state.incidentVersion : state.recordVersion;
-    const currentVersion = () => state.navigationReady ? state.incidentVersion : state.recordVersion;
+    const version = state.incidentVersion;
+    const currentVersion = () => state.incidentVersion;
+    const requestedSort = state.incidentSort;
+    const requestedDirection = state.incidentDirection;
     let params;
-    try { params = recordFilters(false, true); }
+    let filters;
+    try {
+      filters = recordFilters().toString();
+      params = new URLSearchParams(filters);
+      params.set("sort", requestedSort);
+      params.set("direction", requestedDirection);
+    }
     catch (error) { sectionError("incidents-error", error); return; }
     const query = params.toString();
     if (append && query !== state.incidentQuery) append = false;
@@ -952,14 +1226,26 @@
       state.incidents = combined.filter((item, index) => combined.findIndex((other) => String(other.id) === String(item.id)) === index);
       state.incidentCursor = data.next_cursor || null;
       state.incidentQuery = query;
-      state.recordsLoaded = true;
+      state.incidentAppliedSort = requestedSort;
+      state.incidentAppliedDirection = requestedDirection;
       state.incidentsLoaded = true;
-      setText("incidents-count", `${state.incidents.length}${finite(data.total) ? ` / ${numeric(data.total)}` : ""}`);
+      const total = finite(data.total) ? data.total : state.incidents.length;
+      setText("incidents-count", `${numeric(total)} ${total === 1 ? "incidente" : "incidentes"}`);
+      $("incidents-count").title = `${state.incidents.length} incidentes mostrados`;
       $("more-incidents").hidden = !state.incidentCursor;
       renderIncidents();
-      setText(state.navigationReady ? "incidents-feedback" : "records-feedback", `Consulta actualizada a las ${clockFormat.format(new Date())}. Las fechas usan la zona horaria de esta PC; puede haber huecos si faltaron lecturas o registros.`);
     } catch (error) {
-      if (version === currentVersion()) sectionError("incidents-error", new Error(`No se pudieron consultar los incidentes. ${error.message}`));
+      if (version === currentVersion()) {
+        state.incidentSort = state.incidentAppliedSort;
+        state.incidentDirection = state.incidentAppliedDirection;
+        updateIncidentSortHeaders();
+        if (error.code === "incident_cursor_expired") {
+          state.incidentCursor = null;
+          $("more-incidents").hidden = true;
+        }
+        sectionError("incidents-error", new Error(`No se pudieron consultar los incidentes. ${error.message}`));
+        if (!state.incidents.length) renderIncidents("No se pudieron cargar los incidentes.");
+      }
     } finally {
       state.incidentsBusy = false;
       $("incidents-list").setAttribute("aria-busy", "false");
@@ -968,21 +1254,31 @@
     }
   }
 
-  function renderArchive() {
+  function renderArchive(emptyMessage = "No hay eventos que coincidan con la búsqueda.") {
     const list = $("archive-list");
     list.replaceChildren();
-    if (!state.archive.length) return appendDetail(list, "No hay eventos que coincidan con la búsqueda.", "section-empty");
+    if (!state.archive.length) {
+      const row = document.createElement("tr"), cell = document.createElement("td");
+      cell.colSpan = 3;
+      cell.className = "section-empty";
+      cell.textContent = emptyMessage;
+      row.append(cell);
+      list.append(row);
+      return;
+    }
     for (const event of state.archive) {
-      const row = document.createElement("article");
+      const row = document.createElement("tr");
       row.className = "archive-event";
+      const dateCell = document.createElement("td");
       const time = document.createElement("time");
       time.textContent = formatMoment(event.timestamp);
       const parsed = parseDate(event.timestamp);
       if (parsed) time.dateTime = parsed.toISOString();
-      const body = document.createElement("div");
-      appendDetail(body, String(event.message || eventLabel(event.kind)));
-      appendDetail(body, eventLabel(event.kind), "archive-kind");
-      row.append(time, body);
+      dateCell.append(time);
+      const kindCell = document.createElement("td"), messageCell = document.createElement("td");
+      kindCell.textContent = eventLabel(event.kind);
+      messageCell.textContent = eventMessage(event);
+      row.append(dateCell, kindCell, messageCell);
       list.append(row);
     }
   }
@@ -1011,11 +1307,18 @@
       state.archiveLoaded = true;
       state.archiveCursor = data.next_cursor || null;
       $("more-events").hidden = !state.archiveCursor;
-      setText("archive-summary", `${numeric(state.archive.length)} ${state.archive.length === 1 ? "evento mostrado" : "eventos mostrados"}${finite(data.total) ? ` de ${numeric(data.total)}` : ""}. El CSV incluye todos los resultados con estos filtros, no solo esta página.`);
+      const total = finite(data.total) ? data.total : state.archive.length;
+      setText("archive-count", `${numeric(total)} ${total === 1 ? "evento" : "eventos"}`);
+      setText("archive-summary", `${numeric(state.archive.length)} ${state.archive.length === 1 ? "evento mostrado" : "eventos mostrados"}${finite(data.total) ? ` de ${numeric(data.total)}` : ""}. El CSV incluye todos los resultados con los filtros aplicados.`);
+      $("archive-summary").hidden = false;
       renderArchive();
-      if (state.navigationReady) setText("records-feedback", `Consulta actualizada a las ${clockFormat.format(new Date())}. Las fechas corresponden a los eventos; la gráfica usa el período seleccionado.`);
     } catch (error) {
-      if (version === state.recordVersion) sectionError("archive-error", new Error(`No se pudieron consultar los eventos. ${error.message}`));
+      if (version === state.recordVersion) {
+        sectionError("archive-error", new Error(`No se pudieron consultar los eventos. ${error.message}`));
+        setText("archive-summary", "No se cargaron eventos para esta consulta.");
+        $("archive-summary").hidden = false;
+        if (!state.archive.length) renderArchive("No se pudieron cargar los eventos.");
+      }
     } finally {
       state.archiveBusy = false;
       $("archive-list").setAttribute("aria-busy", "false");
@@ -1026,26 +1329,44 @@
 
   async function refreshRecords() {
     if (!state.serviceAvailable) return;
-    try { recordFilters(true); }
+    let dates;
+    try {
+      dates = readRecordDates().toString();
+    }
     catch (error) { setText("records-feedback", error.message); return; }
+    const changed = dates !== state.recordDates;
+    state.recordDates = dates;
     state.recordVersion += 1;
-    setText("records-feedback", "Consultando los registros conservados…");
-    await Promise.all(state.navigationReady ? [loadArchive()] : [loadIncidents(), loadArchive()]);
+    state.incidentVersion += 1;
+    state.incidentCursor = state.archiveCursor = null;
+    $("more-incidents").hidden = $("more-events").hidden = true;
+    if (changed) {
+      state.incidents = [];
+      state.archive = [];
+      setText("incidents-count", "—");
+      setText("archive-count", "—");
+      setText("archive-summary", "Consultando los eventos del intervalo…");
+      renderIncidents("Consultando incidentes…");
+      renderArchive("Consultando eventos…");
+    }
+    renderRecordDates();
+    await Promise.all([loadIncidents(), loadArchive()]);
   }
 
-  async function refreshIncidents() {
+  async function searchArchive() {
     if (!state.serviceAvailable) return;
-    try { recordFilters(false, true); }
-    catch (error) { setText("incidents-feedback", error.message); return; }
-    state.incidentVersion += 1;
-    setText("incidents-feedback", "Consultando los incidentes conservados…");
-    await loadIncidents();
+    state.archiveFilters = readEventFilters();
+    state.recordVersion += 1;
+    state.archiveCursor = null;
+    $("more-events").hidden = true;
+    await loadArchive();
   }
 
   async function downloadFile(path, filename, feedbackId) {
     if (!state.serviceAvailable || state.downloadBusy) return;
     state.downloadBusy = true;
     updateMutationControls();
+    $(feedbackId).hidden = false;
     setText(feedbackId, "Preparando la descarga…");
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 30000);
@@ -1094,23 +1415,23 @@
     const recovered = !state.serviceAvailable;
     const historyRecovered = state.status?.history?.available === false && data.history?.available === true;
     state.status = data;
+    state.upsPowerReviewNeedsStatus = false;
     state.serviceAvailable = true;
     state.stopAcknowledged = false;
     state.lastStatusAt = new Date();
     state.token = typeof data.csrf_token === "string" ? data.csrf_token : null;
     if (finite(data.meta?.history_interval_seconds) && data.meta.history_interval_seconds > 0) state.historyInterval = data.meta.history_interval_seconds * 1000;
-    $("development-notice").hidden = !data.meta?.dry_run;
+    $("development-notice").hidden = !(data.meta?.dry_run || data.meta?.simulation_source);
     $("bridge-policy-note").hidden = data.meta?.bridge_required !== true;
     renderServiceState();
     refreshTelemetry();
     renderEvents(data.events);
     renderPolicy(data.policy || {});
     renderProtection(data.protection || {});
+    renderManualUpsTestNotices();
     renderNotifications(data.notifications);
     renderHistoryStatus();
     renderHealth(data.health);
-    if (data.health?.observation) renderObservation(data.health.observation);
-    else renderObservation();
     loadViewData();
     if (recovered || historyRecovered) loadHistory();
   }
@@ -1187,8 +1508,9 @@
   function renderChart() {
     const chart = $("history-chart");
     chart.replaceChildren();
-    const width = Math.min(800, Math.max(280, chart.clientWidth || 800));
-    chart.setAttribute("viewBox", `0 0 ${width} 230`);
+    const width = Math.max(280, chart.clientWidth || 800);
+    const height = Math.max(120, chart.clientHeight || 230);
+    chart.setAttribute("viewBox", `0 0 ${width} ${height}`);
     const end = Date.now();
     const start = end - state.hours * 3600000;
     const samples = state.history.filter((sample) => sample._time >= start && sample._time <= end);
@@ -1223,7 +1545,7 @@
         yMax = Math.ceil((largest + padding) / step) * step;
       } else { yMin = 0; yMax = series[0].key === "battery_voltage" ? 1 : 250; }
     } else if (available) yMax = Math.max(100, Math.ceil(values.reduce((maximum, value) => Math.max(maximum, value), 0) / 20) * 20);
-    const left = 38, right = width - 14, top = 14, bottom = 192;
+    const left = 38, right = width - 14, top = 14, bottom = height - 38;
     const x = (time) => left + (time - start) / (end - start) * (right - left);
     const y = (value) => bottom - (value - yMin) / (yMax - yMin) * (bottom - top);
     for (let index = 0; index <= 4; index++) {
@@ -1236,7 +1558,7 @@
       const time = start + (end - start) * index / 4;
       const date = new Date(time);
       const label = state.hours > 24 ? new Intl.DateTimeFormat("es-PE", { day: "2-digit", month: "2-digit" }).format(date) : shortClockFormat.format(date);
-      chart.append(svgElement("text", { x: x(time), y: 219, class: "chart-axis", "text-anchor": index === 0 ? "start" : index === 4 ? "end" : "middle" }, label));
+      chart.append(svgElement("text", { x: x(time), y: height - 11, class: "chart-axis", "text-anchor": index === 0 ? "start" : index === 4 ? "end" : "middle" }, label));
     }
     // Never connect samples across a missing measurement or a gap in collection.
     const intervals = samples.slice(1).map((sample, index) => sample._time - samples[index]._time).filter((interval) => interval > 0).sort((a, b) => a - b);
@@ -1334,17 +1656,15 @@
     state.eventFilter = $("events-filter").value;
     renderEvents(state.events, false);
   });
-  $("settings-toggle").addEventListener("click", () => {
-    const button = $("settings-toggle");
-    const expanded = button.getAttribute("aria-expanded") !== "true";
-    button.setAttribute("aria-expanded", String(expanded));
-    $("settings-panel").hidden = !expanded;
-  });
-  $("policy-form").addEventListener("input", () => {
+  $("policy-form").addEventListener("input", (event) => {
+    if (event.target === $("ups-power-review-ack")) return;
     state.policyDirty = true;
-    setText("enabled-label", $("policy-enabled").checked ? "Activada al guardar" : "Desactivada al guardar");
+    setText("enabled-label", $("policy-enabled").checked ? state.status?.meta?.dry_run ? "Prueba al guardar" : "Activada al guardar" : "Desactivada al guardar");
     setText("settings-feedback", "Cambios sin guardar");
     $("settings-feedback").classList.remove("error");
+    updateMutationControls();
+    renderManualUpsTestNotices();
+    renderUpsPoweroff();
   });
   $("notifications-form").addEventListener("input", () => {
     state.notificationsDirty = true;
@@ -1364,7 +1684,7 @@
     state.mutation = "save-notifications";
     state.statusGeneration += 1;
     updateMutationControls();
-    setText("save-notifications", "Guardando…");
+    setText("save-notifications-label", "Guardando…");
     try {
       const result = await post("/api/notifications", settings);
       applyStatus(result);
@@ -1382,7 +1702,7 @@
       toast(error.message, true);
     } finally {
       state.mutation = null;
-      setText("save-notifications", "Guardar avisos");
+      setText("save-notifications-label", "Guardar avisos");
       updateMutationControls();
     }
   });
@@ -1391,7 +1711,7 @@
     state.mutation = "test-notifications";
     state.statusGeneration += 1;
     updateMutationControls();
-    setText("test-notifications", "Enviando prueba…");
+    setText("test-notifications-label", "Enviando prueba…");
     try {
       const result = await post("/api/notifications/test", {});
       applyStatus(result);
@@ -1413,8 +1733,20 @@
   });
   $("policy-form").addEventListener("submit", async (event) => {
     event.preventDefault();
-    if (!state.serviceAvailable || state.mutation) return;
+    if (!state.serviceAvailable || state.mutation || upsPhysicalTestActive()) return;
     if (!$("policy-form").reportValidity()) return;
+    const countdownSeconds = Number($("policy-countdown").value);
+    if (!Number.isInteger(countdownSeconds) || countdownSeconds < 10 || countdownSeconds > 120) {
+      setText("settings-feedback", "El tiempo para cancelar debe ser un entero de 10 a 120 segundos.");
+      $("settings-feedback").classList.add("error");
+      return;
+    }
+    const upsDelayMinutes = Number($("policy-ups-delay").value);
+    if (!Number.isInteger(upsDelayMinutes) || upsDelayMinutes < 1 || upsDelayMinutes > 9) {
+      setText("settings-feedback", "El retardo del UPS debe ser un entero de 1 a 9 minutos.");
+      $("settings-feedback").classList.add("error");
+      return;
+    }
     const button = $("save-policy");
     state.mutation = "save";
     state.statusGeneration += 1;
@@ -1425,8 +1757,10 @@
       on_battery_seconds: Math.round(Number($("policy-on-battery").value) * 60),
       low_battery_percent: state.status?.meta?.source === "native" ? state.status.policy.low_battery_percent : Number($("policy-low-battery").value),
       min_runtime_seconds: state.status?.meta?.source === "native" ? state.status.policy.min_runtime_seconds : Number($("policy-runtime").value),
-      countdown_seconds: Number($("policy-countdown").value),
+      countdown_seconds: countdownSeconds,
       action: $("policy-action").value,
+      ups_poweroff: $("policy-ups-poweroff").checked,
+      ups_poweroff_delay_seconds: upsDelayMinutes * 60,
     };
     try {
       const result = await post("/api/policy", policy);
@@ -1436,7 +1770,10 @@
       renderPolicy(result.policy);
       setText("settings-feedback", "Configuración guardada");
       $("settings-feedback").classList.remove("error");
-      toast(policy.enabled ? "Protección automática activada en esta PC." : "Configuración guardada. La protección está desactivada.");
+      toast(policy.enabled ? result.meta?.dry_run
+        ? "Regla guardada en modo de prueba. El apagado y la hibernación siguen bloqueados."
+        : "Protección automática activada en esta PC."
+        : "Configuración guardada. La protección está desactivada.", false, policy.enabled && result.meta?.dry_run === true);
     } catch (error) {
       if (error.communicationFailure) serviceUnavailable(error);
       setText("settings-feedback", "Guardado sin confirmar");
@@ -1449,23 +1786,51 @@
     }
   });
   $("test-shutdown").addEventListener("click", async () => {
-    if (!state.serviceAvailable || state.mutation || state.status?.policy?.enabled) return;
+    if (!state.serviceAvailable || state.mutation || state.status?.policy?.enabled || state.policyDirty || powerTransition() || upsPhysicalTestActive()) return;
     state.mutation = "test";
     state.statusGeneration += 1;
     updateMutationControls();
     try {
-      const result = await post("/api/protection/test", {});
+      const includeUps = simulationIncludesUps();
+      const result = await post("/api/protection/test", { include_ups: includeUps });
       applyStatus(result);
       if (!result.protection?.simulation || result.protection.state !== "countdown") throw new Error("El monitor no confirmó el inicio de la prueba.");
-      toast("Prueba iniciada. Windows no se apagará ni hibernará.");
+      toast(includeUps ? "Simulación iniciada. Windows y UPS no ejecutarán acciones reales." : "Simulación de Windows iniciada. El apagado adicional del UPS está desactivado o no disponible.");
       $("protection-alert").scrollIntoView({ behavior: window.matchMedia("(prefers-reduced-motion: reduce)").matches ? "instant" : "smooth", block: "center" });
     } catch (error) {
       if (error.communicationFailure) serviceUnavailable(error);
       toast(error.message, true);
     } finally { state.mutation = null; updateMutationControls(); }
   });
+  $("ups-power-review-ack").addEventListener("change", updateMutationControls);
+  $("ups-power-review-submit").addEventListener("click", async () => {
+    if (!upsPowerCanReview() || !$("ups-power-review-ack").checked) return;
+    const operationId = state.status.ups_poweroff.operation.operation_id;
+    state.mutation = "ups-power-review";
+    state.upsPowerReviewNeedsStatus = true;
+    state.statusGeneration += 1;
+    $("ups-power-review-feedback").hidden = true;
+    updateMutationControls();
+    try {
+      const result = await post("/api/ups/poweroff/review", { operation_id: operationId, acknowledge_review: true });
+      applyStatus(result);
+      if (result.ups_poweroff?.operation?.state !== "completed") throw new Error("El monitor no confirmó el cierre de la revisión.");
+      toast("Revisión cerrada; próxima protección preparada. El corte anterior no se confirma automáticamente.", false, true);
+    } catch (error) {
+      state.upsPowerReviewNeedsStatus = true;
+      if (error.communicationFailure) serviceUnavailable(error);
+      setText("ups-power-review-feedback", `Cierre de revisión sin confirmar. ${error.message} No se ha confirmado automáticamente el corte anterior. Esta acción solo actualiza el registro.`);
+      $("ups-power-review-feedback").hidden = false;
+      toast("No se confirmó el cierre de la revisión del UPS. El corte anterior sigue sin confirmación física automática.", true);
+    } finally {
+      state.mutation = null;
+      renderUpsPoweroff();
+      updateMutationControls();
+    }
+  });
   async function cancelProtection() {
-    if (!state.serviceAvailable || state.mutation) return;
+    if (!state.serviceAvailable || state.mutation || state.status?.protection?.state !== "countdown"
+        || state.status?.protection?.cancelable === false || simulationPhase() === "ups_delay") return;
     state.mutation = "cancel";
     state.statusGeneration += 1;
     updateMutationControls();
@@ -1475,6 +1840,7 @@
       const result = await post("/api/protection/cancel", {});
       applyStatus(result);
       if (["countdown", "executed"].includes(result.protection.state)) throw new Error("El monitor aún reporta una cuenta atrás o una acción enviada a Windows.");
+      if (state.criticalOpen && !state.criticalItems.size) acknowledgeCritical();
       toast(simulation ? "El monitor confirmó la cancelación de la prueba." : result.protection.state === "cancelled" ? "Cuenta atrás cancelada. La protección volverá a evaluarse en el próximo corte." : "El monitor confirma que no hay una cuenta atrás activa.");
       if (state.criticalOpen) {
         setText("critical-feedback", "El monitor confirmó que no hay una cuenta atrás activa.");
@@ -1489,7 +1855,13 @@
       }
     } finally { state.mutation = null; updateMutationControls(); }
   }
-  $("cancel-shutdown").addEventListener("click", cancelProtection);
+  $("open-protection-countdown").addEventListener("click", (event) => {
+    event.preventDefault();
+    if (state.stopAcknowledged || state.status?.protection?.state !== "countdown") return;
+    state.criticalCountdownAcknowledged = null;
+    activateView("protection", { writeHash: true });
+    refreshTelemetry();
+  });
   $("critical-cancel").addEventListener("click", cancelProtection);
   $("critical-ack").addEventListener("click", () => acknowledgeCritical());
   $("critical-dialog").addEventListener("cancel", (event) => { event.preventDefault(); acknowledgeCritical(); });
@@ -1505,30 +1877,23 @@
     }
   });
 
-  $("refresh-records").addEventListener("click", refreshRecords);
-  if (document.querySelectorAll("[data-page]").length) {
-    $("refresh-incidents")?.addEventListener("click", refreshIncidents);
-    $("incidents-form")?.addEventListener("submit", (event) => { event.preventDefault(); return refreshIncidents(); });
-    $("clear-incidents")?.addEventListener("click", () => {
-      $("incidents-from").value = "";
-      $("incidents-to").value = "";
-      if (state.incidentsLoaded) return refreshIncidents();
-      setText("incidents-feedback", "Fechas vacías: la consulta incluirá todos los incidentes conservados.");
+  for (const [key] of incidentColumns) {
+    $(`incident-sort-${key}`).addEventListener("click", () => {
+      if (!state.serviceAvailable) return;
+      state.incidentDirection = state.incidentSort === key && state.incidentDirection === "asc" ? "desc" : "asc";
+      state.incidentSort = key;
+      updateIncidentSortHeaders();
+      state.incidentVersion += 1;
+
+      return loadIncidents();
     });
   }
-  $("run-validation").addEventListener("click", runValidation);
-  $("review-physical-tests").addEventListener("click", reviewPhysicalTests);
-  $("refresh-stability").addEventListener("click", loadObservation);
-  $("start-stability").addEventListener("click", () => changeObservation(true));
-  $("stop-stability").addEventListener("click", () => changeObservation(false));
-  $("download-stability").addEventListener("click", () => downloadFile("/api/stability/report", "elipro-observacion.json", "stability-summary"));
   $("records-form").addEventListener("submit", (event) => { event.preventDefault(); return refreshRecords(); });
-  $("event-search-form").addEventListener("submit", (event) => { event.preventDefault(); return refreshRecords(); });
+  $("event-search-form").addEventListener("submit", (event) => { event.preventDefault(); return searchArchive(); });
   $("clear-records").addEventListener("click", () => {
     $("records-from").value = "";
     $("records-to").value = "";
-    if (state.navigationReady ? state.archiveLoaded : state.recordsLoaded) return refreshRecords();
-    setText("records-feedback", "Fechas vacías: la consulta incluirá todo el historial conservado.");
+    return refreshRecords();
   });
   $("more-incidents").addEventListener("click", () => loadIncidents(true));
   $("more-events").addEventListener("click", () => loadArchive(true));
@@ -1536,11 +1901,10 @@
     try { return downloadFile(`/api/events/export.csv?${recordFilters(true)}`, "elipro-eventos.csv", "archive-summary"); }
     catch (error) { sectionError("archive-error", error); }
   });
-  $("download-diagnostics").addEventListener("click", () => downloadFile("/api/diagnostics", "elipro-diagnostico.json", "maintenance-feedback"));
-  $("download-backup").addEventListener("click", () => downloadFile("/api/backup.zip", "elipro-respaldo.zip", "maintenance-feedback"));
-  $("stop-monitor").addEventListener("click", () => { $("stop-confirmation").hidden = false; });
+  $("stop-monitor").addEventListener("click", () => { if (!upsPhysicalTestActive()) $("stop-confirmation").hidden = false; });
   $("cancel-stop-monitor").addEventListener("click", () => { $("stop-confirmation").hidden = true; });
   $("confirm-stop-monitor").addEventListener("click", async () => {
+    if (upsPhysicalTestActive()) return;
     if (!state.serviceAvailable || state.mutation) return;
     state.mutation = "stop";
     state.statusGeneration += 1;
@@ -1570,13 +1934,13 @@
   });
   $("history-period").value = String(state.hours);
   setupNavigation();
+  renderRecordDates();
   updateMutationControls();
   renderChart();
   loadStatus();
   loadHistory();
   setInterval(loadStatus, 2000);
   setInterval(loadHistory, 30000);
-  setInterval(() => { if (state.observationLoaded) loadObservation(); }, 60000);
   setInterval(() => { if (state.status) refreshTelemetry(); updateCountdown(); }, 1000);
   window.addEventListener?.("focus", () => { if (state.status) refreshTelemetry(); });
   document.addEventListener?.("visibilitychange", () => { if (state.status) refreshTelemetry(); });

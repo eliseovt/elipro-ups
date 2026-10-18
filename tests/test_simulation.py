@@ -3,6 +3,7 @@ from datetime import datetime, timedelta, timezone
 import io
 from pathlib import Path
 import tempfile
+import time
 from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
@@ -10,6 +11,7 @@ from unittest.mock import Mock, patch
 from ups_monitor.adapters import SimulationAdapter
 from ups_monitor.core import DEFAULT_POLICY, Store
 from ups_monitor.native_adapter import make_adapter
+from ups_monitor.persistence import HistoryUnavailable
 from ups_monitor.server import Monitor
 from ups_monitor import server, windows_service as service
 from tests.test_windows_service import FakeHostAPI
@@ -137,7 +139,17 @@ class SimulationServiceTests(unittest.TestCase):
                     for moment in (100, 106, 112, 123, 130):
                         clock.return_value = moment
                         monitor.tick()
-                    monitor.set_policy({"enabled": False})
+                    # The real persistence worker may own its nonblocking I/O
+                    # lock while this deliberately accelerated cycle ends.
+                    deadline = time.monotonic() + 2
+                    while True:
+                        try:
+                            monitor.set_policy({"enabled": False})
+                            break
+                        except HistoryUnavailable:
+                            if time.monotonic() >= deadline:
+                                raise
+                            time.sleep(0.01)
                     results["events"] = {item["kind"] for item in monitor.store.events()}
                     results["source"] = monitor.snapshot()["meta"]["source"]
 

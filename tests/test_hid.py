@@ -5,9 +5,12 @@ import subprocess
 import unittest
 from unittest.mock import Mock, patch
 
-from ups_monitor.hid_windows import HIDD_ATTRIBUTES, HIDP_CAPS, StatusTransport, _cooldown_until, _active_workers, _query_status_once, _query_battery_diagnostic_once, _read_report, _run_bounded_worker, battery_worker_main, enumerate_ups_bounded
+from ups_monitor.hid_windows import HIDD_ATTRIBUTES, HIDP_CAPS, StatusTransport, ControlTransport, _cooldown_until, _active_workers, _query_status_once, _query_battery_diagnostic_once, _read_report, _run_bounded_worker, _write_control_once, battery_worker_main, control_worker_main, enumerate_ups_bounded
+from ups_monitor.ups_power import NT2402PRO_CANDIDATE_PROFILE, UpsPowerBlocked, device_fingerprint
 
 PATH = r"\\?\hid#vid_0665&pid_5161#unit#{4d1e55b2-f16f-11cf-88cb-001111000030}"
+CONTROL_JOURNAL = r"D:\fake-tests\ups-power-operation.json"
+CONTROL_OPERATION = "f31182c0-4464-41c2-9c7d-53a89a75f236"
 
 
 class HidTests(unittest.TestCase):
@@ -234,6 +237,152 @@ class HidTests(unittest.TestCase):
             run.return_value.stdout = b" " * 65537
             with self.assertRaises(OSError):
                 enumerate_ups_bounded()
+
+    def control_fixture(self, *, revision=3):
+        device = {**NT2402PRO_CANDIDATE_PROFILE, "path": PATH}
+        profile = {**NT2402PRO_CANDIDATE_PROFILE, "device_fingerprint": device_fingerprint(device),
+                   "manual_restart_verified": True, "cancel_verified": True,
+                   "low_battery_cutoff_behavior": "immediate",
+                   "action_validation": {"shutdown": {"completion_seconds": [30, 40, 50], "reserve_seconds": 600}}}
+        apis = self.fake_apis()
+        original_attributes = apis[1].HidD_GetAttributes.side_effect
+        def attributes(handle, pointer):
+            original_attributes(handle, pointer)
+            ctypes.cast(pointer, ctypes.POINTER(HIDD_ATTRIBUTES)).contents.VersionNumber = revision
+            return True
+        apis[1].HidD_GetAttributes.side_effect = attributes
+        return profile, apis
+
+    def test_production_control_gate_blocks_worker_and_direct_transport_before_hid(self):
+        profile, _ = self.control_fixture()
+        with patch("ups_monitor.hid_windows._apis") as apis, \
+             patch("ups_monitor.hid_windows._run_bounded_worker") as run, patch("sys.stderr"):
+            with self.assertRaises(UpsPowerBlocked):
+                ControlTransport(PATH, profile["profile_id"])
+            for argv in ([PATH, profile["profile_id"], "shutdown", "180", CONTROL_JOURNAL, CONTROL_OPERATION],
+                         [PATH, profile["profile_id"], "cancel", CONTROL_JOURNAL, CONTROL_OPERATION]):
+                self.assertEqual(control_worker_main(argv), 1)
+            run.assert_not_called()
+            apis.assert_not_called()
+
+    def test_control_writes_all_reports_under_one_mutex_and_never_fakes_a_reply(self):
+        profile, apis = self.control_fixture()
+        with patch("ups_monitor.hid_windows._apis", return_value=apis), \
+             patch("ups_monitor.hid_windows._read_report") as read:
+            result = _write_control_once(PATH, b"S03R0000\r", profile)
+        self.assertEqual(result, {"state": "submitted", "confirmation": "unconfirmed", "reports_written": 2})
+        reports = [bytes(call.args[1]) for call in apis[1].HidD_SetOutputReport.call_args_list]
+        self.assertEqual(reports, [b"\x00S03R0000", b"\x00\r\x00\x00\x00\x00\x00\x00\x00"])
+        apis[2].CreateMutexW.assert_called_once()
+        apis[2].ReleaseMutex.assert_called_once_with(30)
+        self.assertEqual(apis[2].CloseHandle.call_count, 2)
+        apis[2].ReadFile.assert_not_called()
+        read.assert_not_called()
+
+    def test_control_revision_mismatch_rejects_before_any_output(self):
+        profile, apis = self.control_fixture(revision=4)
+        with patch("ups_monitor.hid_windows._apis", return_value=apis):
+            with self.assertRaisesRegex(OSError, "identidad"):
+                _write_control_once(PATH, b"S03R0000\r", profile)
+        apis[1].HidD_SetOutputReport.assert_not_called()
+        apis[2].ReleaseMutex.assert_called_once()
+
+    def test_control_invalid_bytes_never_open_hid_and_status_allowlist_is_unchanged(self):
+        profile, _ = self.control_fixture()
+        with patch("ups_monitor.hid_windows._apis") as apis, patch("ups_monitor.hid_windows._run_bounded_worker") as run:
+            for command in (b"S03R0001\r", b"S00R0000\r", b"C\rQS\r", b"QS\r"):
+                with self.assertRaises(ValueError):
+                    _write_control_once(PATH, command, profile)
+            for command in (b"S03R0000\r", b"C\r"):
+                with self.assertRaises(ValueError):
+                    StatusTransport(PATH).query_status(command)
+            apis.assert_not_called()
+            run.assert_not_called()
+
+    def test_control_partial_write_or_deadline_never_retries_and_releases_mutex(self):
+        profile, apis = self.control_fixture()
+        apis[1].HidD_SetOutputReport.side_effect = [True, False]
+        with patch("ups_monitor.hid_windows._apis", return_value=apis):
+            with self.assertRaisesRegex(OSError, "no se repetirá"):
+                _write_control_once(PATH, b"S03R0000\r", profile)
+        self.assertEqual(apis[1].HidD_SetOutputReport.call_count, 2)
+        apis[2].ReleaseMutex.assert_called_once()
+        profile, apis = self.control_fixture()
+        with patch("ups_monitor.hid_windows._apis", return_value=apis), \
+             patch("ups_monitor.hid_windows.time.monotonic", side_effect=[100, 100, 103]):
+            with self.assertRaises(TimeoutError):
+                _write_control_once(PATH, b"S03R0000\r", profile)
+        apis[1].HidD_SetOutputReport.assert_called_once()
+        apis[2].ReleaseMutex.assert_called_once()
+
+    def test_control_worker_cannot_select_unvalidated_delays_or_arbitrary_roles(self):
+        profile, _ = self.control_fixture()
+        registry = {profile["profile_id"]: profile}
+        with patch("ups_monitor.ups_power.VALIDATED_PROFILES", registry), \
+             patch("ups_monitor.windows_service.control_worker_authorized", return_value=True, create=True), \
+             patch("ups_monitor.hid_windows._require_operation_not_interrupted", return_value=True), \
+             patch("ups_monitor.hid_windows._production_control_operation", return_value={"action": "shutdown", "delay_seconds": 180}), \
+             patch("ups_monitor.hid_windows._apis") as apis, patch("sys.stderr"):
+            for argv in ([PATH, profile["profile_id"], "shutdown", "60", CONTROL_JOURNAL, CONTROL_OPERATION],
+                         [PATH, profile["profile_id"], "shutdown", "S03R0000\r", CONTROL_JOURNAL, CONTROL_OPERATION]):
+                self.assertEqual(control_worker_main(argv), 1)
+            for argv in ([], [PATH], [PATH, profile["profile_id"], "QS"],
+                         [PATH, profile["profile_id"], "cancel", "extra", CONTROL_JOURNAL, CONTROL_OPERATION]):
+                with self.assertRaises(SystemExit):
+                    control_worker_main(argv)
+            apis.assert_not_called()
+
+    def test_control_transport_has_separate_worker_role_and_shares_failed_worker_cooldown(self):
+        profile, _ = self.control_fixture()
+        with patch("ups_monitor.ups_power.VALIDATED_PROFILES", {profile["profile_id"]: profile}), \
+             patch("ups_monitor.windows_service.control_worker_authorized", return_value=True, create=True), \
+             patch("ups_monitor.hid_windows._OperationInterruption"), \
+             patch("ups_monitor.hid_windows._require_operation_not_interrupted", return_value=True), \
+             patch("ups_monitor.hid_windows._production_control_operation", return_value={"action": "shutdown", "delay_seconds": 180}), \
+             patch("ups_monitor.hid_windows._run_bounded_worker") as run:
+            transport = ControlTransport(PATH, profile["profile_id"], journal_path=CONTROL_JOURNAL, operation_id=CONTROL_OPERATION)
+            run.return_value = Mock(returncode=0, stdout=b'{"state":"submitted","confirmation":"unconfirmed","reports_written":2}')
+            self.assertEqual(transport.submit_shutdown(180)["confirmation"], "unconfirmed")
+            self.assertEqual(run.call_args.args[0][-7:], ["--control-worker", PATH, profile["profile_id"], "shutdown", "180", CONTROL_JOURNAL, CONTROL_OPERATION])
+            self.assertEqual(run.call_args.args[1], PATH.casefold())
+            run.side_effect = TimeoutError("uncertain child")
+            with self.assertRaises(TimeoutError):
+                transport.submit_shutdown(180)
+            calls = run.call_count
+            with self.assertRaises(TimeoutError):
+                StatusTransport(PATH).query_status()
+            self.assertEqual(run.call_count, calls)
+
+    def test_validated_profile_does_not_bypass_current_service_authorization(self):
+        profile, _ = self.control_fixture()
+        with patch("ups_monitor.ups_power.VALIDATED_PROFILES", {profile["profile_id"]: profile}), \
+             patch("ups_monitor.windows_service.control_worker_authorized", return_value=False, create=True), \
+             patch("ups_monitor.hid_windows._write_control_once") as write, \
+             patch("ups_monitor.hid_windows._run_bounded_worker") as run, patch("sys.stderr"):
+            with self.assertRaises(UpsPowerBlocked):
+                ControlTransport(PATH, profile["profile_id"])
+            self.assertEqual(control_worker_main([PATH, profile["profile_id"], "shutdown", "180", CONTROL_JOURNAL, CONTROL_OPERATION]), 1)
+            self.assertEqual(control_worker_main([PATH, profile["profile_id"], "cancel", CONTROL_JOURNAL, CONTROL_OPERATION]), 1)
+            write.assert_not_called()
+            run.assert_not_called()
+
+    def test_control_transport_rechecks_service_authorization_before_each_submission(self):
+        profile, _ = self.control_fixture()
+        with patch("ups_monitor.ups_power.VALIDATED_PROFILES", {profile["profile_id"]: profile}), \
+             patch("ups_monitor.windows_service.control_worker_authorized", return_value=True, create=True) as authorization, \
+             patch("ups_monitor.hid_windows._OperationInterruption"), \
+             patch("ups_monitor.hid_windows._require_operation_not_interrupted", return_value=True), \
+             patch("ups_monitor.hid_windows._production_control_operation", return_value={}), \
+             patch("ups_monitor.hid_windows._run_bounded_worker") as run:
+            transport = ControlTransport(PATH, profile["profile_id"], journal_path=CONTROL_JOURNAL, operation_id=CONTROL_OPERATION)
+            authorization.return_value = False
+            for operation in (lambda: transport.submit_shutdown(180), transport.cancel_shutdown):
+                with self.assertRaises(UpsPowerBlocked):
+                    operation()
+            authorization.side_effect = OSError("SCM unavailable")
+            with self.assertRaises(UpsPowerBlocked):
+                transport.cancel_shutdown()
+            run.assert_not_called()
 
 
 if __name__ == "__main__":

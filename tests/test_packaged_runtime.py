@@ -26,6 +26,14 @@ class PackagedRuntimeTests(unittest.TestCase):
                              [sys.executable, "-m", "ups_monitor.hid_windows", "--battery-worker", HID_PATH, "BL"])
             self.assertEqual(runtime.child_command("battery-diagnostic", "--help"),
                              [sys.executable, "-m", "ups_monitor.battery_diagnostics", "--help"])
+            self.assertEqual(runtime.child_command("cancel-test-worker", "fixed"),
+                             [sys.executable, "-m", "ups_monitor.hid_windows", "--cancel-test-worker", "fixed"])
+            self.assertEqual(runtime.child_command("authorize-ups-cancel-test", "--help"),
+                             [sys.executable, "-m", "ups_monitor.ups_test_authorization", "--help"])
+            self.assertEqual(runtime.child_command("battery-test-worker", "fixed"),
+                             [sys.executable, "-m", "ups_monitor.hid_windows", "--battery-test-worker", "fixed"])
+            self.assertEqual(runtime.child_command("authorize-ups-battery-test", "--help"),
+                             [sys.executable, "-m", "ups_monitor.ups_test_authorization", "--battery-test", "--help"])
 
     def test_frozen_commands_cannot_recurse_through_python_m(self):
         with patch.object(sys, "frozen", True, create=True), patch.object(sys, "executable", r"C:\Apps\Elipro.exe"):
@@ -37,6 +45,14 @@ class PackagedRuntimeTests(unittest.TestCase):
                              [r"C:\Apps\Elipro.exe", "battery-worker", HID_PATH, "BT"])
             self.assertEqual(runtime.child_command("battery-diagnostic", "--help"),
                              [r"C:\Apps\Elipro.exe", "battery-diagnostic", "--help"])
+            self.assertEqual(runtime.child_command("cancel-test-worker", "fixed"),
+                             [r"C:\Apps\Elipro.exe", "cancel-test-worker", "fixed"])
+            self.assertEqual(runtime.child_command("authorize-ups-cancel-test", "--help"),
+                             [r"C:\Apps\Elipro.exe", "authorize-ups-cancel-test", "--help"])
+            self.assertEqual(runtime.child_command("battery-test-worker", "fixed"),
+                             [r"C:\Apps\Elipro.exe", "battery-test-worker", "fixed"])
+            self.assertEqual(runtime.child_command("authorize-ups-battery-test", "--help"),
+                             [r"C:\Apps\Elipro.exe", "authorize-ups-battery-test", "--help"])
             with self.assertRaises(ValueError):
                 runtime.child_command("arbitrary.module")
 

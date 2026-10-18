@@ -31,7 +31,7 @@ class WaitingChild:
 class GuardianIntegrationTests(unittest.TestCase):
     def options(self):
         return guardian.parse_args(["--port", "8765", "--source", "native", "--dry-run",
-                                    "--observe-hours", "24", "--data-dir",
+                                    "--data-dir",
                                     str(Path(__file__).resolve().parents[1] / ".test-data" / "guardian child with spaces")])
 
     def supervisor(self, status, *, stop_sender=None):
@@ -60,14 +60,12 @@ class GuardianIntegrationTests(unittest.TestCase):
         parsed, actual_ownership = owned_runner.call_args.args
         self.assertTrue(parsed.dry_run)
         self.assertEqual(parsed.source, "native")
-        self.assertEqual(parsed.observe_hours, 24)
         self.assertEqual(parsed.data_dir, options.data_dir)
         self.assertIs(actual_ownership, ownership)
         ownership.acquire.assert_called_once_with()
 
     def test_guardian_argument_errors_reject_remote_urls_credentials_and_unknown_power_flags(self):
-        invalid = (["--port", "0"], ["--port", "65536"], ["--observe-hours", "nan"],
-                   ["--observe-hours", "169"], ["--source", "unknown"], ["--shutdown"],
+        invalid = (["--port", "0"], ["--port", "65536"], ["--source", "unknown"], ["--shutdown"],
                    ["--forza-url", "https://127.0.0.1:15179/Forza"],
                    ["--forza-url", "http://evil.example/Forza"],
                    ["--forza-url", "http://user:password@localhost:15179/Forza"],

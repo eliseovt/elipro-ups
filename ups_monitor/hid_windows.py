@@ -19,10 +19,12 @@ import hashlib
 import json
 import os
 import math
+from pathlib import Path
 import subprocess
 import sys
 import time
 import threading
+import uuid
 from ctypes import wintypes
 from .runtime import child_command, resource_root
 
@@ -461,6 +463,487 @@ class StatusTransport:
         return result.stdout
 
 
+def _write_control_once(path, command, profile, *, before_write=None, before_each_report=None):
+    """Control-only worker: hold the existing device mutex across every report.
+
+    The caller has resolved an approved profile. No response is invented: these
+    controls may act silently, and neither an empty read nor a timeout is ACK.
+    """
+    from .ups_power import validated_control_profile
+    profile = validated_control_profile(profile.get("profile_id"), {profile.get("profile_id"): profile})
+    return _write_control_reports_once(path, command, profile, before_write=before_write,
+                                       before_each_report=before_each_report)
+
+
+def _write_control_reports_once(path, command, profile, *, before_write=None, before_each_report=None):
+    """One guarded transaction after the role-specific authorization gates.
+
+    The normal control role requires physical validation. The separate manual
+    cancellation-test role requires a unit-bound administrative authorization
+    and a durable operation journal. Neither path retries a failed report.
+    """
+    from .ups_power import control_reports, profile_matches_device
+    reports = control_reports(command)
+    _validate_path(path)
+    if before_write is not None and not callable(before_write):
+        raise ValueError("La comprobación previa del control debe ser una función interna.")
+    if before_each_report is not None and not callable(before_each_report):
+        raise ValueError("La continuidad de control debe comprobarse mediante una función interna.")
+    _, hid, kernel = _apis()
+    deadline = time.monotonic() + 2.5
+    mutex_name = "Global\\EliproUPS_QS_" + hashlib.sha256(path.casefold().encode("utf-8")).hexdigest()
+    mutex = kernel.CreateMutexW(None, False, mutex_name)
+    if not mutex:
+        raise ctypes.WinError(ctypes.get_last_error())
+    acquired, handle = False, None
+    try:
+        wait = kernel.WaitForSingleObject(mutex, 500)
+        if wait not in (0, 128):
+            raise TimeoutError("Otro lector USB está usando este UPS; no se envió control.")
+        acquired = True
+        if wait == 128:
+            raise OSError("Transacción USB anterior incierta; no se envió control.")
+        handle = kernel.CreateFileW(path, 0xC0000000, 3, None, 3, 0, None)
+        if handle == ctypes.c_void_p(-1).value:
+            handle = None
+            raise ctypes.WinError(ctypes.get_last_error())
+        attributes = HIDD_ATTRIBUTES()
+        attributes.Size = ctypes.sizeof(attributes)
+        if not hid.HidD_GetAttributes(handle, ctypes.byref(attributes)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        preparsed = ctypes.c_void_p()
+        if not hid.HidD_GetPreparsedData(handle, ctypes.byref(preparsed)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        try:
+            caps = HIDP_CAPS()
+            status = hid.HidP_GetCaps(preparsed, ctypes.byref(caps))
+            if status != 0x00110000:
+                raise OSError("No se verificó el descriptor del UPS; no se envió control.")
+            device = {"path": path, "vendor_id": attributes.VendorID, "product_id": attributes.ProductID,
+                      "version_number": attributes.VersionNumber, "input_report_bytes": caps.InputReportByteLength,
+                      "output_report_bytes": caps.OutputReportByteLength, "feature_report_bytes": caps.FeatureReportByteLength}
+            if not profile_matches_device(profile, device):
+                raise OSError("La identidad física del UPS cambió; no se envió control.")
+        finally:
+            hid.HidD_FreePreparsedData(preparsed)
+        if not hid.HidD_FlushQueue(handle):
+            raise ctypes.WinError(ctypes.get_last_error())
+        if before_write is not None:
+            # The caller's final evidence check remains inside the same named
+            # mutex. A direct QS query can reacquire this Windows mutex on the
+            # same thread; releasing that nested acquisition leaves ours held.
+            before_write()
+        for report in reports:
+            if before_each_report is not None:
+                before_each_report()
+            if time.monotonic() >= deadline:
+                raise TimeoutError("Plazo de control USB agotado; no se repetirá la transacción.")
+            output = ctypes.create_string_buffer(report, 9)
+            if not hid.HidD_SetOutputReport(handle, output, 9):
+                raise OSError("No se confirmó el envío completo al UPS; no se repetirá la transacción.")
+        return {"state": "submitted", "confirmation": "unconfirmed", "reports_written": len(reports)}
+    finally:
+        if handle:
+            kernel.CloseHandle(handle)
+        if acquired:
+            kernel.ReleaseMutex(mutex)
+        kernel.CloseHandle(mutex)
+
+
+def _require_control_service_authorization():
+    from .ups_power import UpsPowerBlocked
+    try:
+        from .windows_service import control_worker_authorized
+        authorized = control_worker_authorized()
+    except Exception:
+        authorized = False
+    if authorized is not True:
+        raise UpsPowerBlocked("El servicio actual no tiene autorización administrativa para enviar controles al UPS.")
+
+
+def _operation_event_name(operation_id):
+    try:
+        return "Global\\EliproUPS_Control_" + uuid.UUID(operation_id).hex
+    except (ValueError, TypeError, AttributeError) as exc:
+        raise ValueError("La continuidad requiere una operación propia identificada.") from exc
+
+
+def _event_api():
+    if os.name != "nt":
+        raise OSError("La continuidad del control requiere Windows.")
+    api = ctypes.WinDLL("kernel32", use_last_error=True)
+    api.CreateEventW.argtypes, api.CreateEventW.restype = [ctypes.c_void_p, wintypes.BOOL, wintypes.BOOL, wintypes.LPCWSTR], wintypes.HANDLE
+    api.OpenEventW.argtypes, api.OpenEventW.restype = [wintypes.DWORD, wintypes.BOOL, wintypes.LPCWSTR], wintypes.HANDLE
+    api.SetEvent.argtypes, api.SetEvent.restype = [wintypes.HANDLE], wintypes.BOOL
+    api.WaitForSingleObject.argtypes, api.WaitForSingleObject.restype = [wintypes.HANDLE, wintypes.DWORD], wintypes.DWORD
+    api.CloseHandle.argtypes, api.CloseHandle.restype = [wintypes.HANDLE], wintypes.BOOL
+    return api
+
+
+class _OperationInterruption:
+    """Parent-owned manual-reset event, never reset or recreated by a worker."""
+
+    def __init__(self, operation_id):
+        self.api = _event_api()
+        ctypes.set_last_error(0)
+        self.handle = self.api.CreateEventW(None, True, False, _operation_event_name(operation_id))
+        if not self.handle:
+            raise OSError("No se pudo proteger la continuidad del control del UPS.")
+        if ctypes.get_last_error() == 183:  # ERROR_ALREADY_EXISTS: never clear an earlier signal.
+            self.close()
+            raise OSError("La operación ya tiene un evento de continuidad; no se repetirá.")
+
+    def signal_interruption(self):
+        # Called from SCM power notification: a single native call, no lock or IO.
+        if self.handle:
+            self.api.SetEvent(self.handle)
+
+    def close(self):
+        handle, self.handle = getattr(self, "handle", None), None
+        if handle:
+            self.api.CloseHandle(handle)
+
+    def __del__(self):
+        self.close()
+
+
+def _require_operation_not_interrupted(operation_id):
+    from .ups_power import UpsPowerBlocked
+    api = _event_api()
+    handle = api.OpenEventW(0x00100000, False, _operation_event_name(operation_id))  # SYNCHRONIZE only
+    if not handle:
+        raise UpsPowerBlocked("No existe el proceso propietario activo de esta operación del UPS.")
+    try:
+        if api.WaitForSingleObject(handle, 0) != 258:  # WAIT_TIMEOUT is the only non-signaled result.
+            raise UpsPowerBlocked("La operación del UPS fue interrumpida; no se enviará control tras reanudar.")
+    finally:
+        api.CloseHandle(handle)
+    return True
+
+
+def _production_control_operation(path, profile, journal_path, operation_id, selector):
+    """Read only the current service's fixed, durable operation before HID."""
+    from .ups_power import OperationJournal, UpsPowerBlocked, profile_matches_device
+    from .ups_test_authorization import _registered_data_dir
+    from . import windows_service
+    _require_control_service_authorization()
+    data_dir = _registered_data_dir()
+    journal = Path(journal_path)
+    if (not journal.is_absolute() or journal.name != "ups-power-operation.json"
+            or journal.resolve().name != "ups-power-operation.json" or journal.resolve().parent != data_dir):
+        raise UpsPowerBlocked("El control requiere el registro propio del servicio actual.")
+    operation = OperationJournal(journal.resolve()).load()
+    expected = "arming" if selector == "shutdown" else "cancelling"
+    status = windows_service.manage("status")
+    if (not isinstance(operation, dict) or operation.get("operation_id") != operation_id or operation.get("state") != expected
+            or operation.get("profile_id") != profile["profile_id"] or operation.get("interrupted") is True
+            or operation.get("device_fingerprint") != profile["device_fingerprint"]
+            or operation.get("worker_claimed_for") == selector
+            or type(operation.get("owner_pid")) is not int or operation["owner_pid"] <= 0
+            or status.get("installed") is not True or status.get("state") != "running" or status.get("pid") != operation["owner_pid"]
+            or not profile_matches_device(profile, {**profile, "path": path})):
+        raise UpsPowerBlocked("El control no pertenece a una operación vigente del servicio actual.")
+    return operation
+
+
+class ControlTransport:
+    """Dedicated, approved-profile controls; ordinary status stays QS-only."""
+
+    def __init__(self, path, profile_id, *, journal_path=None, operation_id=None):
+        from .ups_power import validated_control_profile
+        self.profile = validated_control_profile(profile_id)
+        _require_control_service_authorization()
+        self.path = _validate_path(path)
+        if journal_path is None or operation_id is None:
+            raise ValueError("El control requiere registro durable e identificador de operación propios.")
+        self.journal_path, self.operation_id = os.fspath(journal_path), operation_id
+        self._interruption_event = _OperationInterruption(operation_id)
+
+    def signal_interruption(self):
+        self._interruption_event.signal_interruption()
+
+    def submit_shutdown(self, delay_seconds):
+        from .ups_power import UpsPowerBlocked, configured_delay_seconds, shutdown_command
+        _require_control_service_authorization()
+        operation = _production_control_operation(self.path, self.profile, self.journal_path, self.operation_id, "shutdown")
+        allowed = configured_delay_seconds(self.profile, operation["action"], delay_seconds)
+        if type(delay_seconds) is not int or allowed != operation.get("delay_seconds"):
+            raise UpsPowerBlocked("El retardo no coincide con la operación propia del servicio.")
+        shutdown_command(delay_seconds)
+        return self._submit("shutdown", str(delay_seconds), reports=2)
+
+    def cancel_shutdown(self):
+        return self._submit("cancel", reports=1)
+
+    def _submit(self, selector, *values, reports):
+        from .ups_power import validated_control_profile
+        validated_control_profile(self.profile["profile_id"])
+        _require_control_service_authorization()
+        _require_operation_not_interrupted(self.operation_id)
+        _production_control_operation(self.path, self.profile, self.journal_path, self.operation_id, selector)
+        key = self.path.casefold()
+        with _cooldown_lock:
+            if time.monotonic() < _cooldown_until.get(key, 0):
+                raise TimeoutError("USB en espera de seguridad; no se envió control.")
+        try:
+            result = _run_bounded_worker(child_command("control-worker", self.path,
+                                         self.profile["profile_id"], selector, *values, self.journal_path, self.operation_id), key)
+            if result.returncode or not result.stdout or len(result.stdout) > 2048:
+                raise OSError("Control del UPS sin envío completo confirmado; resultado incierto.")
+            data = json.loads(result.stdout)
+            if (not isinstance(data, dict) or data.get("state") != "submitted"
+                    or data.get("confirmation") != "unconfirmed" or type(data.get("reports_written")) is not int
+                    or data["reports_written"] != reports):
+                raise OSError("El proceso devolvió una confirmación de control no válida.")
+            return data
+        except (OSError, ValueError, TypeError, UnicodeError):
+            with _cooldown_lock:
+                _cooldown_until[key] = time.monotonic() + 5
+            raise
+
+
+def _cancellation_test_profile(path, authorization_path, journal_path, operation_id, selector):
+    """Authorize this explicit test without adding a production profile."""
+    from .ups_power import NT2402PRO_CANDIDATE_PROFILE, UpsPowerBlocked, profile_matches_device
+    from .ups_cancel_test import validate_test_worker_request
+    from .ups_test_authorization import authorize_test_worker
+    _validate_path(path)
+    if selector not in ("start", "cancel"):
+        raise UpsPowerBlocked("Operación de prueba del UPS no admitida.")
+    try:
+        authorized = authorize_test_worker(authorization_path, journal_path)
+    except Exception as exc:
+        raise UpsPowerBlocked("La prueba requiere autorización administrativa del servicio actual.") from exc
+    if authorized is not True:
+        raise UpsPowerBlocked("La prueba requiere autorización administrativa del servicio actual.")
+    profile = validate_test_worker_request(authorization_path, journal_path, operation_id, selector)
+    candidate_device = {**NT2402PRO_CANDIDATE_PROFILE, "path": path}
+    if (not isinstance(profile, dict)
+            or any(profile.get(key) != value for key, value in NT2402PRO_CANDIDATE_PROFILE.items())
+            or not profile_matches_device(profile, candidate_device)):
+        raise UpsPowerBlocked("La autorización de prueba no corresponde a esta unidad USB.")
+    return profile
+
+
+class CancellationTestTransport:
+    """One manual cancellation test; never authorizes automatic UPS cutoff.
+
+    This role has exactly two selectors, a fixed three-minute stay-off request
+    and cancellation of that own journaled request. Parent and isolated worker
+    independently check the authorization and operation before opening USB.
+    """
+
+    def __init__(self, path, authorization_path, journal_path, operation_id):
+        self.path = _validate_path(path)
+        self.authorization_path = os.fspath(authorization_path)
+        self.journal_path = os.fspath(journal_path)
+        self.operation_id = operation_id
+        self._interruption_event = _OperationInterruption(operation_id)
+
+    def signal_interruption(self):
+        self._interruption_event.signal_interruption()
+
+    def submit_test(self):
+        return self._submit("start", reports=2)
+
+    def cancel_test(self):
+        return self._submit("cancel", reports=1)
+
+    def _submit(self, selector, *, reports):
+        _cancellation_test_profile(self.path, self.authorization_path, self.journal_path,
+                                   self.operation_id, selector)
+        _require_operation_not_interrupted(self.operation_id)
+        key = self.path.casefold()
+        with _cooldown_lock:
+            if time.monotonic() < _cooldown_until.get(key, 0):
+                raise TimeoutError("USB en espera de seguridad; no se envió control de prueba.")
+        try:
+            result = _run_bounded_worker(child_command("cancel-test-worker", self.path,
+                        self.authorization_path, self.journal_path, self.operation_id, selector), key)
+            if result.returncode or not result.stdout or len(result.stdout) > 2048:
+                raise OSError("Prueba del UPS sin envío completo confirmado; resultado incierto.")
+            data = json.loads(result.stdout)
+            if (not isinstance(data, dict) or data.get("state") != "submitted"
+                    or data.get("confirmation") != "unconfirmed" or type(data.get("reports_written")) is not int
+                    or data["reports_written"] != reports):
+                raise OSError("El proceso devolvió un resultado de prueba no válido.")
+            return data
+        except (OSError, ValueError, TypeError, UnicodeError):
+            with _cooldown_lock:
+                _cooldown_until[key] = time.monotonic() + 5
+            raise
+
+
+def cancel_test_worker_main(argv):
+    """Fixed manual-test role; both authorization gates precede all HID APIs."""
+    if len(argv) != 5 or argv[4] not in ("start", "cancel"):
+        raise SystemExit("Uso interno: prueba manual aislada de cancelación del UPS.")
+    try:
+        path, authorization_path, journal_path, operation_id, selector = argv
+        profile = _cancellation_test_profile(path, authorization_path, journal_path, operation_id, selector)
+        _require_operation_not_interrupted(operation_id)
+        command = b"S03R0000\r" if selector == "start" else b"C\r"
+        if selector == "cancel":
+            from .qs_protocol import parse_qs
+            from .ups_cancel_test import validate_cancel_test_preflight
+
+            def before_cancel():
+                # Intra-worker only: no subprocess and no StatusTransport, so
+                # the outer control mutex stays owned throughout QS and C.
+                _require_operation_not_interrupted(operation_id)
+                sample = parse_qs(_query_status_once(path))
+                _require_operation_not_interrupted(operation_id)
+                validate_cancel_test_preflight(authorization_path, journal_path, operation_id, sample=sample)
+
+            result = _write_control_reports_once(path, command, profile, before_write=before_cancel,
+                                                 before_each_report=lambda: _require_operation_not_interrupted(operation_id))
+        else:
+            result = _write_control_reports_once(path, command, profile,
+                                                 before_each_report=lambda: _require_operation_not_interrupted(operation_id))
+        sys.stdout.buffer.write(json.dumps(result, allow_nan=False).encode("utf-8"))
+        return 0
+    except Exception:
+        # Never expose local file paths or journal details through the worker.
+        print("Prueba manual del UPS bloqueada o resultado de envío incierto.", file=sys.stderr)
+        return 1
+
+
+def _battery_test_profile(path, authorization_path, journal_path, operation_id, selector):
+    from .ups_power import NT2402PRO_CANDIDATE_PROFILE, UpsPowerBlocked, profile_matches_device
+    from .ups_battery_test import validate_battery_test_worker_request
+    from .ups_test_authorization import authorize_battery_test_worker
+    _validate_path(path)
+    if selector not in ("start", "cancel"):
+        raise UpsPowerBlocked("Operación de prueba en batería no admitida.")
+    if authorize_battery_test_worker(authorization_path, journal_path) is not True:
+        raise UpsPowerBlocked("La prueba en batería requiere autorización administrativa propia.")
+    profile = validate_battery_test_worker_request(authorization_path, journal_path, operation_id, selector)
+    if (not isinstance(profile, dict)
+            or any(profile.get(key) != value for key, value in NT2402PRO_CANDIDATE_PROFILE.items())
+            or not profile_matches_device(profile, {**NT2402PRO_CANDIDATE_PROFILE, "path": path})):
+        raise UpsPowerBlocked("La autorización de prueba no corresponde a esta unidad USB.")
+    return profile
+
+
+class BatteryTestTransport(CancellationTestTransport):
+    """Distinct temporary permission and fixed commands for the battery test."""
+
+    def cancel_after_windows_failure(self):
+        return self._submit("cancel", reports=1)
+
+    def cancel_test(self):
+        raise ValueError("La prueba en batería no admite cancelación manual del UPS.")
+
+    def _submit(self, selector, *, reports):
+        _battery_test_profile(self.path, self.authorization_path, self.journal_path, self.operation_id, selector)
+        _require_operation_not_interrupted(self.operation_id)
+        key = self.path.casefold()
+        with _cooldown_lock:
+            if time.monotonic() < _cooldown_until.get(key, 0):
+                raise TimeoutError("USB en espera de seguridad; no se envió control de prueba en batería.")
+        try:
+            result = _run_bounded_worker(child_command("battery-test-worker", self.path,
+                self.authorization_path, self.journal_path, self.operation_id, selector), key)
+            if result.returncode or not result.stdout or len(result.stdout) > 2048:
+                raise OSError("Prueba en batería sin envío completo confirmado; resultado incierto.")
+            data = json.loads(result.stdout)
+            if (not isinstance(data, dict) or data.get("state") != "submitted"
+                    or data.get("confirmation") != "unconfirmed" or type(data.get("reports_written")) is not int
+                    or data["reports_written"] != reports):
+                raise OSError("El proceso devolvió un resultado de prueba en batería no válido.")
+            return data
+        except (OSError, ValueError, TypeError, UnicodeError):
+            with _cooldown_lock:
+                _cooldown_until[key] = time.monotonic() + 5
+            raise
+
+
+def battery_test_worker_main(argv):
+    if len(argv) != 5 or argv[4] not in ("start", "cancel"):
+        raise SystemExit("Uso interno: prueba manual aislada del UPS en batería.")
+    try:
+        from .qs_protocol import parse_qs
+        from .ups_battery_test import validate_battery_test_preflight
+        path, authorization_path, journal_path, operation_id, selector = argv
+        profile = _battery_test_profile(path, authorization_path, journal_path, operation_id, selector)
+        _require_operation_not_interrupted(operation_id)
+
+        def before_control():
+            _require_operation_not_interrupted(operation_id)
+            sample = parse_qs(_query_status_once(path))
+            _require_operation_not_interrupted(operation_id)
+            validate_battery_test_preflight(authorization_path, journal_path, operation_id, selector, sample=sample)
+
+        command = b"S03R0000\r" if selector == "start" else b"C\r"
+        result = _write_control_reports_once(path, command, profile, before_write=before_control,
+                                             before_each_report=lambda: _require_operation_not_interrupted(operation_id))
+        sys.stdout.buffer.write(json.dumps(result, allow_nan=False).encode("utf-8"))
+        return 0
+    except Exception:
+        print("Prueba en batería bloqueada o resultado de envío incierto.", file=sys.stderr)
+        return 1
+
+
+def control_worker_main(argv):
+    """The profile gate also protects direct invocation of this internal role."""
+    from .ups_power import (OperationJournal, configured_delay_seconds, shutdown_command, validated_control_profile, UpsPowerBlocked,
+                            validate_production_cancel_preflight, validate_production_start_preflight)
+    if (len(argv) not in (5, 6) or argv[2] not in ("shutdown", "cancel")
+            or len(argv) != (6 if argv[2] == "shutdown" else 5)):
+        raise SystemExit("Uso interno: control UPS aislado con perfil validado.")
+    try:
+        profile = validated_control_profile(argv[1])
+        _require_control_service_authorization()
+        journal_path, operation_id = argv[-2:]
+        _require_operation_not_interrupted(operation_id)
+        initial_operation = _production_control_operation(argv[0], profile, journal_path, operation_id, argv[2])
+        if argv[2] == "cancel":
+            if len(argv) != 5:
+                raise ValueError("Argumentos de cancelación no válidos.")
+            command = b"C\r"
+        else:
+            if len(argv) != 6 or not argv[3].isascii() or not argv[3].isdigit():
+                raise ValueError("Retardo de control no válido.")
+            delay = int(argv[3])
+            configured_delay_seconds(profile, initial_operation["action"], delay)
+            if delay != initial_operation.get("delay_seconds"):
+                raise ValueError("El retardo solicitado difiere de la operación durable propia.")
+            command = shutdown_command(delay)
+
+        control_context = {}
+
+        def before_control():
+            from .qs_protocol import parse_qs
+            _require_operation_not_interrupted(operation_id)
+            sample = parse_qs(_query_status_once(argv[0]))
+            _require_operation_not_interrupted(operation_id)
+            operation = _production_control_operation(argv[0], profile, journal_path, operation_id, argv[2])
+            validate = validate_production_start_preflight if argv[2] == "shutdown" else validate_production_cancel_preflight
+            validate(profile, operation, sample)
+            control_context.update(operation=operation, sample=sample)
+            # The named device mutex serializes this claim with every worker.
+            # A crash or partial send never resumes the same transaction.
+            OperationJournal(journal_path).write({**operation, "worker_claimed_for": argv[2]})
+            _require_operation_not_interrupted(operation_id)
+
+        def before_report():
+            _require_operation_not_interrupted(operation_id)
+            # Re-evaluate the absolute observed-sequence deadline after the
+            # durable claim and between the S payload and its terminating CR.
+            # The same immediate QS evidence is used; no additional query can
+            # interrupt the command's two-report framing.
+            validate = validate_production_start_preflight if argv[2] == "shutdown" else validate_production_cancel_preflight
+            validate(profile, control_context["operation"], control_context["sample"])
+
+        result = _write_control_once(argv[0], command, profile, before_write=before_control,
+                                     before_each_report=before_report)
+        sys.stdout.buffer.write(json.dumps(result, allow_nan=False).encode("utf-8"))
+        return 0
+    except Exception as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+
+
 def battery_worker_main(argv):
     if len(argv) != 2 or argv[1] not in BATTERY_DIAGNOSTIC_QUERIES:
         raise SystemExit("Uso interno: diagnóstico de batería aislado BT/BL")
@@ -494,4 +977,10 @@ if __name__ == "__main__":
         raise SystemExit(worker_main(sys.argv[2:]))
     if len(sys.argv) >= 2 and sys.argv[1] == "--battery-worker":
         raise SystemExit(battery_worker_main(sys.argv[2:]))
+    if len(sys.argv) >= 2 and sys.argv[1] == "--control-worker":
+        raise SystemExit(control_worker_main(sys.argv[2:]))
+    if len(sys.argv) >= 2 and sys.argv[1] == "--cancel-test-worker":
+        raise SystemExit(cancel_test_worker_main(sys.argv[2:]))
+    if len(sys.argv) >= 2 and sys.argv[1] == "--battery-test-worker":
+        raise SystemExit(battery_test_worker_main(sys.argv[2:]))
     raise SystemExit("Uso interno: diagnóstico HID aislado")

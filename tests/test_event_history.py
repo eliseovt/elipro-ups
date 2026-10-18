@@ -1,20 +1,12 @@
 import base64
 import json
 import sqlite3
-import tempfile
-import threading
-import time
 import unittest
-from contextlib import closing
 from datetime import timedelta
-from pathlib import Path
-from unittest.mock import Mock, patch
+from unittest.mock import patch
 
-from ups_monitor.core import DEFAULT_POLICY, Store, iso_utc, utc_now
+from ups_monitor.core import IncidentCursorExpired, Store, iso_utc, utc_now
 from ups_monitor.persistence import HistoryUnavailable, ResilientStore
-
-
-TEST_ROOT = Path(__file__).resolve().parents[1] / ".test-data"
 
 
 class EventHistoryTests(unittest.TestCase):
@@ -142,6 +134,103 @@ class EventHistoryTests(unittest.TestCase):
         self.assertIsNone(third["next_cursor"])
         self.assertEqual(len({first["incidents"][0]["id"], second["incidents"][0]["id"], third["incidents"][0]["id"]}), 3)
 
+    def test_incident_columns_sort_entire_result_with_stable_ties_and_missing_recovery_last(self):
+        opened = []
+        for kind, start, end, action in (
+                ("power", 0, 9, None), ("communication", 20, 120, "policy_cancelled"),
+                ("power", 200, 209, "policy_action_failed"), ("communication", 220, 225, "simulation"),
+                ("power", 300, None, "policy_action_started"), ("communication", 320, None, None)):
+            opened.append(self.event("power_lost" if kind == "power" else "connection_lost", start)["id"])
+            if action:
+                self.event(action, start + 1)
+            if end is not None:
+                self.event("power_restored" if kind == "power" else "connection_restored", end)
+        expectations = {
+            ("type", "asc"): [4, 2, 0, 5, 3, 1],
+            ("type", "desc"): [5, 3, 1, 4, 2, 0],
+            ("status", "asc"): [3, 2, 1, 0, 5, 4],
+            ("status", "desc"): [5, 4, 3, 2, 1, 0],
+            ("started_at", "asc"): [0, 1, 2, 3, 4, 5],
+            ("started_at", "desc"): [5, 4, 3, 2, 1, 0],
+            ("ended_at", "asc"): [0, 1, 2, 3, 5, 4],
+            ("ended_at", "desc"): [3, 2, 1, 0, 5, 4],
+            ("duration_seconds", "asc"): [3, 2, 0, 5, 4, 1],
+            ("duration_seconds", "desc"): [4, 1, 5, 2, 0, 3],
+            ("action_result", "asc"): [1, 2, 4, 3, 5, 0],
+            ("action_result", "desc"): [5, 0, 3, 4, 2, 1],
+        }
+        with patch("ups_monitor.core.utc_now", return_value=self.base + timedelta(seconds=400)):
+            for (sort, direction), indexes in expectations.items():
+                with self.subTest(sort=sort, direction=direction):
+                    cursor, actual = None, []
+                    while True:
+                        page = self.store.incidents(sort=sort, direction=direction, limit=2, cursor=cursor)
+                        self.assertEqual(page["total"], 6)
+                        actual.extend(row["opening_event_id"] for row in page["incidents"])
+                        cursor = page["next_cursor"]
+                        if cursor is None:
+                            break
+                    self.assertEqual(actual, [opened[index] for index in indexes])
+
+    def test_sorted_incident_snapshot_freezes_duration_recovery_and_new_insertions(self):
+        self.event("power_lost", 0)
+        self.event("power_restored", 5)
+        communication = self.event("connection_lost", 10)
+        power = self.event("power_lost", 20)
+        with patch("ups_monitor.core.utc_now", return_value=self.base + timedelta(seconds=100)):
+            first = self.store.incidents(sort="duration_seconds", direction="asc", limit=1)
+        cursor_data = json.loads(base64.urlsafe_b64decode(first["next_cursor"] + "=" * (-len(first["next_cursor"]) % 4)))
+        self.assertEqual(cursor_data["v"], 2)
+        self.assertEqual(first["as_of"], self.stamp(100))
+        self.event("power_restored", 110)
+        self.event("connection_restored", 120)
+        self.event("connection_lost", 130)
+        with patch("ups_monitor.core.utc_now", return_value=self.base + timedelta(seconds=1000)):
+            second = self.store.incidents(sort="duration_seconds", direction="asc", limit=1, cursor=first["next_cursor"])
+            third = self.store.incidents(sort="duration_seconds", direction="asc", limit=1, cursor=second["next_cursor"])
+        self.assertEqual(second["incidents"][0]["opening_event_id"], power["id"])
+        self.assertEqual(third["incidents"][0]["opening_event_id"], communication["id"])
+        self.assertEqual(second["incidents"][0]["duration_seconds"], 80)
+        self.assertEqual(third["incidents"][0]["duration_seconds"], 90)
+        self.assertEqual(third["incidents"][0]["status"], "open")
+        self.assertEqual(third["as_of"], first["as_of"])
+        self.assertEqual(third["total"], 3)
+        self.assertIsNone(third["next_cursor"])
+
+    def test_sorted_incident_cursors_are_bound_to_filters_order_and_version(self):
+        for second in (0, 10, 20):
+            self.event("power_lost", second)
+            self.event("power_restored", second + 1)
+        first = self.store.incidents(sort="started_at", direction="asc", limit=1)
+        cursor = first["next_cursor"]
+        for options in ({"sort": "started_at", "direction": "desc"}, {"sort": "ended_at", "direction": "asc"},
+                        {"sort": "started_at", "direction": "asc", "start": self.stamp(0)}, {}):
+            with self.subTest(options=options), self.assertRaises(ValueError):
+                self.store.incidents(cursor=cursor, **options)
+        legacy = self.store.incidents(limit=1)
+        legacy_data = json.loads(base64.urlsafe_b64decode(legacy["next_cursor"] + "=" * (-len(legacy["next_cursor"]) % 4)))
+        self.assertEqual(legacy_data["v"], 1)
+        with self.assertRaises(ValueError):
+            self.store.incidents(sort="started_at", cursor=legacy["next_cursor"])
+        self.assertEqual(self.store.incidents(sort="started_at")["direction"], "desc")
+        valid = json.loads(base64.urlsafe_b64decode(cursor + "=" * (-len(cursor) % 4)))
+        for changes in ({"v": True}, {"high": True}, {"before": True}, {"before": 0},
+                        {"before": valid["high"] + 1}, {"as_of": "2026-10-18"},
+                        {"as_of": None}, {"filter": "bad"}, {"extra": 1}):
+            bad = base64.urlsafe_b64encode(json.dumps({**valid, **changes}).encode()).decode().rstrip("=")
+            with self.subTest(changes=changes), self.assertRaises(ValueError):
+                self.store.incidents(sort="started_at", direction="asc", cursor=bad)
+
+    def test_sorted_incident_query_expires_when_retention_removes_anchor(self):
+        for second in (0, 10, 20):
+            self.event("power_lost", second)
+            self.event("power_restored", second + 1)
+        first = self.store.incidents(sort="started_at", direction="asc", limit=1)
+        with self.store._db:
+            self.store._db.execute("DELETE FROM events WHERE id=?", (first["incidents"][0]["opening_event_id"],))
+        with self.assertRaisesRegex(IncidentCursorExpired, "Vuelve a consultar incidentes"):
+            self.store.incidents(sort="started_at", direction="asc", cursor=first["next_cursor"])
+
     def test_corrupted_event_payload_is_not_silently_discarded(self):
         self.event("power_lost", 0)
         self.store._db.execute("UPDATE events SET data='broken'")
@@ -150,34 +239,6 @@ class EventHistoryTests(unittest.TestCase):
             self.store.events_page()
         with self.assertRaises(json.JSONDecodeError):
             self.store.incidents()
-
-    def test_backup_includes_wal_settings_and_preserves_source(self):
-        TEST_ROOT.mkdir(exist_ok=True)
-        with tempfile.TemporaryDirectory(dir=TEST_ROOT) as directory:
-            source, backup = Path(directory) / "source.sqlite3", Path(directory) / "backup.sqlite3"
-            store = Store(source)
-            try:
-                store.add_event("power_lost", "Corte")
-                store.add_sample({"timestamp": iso_utc(), "on_battery": True})
-                store.set_setting("policy", DEFAULT_POLICY)
-                metadata = store.backup(backup)
-                self.assertEqual((metadata["event_count"], metadata["sample_count"], metadata["settings_count"]), (1, 1, 1))
-                with closing(sqlite3.connect(backup)) as db:
-                    self.assertEqual(db.execute("PRAGMA integrity_check").fetchone()[0], "ok")
-                    policy = json.loads(db.execute("SELECT value FROM settings WHERE key='policy'").fetchone()[0])
-                    self.assertFalse(policy["enabled"])
-                store.add_event("power_restored", "Regresó")
-                with closing(sqlite3.connect(backup)) as db:
-                    self.assertEqual(db.execute("SELECT COUNT(*) FROM events").fetchone()[0], 1)
-                with self.assertRaises(ValueError):
-                    store.backup(source)
-                with self.assertRaises(ValueError):
-                    store.backup(backup)
-                with self.assertRaises(sqlite3.OperationalError):
-                    store.backup(Path(directory) / "missing" / "backup.sqlite3")
-            finally:
-                store.close()
-
 
 class ResilientEventHistoryTests(unittest.TestCase):
     def setUp(self):
@@ -192,10 +253,30 @@ class ResilientEventHistoryTests(unittest.TestCase):
         for operation in (lambda: self.store.events_page(limit=0),
                           lambda: self.store.events_page(cursor="bad"),
                           lambda: self.store.incidents(start="bad"),
+                          lambda: self.store.incidents(sort="message"),
+                          lambda: self.store.incidents(sort=[]),
+                          lambda: self.store.incidents(sort="type", direction="up"),
+                          lambda: self.store.incidents(sort="type", direction=[]),
+                          lambda: self.store.incidents(direction="asc"),
                           lambda: self.store.iter_events(query="x" * 201)):
             with self.assertRaises(ValueError):
                 operation()
         self.assertTrue(self.store.status()["available"])
+
+    def test_expired_incident_cursor_does_not_mark_storage_unavailable(self):
+        for _ in range(3):
+            self.backend.add_event("power_lost", "Corte")
+            self.backend.add_event("power_restored", "Regresó")
+        first = self.store.incidents(sort="started_at", direction="asc", limit=1)
+        with self.backend._db:
+            self.backend._db.execute("DELETE FROM events WHERE id=?", (first["incidents"][0]["opening_event_id"],))
+        before = self.store.status()
+        with self.assertRaises(IncidentCursorExpired):
+            self.store.incidents(sort="started_at", direction="asc", cursor=first["next_cursor"])
+        after = self.store.status()
+        self.assertTrue(after["available"])
+        self.assertEqual(after["last_failure_at"], before["last_failure_at"])
+        self.assertEqual(after["last_error"], before["last_error"])
 
     def test_failed_new_reads_keep_memory_cache_and_recover(self):
         self.store.add_event("power_lost", "Corte")
@@ -214,34 +295,6 @@ class ResilientEventHistoryTests(unittest.TestCase):
         self.assertEqual(next(iterator)["message"], "0")
         self.store.set_setting("test", {"ok": True})
         self.assertEqual(len(list(iterator)), 500)
-
-    def test_backup_failure_and_slow_backup_cannot_block_telemetry_queue(self):
-        entered, release = threading.Event(), threading.Event()
-        def slow_backup(destination):
-            entered.set()
-            release.wait(2)
-            raise sqlite3.OperationalError("database or disk is full")
-        self.backend.backup = slow_backup
-        errors = []
-        def request():
-            try:
-                self.store.backup("unused")
-            except HistoryUnavailable as exc:
-                errors.append(str(exc))
-        thread = threading.Thread(target=request)
-        thread.start()
-        self.assertTrue(entered.wait(1))
-        try:
-            began = time.monotonic()
-            self.store.add_sample({"timestamp": iso_utc(), "on_battery": True})
-            self.store.add_event("power_lost", "Corte")
-            self.assertFalse(self.store.get_setting("policy")["enabled"])
-            self.assertLess(time.monotonic() - began, 0.1)
-            self.assertEqual(self.store.status()["pending"], 2)
-        finally:
-            release.set()
-            thread.join(1)
-        self.assertIn("disk is full", errors[0])
 
 
 if __name__ == "__main__":

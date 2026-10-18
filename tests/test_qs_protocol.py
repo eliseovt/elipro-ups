@@ -26,6 +26,19 @@ def status_frame(value):
 
 
 class QsProtocolTests(unittest.TestCase):
+    def test_zero_frequency_is_only_valid_for_output_off_shutdown(self):
+        fields = LOG_SAMPLE[1:-1].split(b" ")
+        fields[2], fields[5], fields[6], fields[9] = b"\x00\x00", b"\x00\x00", b"\x00\x00\x00", b"\x0b"
+        off = b"#" + b" ".join(fields) + b"\r"
+        parsed = parse_qs(off)
+        self.assertEqual(parsed["frequency_hz"], 0)
+        self.assertEqual(parsed["output_voltage"], 0)
+        self.assertEqual(parsed["raw_status"], "Shutdown mode")
+        self.assertIsNone(parsed["on_battery"])
+        fields[9] = b"\x09"
+        with self.assertRaises(QsProtocolError):
+            parse_qs(b"#" + b" ".join(fields) + b"\r")
+
     def test_recorded_measurements_and_unknown_capabilities(self):
         before = datetime.now(timezone.utc)
         sample = parse_qs(LOG_SAMPLE)
