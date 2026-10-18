@@ -1,12 +1,16 @@
 # Resumen: diagrama y alertas críticas
 
-El diagrama usa SVG propio y mediciones HTML. El voltaje de entrada y salida son lecturas distintas; `frequency_hz` conserva el contrato existente y se presenta junto a la salida, sin duplicarlo como frecuencia de entrada. La barra del frontal representa `load_percent`, no el nivel de batería. El llenado visual se limita a 100%, pero el texto conserva una sobrecarga reportada superior a ese límite. Los valores ausentes se presentan como no disponibles, incluido su texto accesible.
+El diagrama usa SVG propio y mediciones HTML. El frontal de la ilustración muestra **FORZA** y el modelo **NT-2402PRO**, sin visor LCD. La iluminación de su botón de encendido refleja el estado del suministro; su estado accesible acompaña los cambios de conexión y calidad de lectura.
+
+El voltaje de entrada y salida son lecturas distintas; `frequency_hz` conserva el contrato existente y se presenta junto a la salida, sin duplicarlo como frecuencia de entrada. La carga del UPS representa `load_percent`, separada del porcentaje de batería. El llenado visual se limita a 100%, pero el texto conserva una sobrecarga reportada superior a ese límite. Los valores ausentes se presentan como no disponibles, incluido su texto accesible.
 
 ## Calidad y recorrido
 
 Una muestra es actual si el servicio está disponible, la conexión está confirmada y su timestamp tiene una edad entre -5 y 15 segundos. El temporizador de interfaz existente revisa la caducidad entre sondeos y al recuperar foco o visibilidad. No se agregan consultas periódicas.
 
-En red se activa entrada→UPS→equipos. En batería se activa batería→UPS→equipos. Una falla, un origen desconocido o datos sin confirmar neutralizan las rutas. La batería en red no representa una carga activa ni un bypass. Su porcentaje conserva la precedencia reportado→estimado, con su etiqueta de procedencia. Las estimaciones nunca generan alertas ni decisiones de energía.
+Los conductos rectos usan un contorno fino y pulsos de luz con estela, sin puntas de flecha. La entrada de red es turquesa; la rama de batería y la salida hacia los equipos son azules. En red se activa entrada→UPS→equipos. En batería se activa batería→UPS→equipos, con el pulso de la rama recta ascendiendo desde la batería hasta el UPS; la entrada de red permanece neutra.
+
+La animación exige una muestra actual, un origen de suministro confirmado y una salida con energía. Una falla, un origen desconocido, datos antiguos o sin confirmar y una salida de cero voltios neutralizan las rutas. La batería en red permanece neutra: la lectura no demuestra una carga activa ni un bypass. Su porcentaje conserva la precedencia reportado→estimado, con su etiqueta de procedencia y el voltaje visible. Las estimaciones nunca generan alertas ni decisiones de energía y no se convierten en minutos de autonomía.
 
 ## Modal de condiciones actuales
 
@@ -20,4 +24,6 @@ La cuenta atrás y su cancelación usan el estado y endpoint existentes. Se conf
 
 El selector ocupa el ancho útil del lateral y una fila completa en móvil. La transición de 350 ms solo se habilita al cambiar manualmente de tema. La preferencia sigue siendo `elipro-theme`; la primera pintura no se anima. Movimiento reducido desactiva las transiciones y las animaciones del diagrama.
 
-Hasta 600 px se utiliza un recorrido vertical con batería al costado. El gráfico y el registro conservan una sola instancia compartida y se apilan cuando falta espacio. Las ventanas bajas permiten desplazamiento; no se modifican la API, el lector, los datos guardados ni las reglas de protección.
+En un escritorio amplio de referencia de 1920 × 1080, Resumen reúne el diagrama compacto arriba y las tarjetas completas de Mediciones y Eventos recientes debajo. El gráfico conserva su período y sus tres métricas; la lista de eventos mantiene su filtro. La gráfica sigue compartida con Historial y los eventos recientes permanecen exclusivos de Resumen.
+
+La composición se adapta al ancho disponible y apila las tarjetas cuando falta espacio. Móviles, ventanas bajas y avisos o contenido adicional permiten desplazamiento. El ajuste de altura nunca recorta alertas, errores, la cuenta atrás de protección ni sus controles. `prefers-reduced-motion` desactiva los pulsos y las transiciones del diagrama, conservando colores, datos y estados estáticos. Se mantienen la API, el lector, los datos guardados y las reglas de protección.

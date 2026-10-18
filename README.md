@@ -10,7 +10,7 @@ Elipro es un proyecto independiente en desarrollo. No es software oficial de For
 
 - Lectura de alimentación de red/batería, voltajes de entrada y salida, frecuencia, carga del UPS, voltaje de batería y señales de batería baja o falla.
 - Cuatro secciones: **Resumen, Protección, Historial y Sistema**; temas claro y oscuro con selector sol/luna. Historial reúne las mediciones y una única tabla **Registro**, conservando sus filtros al navegar. Los eventos recientes permanecen en Resumen.
-- Resumen con un diagrama de energía: red, UPS, equipos y batería. Integra la carga del UPS en su frontal y mantiene la frecuencia junto a la salida; los recorridos solo se activan con lecturas recientes y suministro confirmado.
+- Resumen compacto para consultar el diagrama de energía, las mediciones y los eventos recientes en una sola vista de escritorio. La ilustración del UPS muestra FORZA y el modelo en el frontal, sin visor LCD; su botón de encendido refleja el estado del suministro. Los conductos de luz usan turquesa en la entrada de red y azul en batería y salida, con pulsos solo cuando las lecturas recientes confirman energía hacia los equipos.
 - Ventana modal global para batería baja, sobrecarga, falla del UPS y cuentas atrás reales o simuladas. Durante el aviso inicial ofrece un único botón **Cancelar protección**; reconocer una alarma no cancela la actuación.
 - Avisos de Windows, sonido e icono de bandeja aunque se cierre el navegador.
 - Avisos eléctricos retenidos durante bloqueo o desconexión de sesión, con acuse de aceptación nativa y recuperación del contexto al reanudar.
@@ -22,6 +22,8 @@ Elipro es un proyecto independiente en desarrollo. No es software oficial de For
 - Los controles de avisos permanecen visibles, sin opciones contraídas: avisos de escritorio, sonido, persistencia de avisos críticos cuando está disponible e intervalo de repetición.
 
 No requiere cuentas ni servicios de nube para funcionar. El servidor escucha únicamente en `127.0.0.1`; no está diseñado para exponerlo a una red.
+
+El Resumen adapta su altura para mostrar el diagrama y las dos tarjetas inferiores en pantallas de escritorio amplias. Los avisos siempre permanecen accesibles; móviles, ventanas bajas o contenido adicional permiten desplazamiento. El movimiento reducido del sistema desactiva las animaciones de flujo. La rama de batería permanece neutra con suministro de red: la vista no infiere que esté cargando ni muestra flujo con datos antiguos, sin confirmar, una falla o salida sin energía.
 
 ## Instalador de Windows x64
 

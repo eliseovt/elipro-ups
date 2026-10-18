@@ -87,7 +87,7 @@
     upsPowerReviewOperation: null,
   };
   const views = {
-    overview: { hash: "resumen", title: "Resumen", description: "Lo esencial de tu UPS, en tiempo real." },
+    overview: { hash: "resumen", title: "Resumen", description: "" },
     protection: { hash: "proteccion", title: "Protección", description: "Elige qué hacer cuando se corte la luz." },
     history: { hash: "historial", title: "Historial", description: "" },
     system: { hash: "sistema", title: "Sistema", description: "" },
@@ -558,9 +558,20 @@
     const diagram = $("energy-diagram");
     diagram.dataset.mode = context.mode;
     diagram.dataset.quality = context.quality;
+    const liveSource = context.quality === "live" && ["line", "battery"].includes(context.mode);
+    const inputActive = liveSource && context.mode === "line" && finite(sample?.input_voltage) && sample.input_voltage > 0;
+    const outputPowered = liveSource && finite(sample?.output_voltage) && sample.output_voltage > 0;
+    diagram.dataset.inputActive = String(inputActive);
+    diagram.dataset.outputPowered = String(outputPowered);
+    const missingMains = context.quality === "live" && context.mode === "battery" && sample?.input_voltage === 0;
+    $("input-supply-note").hidden = !missingMains;
+    setText("input-supply-note", missingMains ? "Sin red" : "");
+    const batterySupplying = context.mode === "battery" && outputPowered;
+    $("battery-flow-note").hidden = !batterySupplying;
+    setText("battery-flow-note", batterySupplying ? "En uso · " : "");
     const badge = $("connection-badge");
     const showConnection = (status, label) => {
-      badge.className = `connection-indicator ${status}`;
+      badge.className = `connection-indicator ups-power-indicator ${status}`;
       badge.lastElementChild.textContent = label;
       badge.title = label;
     };
@@ -598,11 +609,14 @@
       setText("power-state", "El UPS reporta una falla");
       setText("power-detail", "Revisa el equipo y sus indicadores físicos.");
     } else if (sample.on_battery === true) {
-      setText("power-state", "Usando batería");
-      setText("power-detail", "El UPS está alimentando tus equipos con su batería.");
+      setText("power-state", "Funcionando con batería");
+      setText("power-detail", outputPowered ? "El UPS está alimentando tus equipos con su batería."
+        : "El UPS reporta batería, pero no se confirma tensión en la salida a tus equipos.");
     } else if (sample.on_battery === false) {
-      setText("power-state", sample.raw_status === "AVR mode" ? "Red eléctrica · Regulación AVR" : "Red eléctrica activa");
-      setText("power-detail", "Tus equipos reciben energía de la red eléctrica.");
+      setText("power-state", !inputActive ? sample.input_voltage === 0 ? "Entrada de red sin tensión" : "Entrada de red sin confirmar"
+        : sample.raw_status === "AVR mode" ? "Red eléctrica · Regulación AVR" : "Red eléctrica activa");
+      setText("power-detail", !inputActive ? "El UPS reporta modo de red, pero la tensión de entrada no está confirmada."
+        : outputPowered ? "Tus equipos reciben energía de la red eléctrica." : "Hay tensión de entrada, pero no se confirma tensión en la salida a tus equipos.");
     } else {
       setText("power-state", "UPS conectado");
       setText("power-detail", sample.raw_status ? `Estado reportado: ${String(sample.raw_status)}. Suministro sin confirmar.` : "El equipo no reporta el origen del suministro.");

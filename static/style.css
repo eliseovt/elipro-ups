@@ -115,112 +115,117 @@ select option:disabled{color:var(--muted)}
 .shared-history{margin-top:20px}.shared-history .history-events{margin-top:0}
 body[data-view=history] .shared-history{margin-top:0}
 body[data-view=history] #page-history{margin-top:20px}
-.connection-indicator{display:inline-flex;align-items:center;justify-content:center;flex-shrink:0;width:10px;height:16px}
-.connection-indicator .status-dot{width:7px;height:7px;background:var(--muted)}
-.connection-indicator.connected .status-dot{background:var(--teal);box-shadow:0 0 0 3px #52e0c211}
-.connection-indicator.stale .status-dot{background:var(--amber)}
-.connection-indicator.disconnected .status-dot{background:var(--red)}
 .sidebar-controls .last-sync{margin-top:0}
 .chart-legend i.legend-estimated{height:0;background:transparent!important;border-top:3px dashed var(--blue);border-radius:0}
-html[data-theme=light] .connection-indicator.connected .status-dot{box-shadow:0 0 0 3px #087d6810}
 @media(max-width:800px){.shared-history{margin-top:16px}}
 
 
-/* Energy overview: readings remain HTML; the illustration is decorative. */
-.energy-diagram{--energy-icon-surface:#152833;--energy-icon-edge:#315566;--energy-wire:#2e4955;--energy-screen:#142738;position:relative;padding:20px 28px 27px;overflow:hidden;background:radial-gradient(ellipse at 50% 35%,#18352933,transparent 58%),var(--panel)}
-.energy-status-row{display:flex;justify-content:flex-end;min-height:24px;margin-bottom:6px}
-.power-state{display:inline-flex;align-items:center;gap:9px;max-width:100%;font-size:13px;line-height:1.5;font-weight:500;color:var(--muted);text-align:right}
-.power-state:before{content:"";width:7px;height:7px;flex-shrink:0;border-radius:50%;background:currentColor;box-shadow:0 0 0 4px #8a9ca810}
-.energy-diagram[data-mode=line][data-quality=live] .power-state{color:var(--teal)}
-.energy-diagram[data-mode=battery][data-quality=live] .power-state{color:var(--amber)}
+/* Energy overview: live paths follow confirmed telemetry and never imply charging. */
+.energy-diagram{--energy-icon-surface:#142936;--energy-icon-edge:#365e74;--energy-wire:#567488;--energy-screen:#112a42;--flow-blue:#36c9ff;--flow-line:#36dfc9;position:relative;height:clamp(340px,41vh,430px);padding:16px 26px 14px;overflow:hidden;background:radial-gradient(ellipse at 50% 38%,#15334833,transparent 62%),var(--panel)}
+.energy-status-row{position:absolute;top:17px;right:20px;display:flex;justify-content:flex-end;z-index:2;max-width:calc(100% - 40px)}
+.power-state{display:inline-flex;align-items:center;gap:9px;max-width:100%;font-size:12px;line-height:1.5;font-weight:500;color:var(--muted);text-align:right}
+.power-state:before{content:"";width:7px;height:7px;flex-shrink:0;border-radius:50%;background:currentColor;box-shadow:0 0 0 3px #8a9ca810}
+.energy-diagram[data-mode=line][data-quality=live] .power-state{color:var(--flow-line)}
+.energy-diagram[data-mode=battery][data-quality=live] .power-state{color:var(--flow-blue)}
 .energy-diagram[data-mode=fault][data-quality=live] .power-state{color:var(--red)}
-.energy-layout{display:grid;grid-template-columns:144px minmax(20px,1fr) 156px minmax(20px,1fr) 144px;grid-template-rows:273px auto;align-items:start;max-width:1080px;margin:0 auto}
+.energy-layout{display:grid;grid-template-columns:140px minmax(20px,1fr) 140px minmax(20px,1fr) 140px;grid-template-rows:196px auto;align-items:start;align-content:center;width:100%;height:100%;max-width:1000px;margin:0 auto}
 .energy-node{min-width:0;display:flex;flex-direction:column;align-items:center;text-align:center}
-.energy-input{grid-column:1;grid-row:1;padding-top:47px}
+.energy-input{grid-column:1;grid-row:1;padding-top:50px}
 .energy-ups{grid-column:3;grid-row:1}
-.energy-output{grid-column:5;grid-row:1;padding-top:57px}
-.input-illustration{width:112px;height:112px;margin-bottom:10px;filter:drop-shadow(0 6px 9px #0002)}
+.energy-output{grid-column:5;grid-row:1;padding-top:52px}
+.input-illustration{width:90px;height:90px;margin-bottom:8px;filter:drop-shadow(0 5px 8px #0002)}
 .outlet-plate{fill:var(--energy-icon-surface);stroke:var(--energy-icon-edge);stroke-width:1.5}
 .outlet-socket{fill:var(--panel);stroke:var(--energy-icon-edge);stroke-width:2}
-.outlet-contacts{fill:none;stroke:var(--teal);stroke-width:4;stroke-linecap:round}
-.energy-node-label{font-size:11px;line-height:1.4;letter-spacing:1.2px;font-weight:500;color:var(--muted)}
-.energy-voltage{display:flex;align-items:baseline;justify-content:center;gap:5px;margin-top:6px;font-size:clamp(28px,2.8vw,38px);line-height:1.2;letter-spacing:-1.2px;font-weight:500;font-variant-numeric:tabular-nums;white-space:nowrap}
-.energy-unit{font-size:.62em;letter-spacing:-.4px;font-weight:400;color:var(--muted)}
-/* Extend each track to the SVG contour inside the fixed-width icon column. */
-.energy-route{padding:0;margin-top:88px}
-.route-input{grid-column:2;grid-row:1;width:calc(100% + 39px);transform:translateX(-25px)}.route-output{grid-column:4;grid-row:1;width:calc(100% + 29px);transform:translateX(-14px)}
-.energy-link{width:100%;height:30px;overflow:visible;color:var(--energy-wire);fill:none;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
+.outlet-contacts{fill:none;stroke:var(--flow-line);stroke-width:4;stroke-linecap:round}
+.energy-node-label{font-size:10px;line-height:1.4;letter-spacing:.9px;font-weight:500;color:var(--text)}
+.energy-voltage{display:flex;align-items:baseline;justify-content:center;gap:5px;margin-top:4px;font-size:32px;line-height:1.2;letter-spacing:-1px;font-weight:500;font-variant-numeric:tabular-nums;white-space:nowrap}
+.energy-unit{font-size:.62em;letter-spacing:-.4px;font-weight:400;color:#bddbe9}
+.input-supply-note{margin-top:4px;color:#bddbe9;font-size:12px;line-height:1.4}
+.energy-route{grid-row:1;margin-top:80px;padding:0}
+.route-input{grid-column:2;width:calc(100% + 38px);transform:translateX(-25px)}
+.route-output{grid-column:4;width:calc(100% + 34px);transform:translateX(-13px)}
+.energy-link{--flow-on:0;--flow-animation:none;display:block;width:100%;height:30px;overflow:visible;color:var(--energy-wire);fill:none;stroke-linecap:round;stroke-linejoin:round}
 .energy-link path{vector-effect:non-scaling-stroke}
-.flow-track{stroke:var(--energy-wire)}
-.flow-active,.flow-motion{stroke:currentColor;opacity:0}
-.flow-motion{stroke-width:3;stroke-dasharray:1 25}
-.flow-chevron{stroke:currentColor;stroke-width:2.2;opacity:0}
-.energy-diagram[data-quality=live][data-mode=line] :is(.flow-input,.flow-output),.energy-diagram[data-quality=live][data-mode=battery] :is(.flow-battery,.flow-output){color:var(--teal)}
-.energy-diagram[data-quality=live][data-mode=battery] :is(.flow-battery,.flow-output){color:var(--amber)}
-.energy-diagram[data-quality=live][data-mode=line] :is(.flow-input,.flow-output) .flow-active,.energy-diagram[data-quality=live][data-mode=battery] :is(.flow-battery,.flow-output) .flow-active{opacity:.62}
-.energy-diagram[data-quality=live][data-mode=line] :is(.flow-input,.flow-output) .flow-chevron,.energy-diagram[data-quality=live][data-mode=battery] :is(.flow-battery,.flow-output) .flow-chevron{opacity:1}
-.energy-diagram[data-quality=live][data-mode=line] :is(.flow-input,.flow-output) .flow-motion,.energy-diagram[data-quality=live][data-mode=battery] :is(.flow-battery,.flow-output) .flow-motion{opacity:.9;animation:energy-flow 2.4s linear infinite}
-@keyframes energy-flow{to{stroke-dashoffset:-52}}
-.ups-tower{position:relative;width:156px;height:218px;flex-shrink:0}
+.flow-track{stroke:var(--energy-wire);stroke-width:2;stroke-dasharray:4 6;opacity:.8}
+.flow-tube,.flow-filament,.flow-comet-tail,.flow-comet-head{stroke:currentColor;opacity:var(--flow-on);filter:drop-shadow(0 0 4px currentColor)}
+.flow-tube{stroke-width:7;opacity:calc(var(--flow-on)*.16);filter:drop-shadow(0 0 6px currentColor)}
+.flow-filament{stroke-width:1.25;opacity:calc(var(--flow-on)*.8)}
+.flow-filament-two{stroke-width:.85;opacity:calc(var(--flow-on)*.55)}
+.flow-comet-tail{--comet-start:0;--comet-end:-100;stroke-width:3;stroke-dasharray:10 90;animation:var(--flow-animation) 2.8s linear infinite;opacity:calc(var(--flow-on)*.65)}
+.flow-comet-head{--comet-start:-10;--comet-end:-110;stroke:#dfffff;stroke-width:4;stroke-dasharray:1 99;stroke-dashoffset:-10;animation:var(--flow-animation) 2.8s linear infinite;opacity:var(--flow-on);filter:drop-shadow(0 0 3px #fff) drop-shadow(0 0 6px currentColor)}
+.flow-comet-second{animation-delay:-1.4s}
+.energy-diagram[data-quality=live][data-output-powered=true][data-mode=line][data-input-active=true] [data-flow=input]{--flow-on:1;--flow-animation:energy-comet;color:var(--flow-line)}
+.energy-diagram[data-quality=live][data-output-powered=true]:is([data-mode=line],[data-mode=battery]) [data-flow=output],.energy-diagram[data-quality=live][data-output-powered=true][data-mode=battery] [data-flow=battery]{--flow-on:1;--flow-animation:energy-comet;color:var(--flow-blue)}
+.energy-diagram[data-quality=live][data-output-powered=true][data-mode=line][data-input-active=true] [data-flow=input] .flow-track,.energy-diagram[data-quality=live][data-output-powered=true]:is([data-mode=line],[data-mode=battery]) [data-flow=output] .flow-track,.energy-diagram[data-quality=live][data-output-powered=true][data-mode=battery] [data-flow=battery] .flow-track{stroke:currentColor;stroke-dasharray:none;opacity:.3}
+@keyframes energy-comet{from{stroke-dashoffset:var(--comet-start)}to{stroke-dashoffset:var(--comet-end)}}
+.ups-tower{position:relative;width:140px;height:196px;flex-shrink:0}
 .ups-illustration{width:100%;height:100%;overflow:visible}
-.ups-shadow{fill:#0004}.ups-foot{fill:#0b141d;stroke:#2a4050;stroke-width:1}
-.ups-shell{fill:url(#ups-shell-gradient);stroke:#476173;stroke-width:1.2}
-.ups-side-seam{fill:none;stroke:#4a6575;stroke-width:1;opacity:.45}
+.ups-shadow{fill:#0004}
+.ups-foot{fill:#0b141d;stroke:#2a4050;stroke-width:1}
+.ups-shell{fill:url(#ups-shell-gradient);stroke:#587e98;stroke-width:1.2}
+.ups-side-seam{fill:none;stroke:#50738a;stroke-width:1;opacity:.45}
 .ups-front{fill:url(#ups-front-gradient);stroke:#0b1a25;stroke-width:1}
-.ups-upper-panel{fill:#162b39;stroke:#3b5261;stroke-width:.6}
-.ups-screen-frame{fill:#0d1c27;stroke:#577180;stroke-width:.8}
-.ups-screen{fill:url(#ups-screen-gradient);stroke:#6b8796;stroke-width:.5}
-.ups-power-ring{fill:#173b3b;stroke:#4b7a72;stroke-width:.8}
-.ups-power-mark{fill:none;stroke:#77cbb5;stroke-width:1.5;stroke-linecap:round}
+.ups-upper-panel{fill:#142a39;stroke:#3b5261;stroke-width:.6}
+.ups-brand-label{fill:#f1f7fb;font-family:Arial,sans-serif;font-size:16px;font-weight:700;letter-spacing:.2px}
+.ups-model-label{fill:#ecf4f9;font-family:Arial,sans-serif;font-size:13.5px;font-weight:500;letter-spacing:.1px}
+#connection-badge{position:absolute;left:50%;top:26.3%;display:grid;place-items:center;width:23px;height:23px;transform:translate(-50%,-50%);color:#6c8493;filter:none;z-index:2}
+#connection-badge svg{width:100%;height:100%;fill:none;stroke:currentColor;stroke-width:1.7;stroke-linecap:round;stroke-linejoin:round}
+#connection-badge .ups-status-ring{fill:currentColor;fill-opacity:.12;stroke-width:1}
+.energy-diagram[data-quality=live][data-mode=line] #connection-badge{color:var(--flow-line);filter:drop-shadow(0 0 4px #36dfc955)}
+.energy-diagram[data-quality=live][data-mode=battery] #connection-badge{color:var(--flow-blue);filter:drop-shadow(0 0 4px #36c9ff88)}
+.energy-diagram[data-quality=live][data-mode=fault] #connection-badge{color:var(--red)}
 .ups-meter-recess{fill:#0b1924;stroke:#345163;stroke-width:1.5}
 .ups-vents{fill:none;stroke:#071821;stroke-width:2;opacity:.9}
 .ups-base-edge{fill:none;stroke:#496475;stroke-width:1;opacity:.65}
 .load-meter{position:absolute;left:42.05%;top:38.5%;width:15.9%;height:37.3%;overflow:hidden;border-radius:4px;background:#122634;box-shadow:inset 0 0 0 1px #5d809333}
-.load-meter-fill{position:absolute;bottom:0;left:0;display:block;width:100%;height:0;background:#6ca5e5;box-shadow:0 0 12px #77aeef25}
+.load-meter-fill{position:absolute;bottom:0;left:0;display:block;width:100%;height:0;background:#47bdff;box-shadow:0 0 10px #47bdff33}
 .load-meter-fill.high{background:var(--amber)}
 .load-meter-slots{position:absolute;inset:0;background:repeating-linear-gradient(to top,transparent 0,transparent calc(12.5% - 3px),#10212e calc(12.5% - 3px),#10212e 12.5%);pointer-events:none}
 .load-meter[data-available=false] .load-meter-fill{opacity:0}
-.ups-load-value{position:absolute;bottom:25px;left:0;right:0;display:flex;justify-content:center;align-items:baseline;gap:2px;color:#e2eef7;font-size:18px;line-height:1;font-weight:500;font-variant-numeric:tabular-nums;letter-spacing:-.5px}
-.ups-load-value>span:last-child{font-size:13px;color:#9db4c5}
-.energy-ups-label{font-size:14px;line-height:1.4;font-weight:500;margin-top:4px;letter-spacing:.4px}
-.diagram-model{display:flex;align-items:center;justify-content:center;gap:6px;margin-top:4px;font-size:10px;line-height:1.5;letter-spacing:.65px;white-space:nowrap;color:var(--muted)}
-.output-illustration{width:128px;height:100px;margin-bottom:12px;filter:drop-shadow(0 6px 9px #0002)}
-.monitor-bezel{fill:#24415a;stroke:#5689c2;stroke-width:1.5}
+.ups-load-value{position:absolute;bottom:25px;left:0;right:0;display:flex;justify-content:center;align-items:baseline;gap:2px;color:#e2eef7;font-size:16px;line-height:1;font-weight:500;font-variant-numeric:tabular-nums;letter-spacing:-.5px}
+.ups-load-value>span:last-child{font-size:11px;color:#bddbe9}
+.ups-load-caption{position:absolute;bottom:10px;left:0;right:0;text-align:center;font-size:9px;line-height:1.2;color:#d4e5ef}
+.output-illustration{width:110px;height:86px;margin-bottom:10px}
+.monitor-bezel{fill:#24415a;stroke:#69b5f6;stroke-width:1.5}
 .monitor-screen{fill:var(--energy-screen);stroke:#416c98;stroke-width:.7}
 .monitor-stand{fill:#233c4e;stroke:#507089;stroke-width:2;stroke-linejoin:round}
 .monitor-highlight{fill:none;stroke:#7695b7;stroke-width:1;opacity:.3}
-.output-frequency{display:flex;justify-content:center;gap:4px;margin-top:5px;color:var(--muted);font-size:16px;line-height:1.4;font-variant-numeric:tabular-nums}
-.output-frequency>span:last-child{font-size:12px;align-self:baseline}
-.energy-battery{position:relative;grid-column:1/-1;grid-row:2;display:grid;grid-template-columns:1fr 76px 1fr;grid-template-rows:42px auto;column-gap:18px;width:100%;max-width:510px;margin:-3px auto 0}
-.battery-link{grid-column:2;grid-row:1;justify-self:center;width:30px;height:42px}
-.battery-link .flow-track{stroke-dasharray:3 5}
-.battery-link-mobile{display:none}
-.battery-symbol{position:relative;grid-column:2;grid-row:2;width:76px;height:115px}
+.output-frequency{display:flex;justify-content:center;gap:4px;margin-top:5px;color:#bddbe9;font-size:13px;line-height:1.4;font-variant-numeric:tabular-nums}
+.output-frequency>span:last-child{font-size:11px;align-self:baseline}
+.energy-battery{position:relative;grid-column:1/-1;grid-row:2;display:grid;grid-template-columns:1fr 54px 1fr;grid-template-rows:clamp(48px,6vh,68px) auto;column-gap:18px;width:100%;max-width:480px;margin:0 auto}
+.battery-link{grid-column:2;grid-row:1;justify-self:center;width:30px;height:100%}
+.battery-symbol{position:relative;grid-column:2;grid-row:2;width:54px;height:82px}
 .battery-outline{position:absolute;inset:0;width:100%;height:100%;overflow:visible}
-.battery-terminal{fill:var(--energy-icon-surface);stroke:var(--energy-icon-edge);stroke-width:2.4}
-.battery-case{fill:var(--energy-icon-surface);stroke:var(--energy-icon-edge);stroke-width:2.4}
+.battery-terminal,.battery-case{fill:var(--energy-icon-surface);stroke:var(--energy-icon-edge);stroke-width:2.4}
 .battery-meter{position:absolute;left:18.2%;top:22.6%;width:63.4%;height:64.5%;overflow:hidden;border-radius:3px;background:#31504433}
-.battery-meter-fill{position:absolute;bottom:0;left:0;display:block;width:100%;height:0;background:var(--teal)}
-.battery-meter-fill.low{background:var(--amber)}
-.battery-meter-slots{position:absolute;inset:0;background:repeating-linear-gradient(to top,transparent 0,transparent calc(25% - 4px),var(--energy-icon-surface) calc(25% - 4px),var(--energy-icon-surface) 25%);pointer-events:none}
+.battery-meter-fill{position:absolute;bottom:0;left:0;display:block;width:100%;height:0;background:var(--flow-line)}
+.energy-diagram[data-quality=live][data-mode=battery] .battery-meter-fill{background:var(--flow-blue)}
+.battery-meter-fill.low{background:var(--amber)!important}
+.battery-meter-slots{position:absolute;inset:0;background:repeating-linear-gradient(to top,transparent 0,transparent calc(25% - 3px),var(--energy-icon-surface) calc(25% - 3px),var(--energy-icon-surface) 25%);pointer-events:none}
 .battery-meter[data-available=false] .battery-meter-fill{opacity:0}
-.battery-values{grid-column:3;grid-row:2;min-width:0;align-self:center;padding-top:3px}
-.battery-values .energy-node-label{letter-spacing:1.1px}
-.battery-charge{display:flex;align-items:baseline;gap:3px;color:var(--teal);font-size:40px;line-height:1.1;letter-spacing:-1.2px;font-weight:500;font-variant-numeric:tabular-nums;margin-top:5px}
+.battery-values{grid-column:3;grid-row:2;min-width:0;align-self:center;padding-top:0}
+.battery-values .energy-node-label{font-size:10px;letter-spacing:.7px}
+.battery-charge{display:flex;align-items:baseline;gap:3px;color:var(--flow-line);font-size:30px;line-height:1.1;letter-spacing:-1px;font-weight:500;font-variant-numeric:tabular-nums;margin-top:3px}
+.energy-diagram[data-quality=live][data-mode=battery] .battery-charge{color:var(--flow-blue)}
 #battery-unit{font-size:.68em;font-weight:400;letter-spacing:-.5px}
-.battery-charge-note{margin-top:5px;color:var(--muted);font-size:11px;line-height:1.4}
-.battery-voltage-value{display:flex;align-items:baseline;gap:4px;margin-top:4px;font-size:18px;line-height:1.4;font-weight:400;font-variant-numeric:tabular-nums}
-.battery-voltage-value>span:last-child{font-size:12px;color:var(--muted)}
-.energy-diagram:not([data-quality=live]) :is(.energy-voltage,.battery-charge,.battery-voltage-value){color:var(--muted)}
-.energy-diagram:not([data-quality=live]) :is(.input-illustration,.output-illustration,.ups-tower,.battery-symbol){opacity:.62}
-html[data-theme=light] .energy-diagram{--energy-icon-surface:#eaf2f5;--energy-icon-edge:#92b1bf;--energy-wire:#bdcfd6;--energy-screen:#dceafa;background:radial-gradient(ellipse at 50% 35%,#d9eee74d,transparent 58%),var(--panel)}
+.battery-charge-note{margin-top:3px;color:var(--text);font-size:10px;line-height:1.45}
+.battery-voltage-value{display:flex;align-items:baseline;gap:4px;margin-top:3px;font-size:14px;line-height:1.4;font-weight:400;font-variant-numeric:tabular-nums}
+.battery-voltage-value>span:last-child{font-size:11px;color:var(--muted)}
+.energy-diagram[data-mode=battery] .outlet-contacts{stroke:var(--muted)}
+.energy-diagram:not([data-quality=live]) :is(.energy-voltage,.battery-charge,.battery-voltage-value),.energy-diagram[data-mode=unknown] :is(.energy-voltage,.battery-charge,.battery-voltage-value){color:var(--muted)}
+.energy-diagram:not([data-quality=live]) :is(.input-illustration,.output-illustration,.ups-tower,.battery-symbol),.energy-diagram[data-mode=unknown] :is(.input-illustration,.output-illustration,.ups-tower,.battery-symbol){opacity:.65;filter:grayscale(1)}
+html[data-theme=light] .energy-diagram{--energy-icon-surface:#eaf2f5;--energy-icon-edge:#92b1bf;--energy-wire:#a4bac8;--energy-screen:#dceafa;--flow-blue:#168fd5;--flow-line:#0aa98f;background:radial-gradient(ellipse at 50% 38%,#d9eee74d,transparent 62%),var(--panel)}
 html[data-theme=light] .outlet-socket{fill:#f9fcfd}
 html[data-theme=light] .monitor-bezel{fill:#e8f0fa;stroke:#759bd0}
 html[data-theme=light] .monitor-stand{fill:#b4c8dc;stroke:#7b9bb8}
 html[data-theme=light] .monitor-highlight{stroke:#fff;opacity:.8}
 html[data-theme=light] .ups-shadow{fill:#37556926}
 html[data-theme=light] .battery-meter{background:#a8c5b933}
-
+html[data-theme=light] :is(.energy-unit,.input-supply-note,.output-frequency){color:#4d6f83}
+@media(min-width:1600px){.energy-layout{grid-template-columns:150px minmax(20px,1fr) 156px minmax(20px,1fr) 150px;grid-template-rows:218px auto;max-width:1120px}.ups-tower{width:156px;height:218px}.energy-input{padding-top:62px}.energy-output{padding-top:65px}.energy-route{margin-top:94px}.input-illustration{width:96px;height:96px}.output-illustration{width:120px;height:94px}.energy-voltage{font-size:36px}.energy-battery{grid-template-columns:1fr 58px 1fr}.battery-symbol{width:58px;height:88px}.battery-charge{font-size:33px}#connection-badge{width:25px;height:25px}}
+@media(max-width:1140px) and (min-width:601px){.energy-diagram{padding-right:20px;padding-left:20px}.energy-layout{grid-template-columns:118px minmax(12px,1fr) 140px minmax(12px,1fr) 118px}.input-illustration{width:84px;height:84px}.output-illustration{width:102px;height:80px}.energy-input{padding-top:53px}.energy-output{padding-top:55px}.energy-node-label{font-size:9px;letter-spacing:.5px}.energy-voltage{font-size:29px}.route-input{width:calc(100% + 30px);transform:translateX(-20px)}.route-output{width:calc(100% + 26px);transform:translateX(-11px)}}
+@media(max-width:600px){.energy-diagram{height:auto;min-height:365px;padding:16px 12px 18px}.energy-status-row{position:static;justify-content:center;max-width:none;margin-bottom:16px}.power-state{font-size:11px;text-align:center}.energy-layout{grid-template-columns:minmax(0,1fr) 12px 116px 12px minmax(0,1fr);grid-template-rows:162px auto;align-content:start;height:auto;max-width:370px}.energy-input{padding-top:50px}.energy-output{padding-top:51px}.input-illustration{width:58px;height:58px;margin-bottom:8px}.output-illustration{width:74px;height:58px;margin-bottom:8px}.energy-node-label{font-size:8px;line-height:1.45;letter-spacing:.3px}.energy-voltage{font-size:24px;gap:3px;margin-top:4px}.energy-unit{font-size:.62em}.input-supply-note{font-size:10px}.ups-tower{width:116px;height:162px}.energy-route{margin-top:64px}.route-input{width:calc(100% + 15px);transform:translateX(-8px)}.route-output{width:calc(100% + 18px);transform:translateX(-8px)}.energy-link{height:30px}.ups-load-value{font-size:13px;bottom:21px}.ups-load-value>span:last-child{font-size:10px}.ups-load-caption{bottom:8px;font-size:7.5px}#connection-badge{width:20px;height:20px}.output-frequency{font-size:10px;gap:3px}.output-frequency>span:last-child{font-size:8px}.energy-battery{grid-template-columns:1fr 50px 1fr;grid-template-rows:52px auto;column-gap:12px;max-width:320px}.battery-link{height:100%;width:26px}.battery-symbol{width:50px;height:76px}.battery-values .energy-node-label{font-size:9px}.battery-charge{font-size:27px}.battery-charge-note{font-size:9px}.battery-voltage-value{font-size:12px}}
+@media(prefers-reduced-motion:reduce){.energy-link .flow-comet-tail,.energy-link .flow-comet-head{animation:none!important}.flow-filament{filter:none}}
 /* The switch uses two equal hit areas and a proportional sliding thumb. */
 .sidebar-controls{align-items:stretch;padding:0 0 2px;gap:18px}
 .sidebar-controls .last-sync{padding:0 8px}
@@ -271,11 +276,11 @@ html[data-theme=light] .critical-dialog .button-primary{color:#fff;background:#a
 html[data-theme=light] .critical-dialog .button-primary:hover{background:#942a3e;border-color:#942a3e}
 @keyframes critical-enter{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
 
-@media(min-width:1500px){.energy-diagram{padding:23px 40px 31px}.energy-layout{grid-template-columns:144px minmax(20px,1fr) 166px minmax(20px,1fr) 144px;grid-template-rows:287px auto}.ups-tower{width:166px;height:230px}.energy-input{padding-top:59px}.energy-output{padding-top:69px}.energy-route{margin-top:100px}.energy-battery{grid-template-rows:44px auto}}
-@media(max-width:1140px) and (min-width:801px){.energy-diagram{padding:18px 18px 24px}.energy-layout{grid-template-columns:118px minmax(18px,1fr) 146px minmax(18px,1fr) 118px;grid-template-rows:261px auto}.ups-tower{width:146px;height:204px}.energy-voltage{font-size:29px}.energy-node-label{font-size:10px;letter-spacing:.8px}.input-illustration{width:96px;height:96px;margin-bottom:15px}.output-illustration{width:120px;height:94px}.energy-input{padding-top:49px}.energy-output{padding-top:54px}.energy-route{margin-top:82px}.route-input{width:calc(100% + 32px);transform:translateX(-19px)}.route-output{width:calc(100% + 19px);transform:translateX(-13px)}.diagram-model{font-size:9px;letter-spacing:.25px}.energy-battery{grid-template-rows:36px auto}}
-@media(max-width:800px){.sidebar-controls{display:flex;flex-direction:column;align-items:stretch;gap:13px}.sidebar-controls .last-sync{padding:0;min-width:0}.sidebar-controls .theme-toggle{margin:0}.energy-diagram{padding:18px 22px 26px}.energy-layout{grid-template-columns:118px minmax(18px,1fr) 150px minmax(18px,1fr) 118px;grid-template-rows:267px auto}.ups-tower{width:150px;height:210px}.input-illustration{width:96px;height:96px;margin-bottom:15px}.output-illustration{width:120px;height:94px}.energy-input{padding-top:49px}.energy-output{padding-top:54px}.energy-route{margin-top:82px}.route-input{width:calc(100% + 32px);transform:translateX(-19px)}.route-output{width:calc(100% + 19px);transform:translateX(-13px)}}
-@media(max-width:600px){.energy-diagram{padding:17px 16px 24px}.energy-status-row{justify-content:center;min-height:22px;margin-bottom:21px}.power-state{font-size:12px;text-align:center}.energy-layout{grid-template-columns:minmax(0,1fr) 119px;grid-template-rows:auto 48px 254px 48px auto;column-gap:9px;row-gap:0;max-width:350px}.energy-input{grid-column:1;grid-row:1;padding-top:0}.energy-ups{grid-column:1;grid-row:3}.energy-output{grid-column:1;grid-row:5;padding-top:0}.energy-route{grid-column:1;justify-self:center;width:48px;height:48px;padding:0;margin:0;display:grid;place-items:center;transform:none}.route-input{grid-row:2}.route-output{grid-row:4}.energy-route .energy-link{width:48px;height:26px;transform:rotate(90deg)}.input-illustration{width:79px;height:79px;margin-bottom:8px}.output-illustration{width:106px;height:83px;margin-bottom:9px}.energy-node-label{font-size:10px;letter-spacing:.65px}.energy-voltage{font-size:30px;margin-top:4px}.ups-tower{width:145px;height:203px}.energy-ups-label{font-size:13px;margin-top:4px}.diagram-model{font-size:8px;letter-spacing:.15px;gap:4px}.ups-load-value{font-size:17px;bottom:24px}.energy-battery{grid-column:2;grid-row:3;display:flex;flex-direction:column;align-items:center;align-self:start;gap:8px;max-width:none;margin:41px 0 0;min-width:0}.battery-link{display:none}.battery-link-mobile{display:block;position:absolute;width:calc(50% + 8px);height:24px;right:calc(50% + 32px);top:32px}.battery-symbol{width:64px;height:97px;flex-shrink:0}.battery-values{padding-top:0;text-align:center;align-self:center}.battery-charge{justify-content:center;font-size:31px;margin-top:4px}.battery-charge-note{font-size:10px;margin-top:3px;max-width:116px}.battery-voltage-value{justify-content:center;font-size:17px;margin-top:3px}.output-frequency{font-size:11px}.output-frequency>span:last-child{font-size:9px}.critical-dialog{padding:23px 21px}.critical-dialog h2{font-size:22px}.critical-countdown{gap:12px;padding:12px}.critical-countdown .button{font-size:11px;padding:9px 10px}}
-@media(max-width:380px){.energy-diagram{padding-left:11px;padding-right:11px}.energy-layout{grid-template-columns:minmax(0,1fr) 102px;column-gap:4px}.energy-node-label{font-size:9px}.energy-voltage{font-size:28px}.diagram-model{font-size:7.5px}.critical-countdown{align-items:stretch;flex-direction:column}.critical-countdown>div{flex-direction:row;justify-content:space-between;align-items:center}.critical-countdown .button{width:100%}}.incident-details-toggle:focus-visible{outline:2px solid var(--teal);outline-offset:-3px}
+
+
+@media(max-width:800px){.sidebar-controls{display:flex;flex-direction:column;align-items:stretch;gap:13px}.sidebar-controls .last-sync{padding:0;min-width:0}.sidebar-controls .theme-toggle{margin:0}}
+@media(max-width:600px){.critical-dialog{padding:23px 21px}.critical-dialog h2{font-size:22px}.critical-countdown{gap:12px;padding:12px}.critical-countdown .button{font-size:11px;padding:9px 10px}}
+@media(max-width:380px){.critical-countdown{align-items:stretch;flex-direction:column}.critical-countdown>div{flex-direction:row;justify-content:space-between;align-items:center}.critical-countdown .button{width:100%}}.incident-details-toggle:focus-visible{outline:2px solid var(--teal);outline-offset:-3px}
 .incident-detail-row[hidden]{display:none}
 .incident-details{padding:17px 20px;border-left:3px solid var(--teal);overflow-wrap:anywhere}
 .incident-details p{margin:0 0 9px;color:var(--muted)}
@@ -464,3 +469,36 @@ html[data-theme=light] .history-section-heading svg,html[data-theme=light] #page
 @media(max-width:900px){#page-history .records-filters{grid-template-columns:repeat(2,minmax(0,1fr))}#page-history #apply-records{grid-column:1;justify-self:stretch}#page-history #clear-records{grid-column:2;justify-self:stretch}}
 @media(max-width:600px){body[data-view=history] #shared-history .history-card{padding:18px 16px}body[data-view=history] #shared-history .chart-container{height:clamp(240px,42vh,320px)}body[data-view=history] #shared-history .section-header{gap:12px;align-items:center}body[data-view=history] #shared-history .export-link{font-size:10px}#page-history .records-card{padding:18px 16px}#page-history .records-header{gap:10px}#page-history .records-header h2{font-size:17px}#page-history .records-actions{gap:8px}#page-history .count-badge{font-size:10px;padding:4px 8px}#page-history #export-records{font-size:10px;gap:6px;padding:5px 9px}#page-history .records-filters{gap:12px}#page-history .records-filters label{min-width:0;width:auto}#page-history .records-search-field{grid-column:1/-1}#page-history .records-filters label:last-of-type{grid-column:1/-1}#page-history #apply-records,#page-history #clear-records{width:100%}.unified-records-scroll{max-height:300px}.unified-records-table .incident-details{max-height:180px;padding:15px}.records-pagination{gap:8px}#page-history .more-records{margin-left:auto}}
 @media(max-width:380px){#page-history .records-filters{grid-template-columns:1fr}#page-history .records-filters label,#page-history #apply-records,#page-history #clear-records{grid-column:auto}#page-history .records-actions{flex-wrap:wrap;justify-content:flex-end}}
+
+/* The desktop overview fits its diagram and both lower cards without hiding alerts. */
+body[data-view=overview] .workspace{padding-top:24px;padding-bottom:24px}
+body[data-view=overview] .page-heading{margin-bottom:16px}
+body[data-view=overview] #shared-history{margin-top:16px}
+body[data-view=overview] #shared-history .history-events{grid-template-columns:minmax(0,1.65fr) minmax(320px,1fr);gap:16px;height:clamp(310px,38vh,390px);margin-top:0;align-items:stretch}
+body[data-view=overview] #shared-history .history-card,body[data-view=overview] #shared-history .events-card{display:flex;flex-direction:column;min-height:0;height:100%;padding:18px 20px}
+body[data-view=overview] #shared-history .section-header{flex-shrink:0;align-items:center;gap:12px;flex-wrap:nowrap}
+body[data-view=overview] #shared-history .section-header h2{font-size:17px;font-weight:550;max-width:none}
+body[data-view=overview] #shared-history .history-section-heading{gap:10px}
+body[data-view=overview] #shared-history .history-section-heading svg{width:23px;height:23px}
+body[data-view=overview] #shared-history .export-link{font-size:11px}
+body[data-view=overview] #shared-history .chart-toolbar{flex-shrink:0;gap:12px;margin-top:13px}
+body[data-view=overview] #shared-history .segmented button{padding:6px 12px;font-size:11px}
+body[data-view=overview] #shared-history .period-select select{padding:7px 9px;font-size:10px;min-height:34px;max-width:170px}
+body[data-view=overview] #shared-history .chart-legend{flex-shrink:0;gap:16px;margin-top:12px;font-size:10px}
+body[data-view=overview] #shared-history .chart-container{flex:1;min-height:145px;height:auto;margin-top:7px}
+body[data-view=overview] #shared-history .chart-note{flex-shrink:0;margin-top:6px;font-size:10px;line-height:1.5}
+body[data-view=overview] #recent-events-card .count-badge{font-size:11px}
+body[data-view=overview] #recent-events-card .events-filter{flex-shrink:0;gap:12px;margin-top:12px;font-size:11px}
+body[data-view=overview] #recent-events-card .events-filter select{min-height:33px;min-width:112px;padding:6px 9px;font-size:11px}
+body[data-view=overview] #recent-events-card .events-list{display:block;flex:1;min-height:0;max-height:none;margin-top:8px;overflow-y:auto}
+body[data-view=overview] #recent-events-card .event{padding:10px 0;gap:11px}
+body[data-view=overview] #recent-events-card .event:first-child{padding-top:6px}
+body[data-view=overview] #recent-events-card .event-symbol{width:29px;height:29px;font-size:13px}
+body[data-view=overview] #recent-events-card .event h3{font-size:11px;line-height:1.5}
+body[data-view=overview] #recent-events-card .event time{font-size:10px;margin-top:4px}
+body[data-view=overview] #recent-events-card .events-empty{min-height:140px;height:100%;padding:15px}
+.recent-events-link{flex-shrink:0;align-self:flex-start;margin-top:10px;padding-top:10px;font-size:11px;color:var(--teal)}
+.recent-events-link svg{width:15px;height:15px}
+@media(max-width:1140px){body[data-view=overview] #shared-history .history-events{grid-template-columns:1fr;height:auto;gap:16px}body[data-view=overview] #shared-history .history-card{height:auto;min-height:340px}body[data-view=overview] #shared-history .history-card .chart-container{flex:none;height:220px;min-height:0}body[data-view=overview] #shared-history .events-card{height:auto;min-height:280px}body[data-view=overview] #recent-events-card .events-list{flex:none;max-height:290px}body[data-view=overview] #shared-history .section-header{flex-wrap:wrap}}
+@media(max-width:600px){body[data-view=overview] .workspace{padding-top:20px;padding-bottom:20px}body[data-view=overview] #shared-history .history-card,body[data-view=overview] #shared-history .events-card{padding:18px 16px}body[data-view=overview] #shared-history .section-header h2{font-size:16px}body[data-view=overview] #shared-history .export-link{font-size:10px}body[data-view=overview] #shared-history .chart-toolbar{gap:8px;flex-wrap:wrap}body[data-view=overview] #shared-history .period-select{margin-left:auto}body[data-view=overview] #shared-history .segmented button{padding:6px 10px;font-size:10px}body[data-view=overview] #shared-history .chart-legend{margin-top:11px}body[data-view=overview] #shared-history .history-card .chart-container{height:200px}body[data-view=overview] #shared-history .chart-note{font-size:9px}}
+@media(max-height:767px) and (min-width:1141px){.energy-diagram{height:360px}body[data-view=overview] #shared-history .history-events{height:340px}}

@@ -137,7 +137,14 @@ function harness(historyOptions = {}) {
   const views = ["overview", "protection", "history", "system"];
   const nav = historyOptions.navigation ? views.map((view) => Object.assign(new Element(), { dataset: { view } })) : [];
   const pages = historyOptions.navigation ? views.map((view) => Object.assign(get(`page-${view}`), { dataset: { page: view } })) : [];
-  const shortcuts = historyOptions.navigation ? views.map((view) => Object.assign(new Element(), { dataset: { goView: view } })) : [];
+  const markupShortcuts = [...html.matchAll(/<a\b[^>]*\bdata-go-view="([^"]+)"[^>]*>/gi)].map((match) => {
+    const element = Object.assign(new Element(), { dataset: { goView: match[1] } });
+    for (const attribute of match[0].matchAll(/\s([\w:-]+)="([^"]*)"/g)) element.setAttribute(attribute[1], attribute[2]);
+    return element;
+  });
+  const shortcuts = historyOptions.navigation ? [
+    ...views.map((view) => Object.assign(new Element(), { dataset: { goView: view } })), ...markupShortcuts,
+  ] : [];
   const metrics = ["voltage", "battery", "load"].map((metric) => Object.assign(new Element(), { dataset: { metric } }));
   const windowListeners = {};
   const navigationScrolls = [];
@@ -916,6 +923,8 @@ test("exiting the monitor requires an explicit second click and never requests a
   assert.equal(ui.get("health-state-label").textContent, "Detenido");
   assert.equal(ui.get("energy-diagram").dataset.quality, "stopped");
   assert.equal(ui.get("energy-diagram").dataset.mode, "unknown");
+  assert.equal(ui.get("energy-diagram").dataset.inputActive, "false");
+  assert.equal(ui.get("energy-diagram").dataset.outputPowered, "false");
   assert.match(ui.get("service-notice").textContent, /se detuvo por tu solicitud/);
   assert.match(ui.get("health-message").textContent, /Detuviste Elipro/);
   assert.equal(ui.get("connection-badge").lastElementChild.textContent, "Elipro detenido");
@@ -1167,6 +1176,24 @@ test("section shortcuts and keyboard navigation are accessible and do not submit
   assert.equal(ui.calls.some((call) => call.options.method === "POST"), false);
 });
 
+test("the compact Resumen hides its intro and its real full-register link opens Historial", async () => {
+  const { ui } = await currentUi({}, { navigation: true });
+  assert.equal(ui.get("view-description").hidden, true);
+  assert.equal(ui.get("view-description").textContent, "");
+  const link = ui.shortcuts.find((item) => item.dataset.goView === "history" && item.getAttribute("href") === "#historial");
+  assert.ok(link, "Resumen must offer a real link to the full register");
+  const previousCalls = ui.calls.length;
+  link.emit("click");
+  assert.equal(ui.get("view-title").textContent, "Historial");
+  assert.equal(ui.location.hash, "historial");
+  assert.equal(ui.get("page-title").focused, true);
+  assert.equal(ui.calls.length, previousCalls + 1);
+  assert.equal(recordCalls(ui).length, 1);
+  answerRecords(ui);
+  await flush();
+  assert.equal(ui.calls.some((call) => call.options.method === "POST"), false);
+});
+
 test("moving between sections resets long-page scroll while keeping the new heading focusable", () => {
   const ui = harness({ navigation: true });
   assert.equal(ui.navigationScrolls.length, 0);
@@ -1382,13 +1409,14 @@ test("connection point keeps an accessible state for fresh, stale and disconnect
     data.connection.state = state;
     ui.calls.at(-1).respond(data);
     await flush();
-    assert.equal(ui.get("connection-badge").className, `connection-indicator ${state}`);
+    assert.equal(ui.get("connection-badge").className, `connection-indicator ups-power-indicator ${state}`);
     assert.equal(ui.get("connection-badge").title, label);
     assert.equal(ui.get("connection-badge").lastElementChild.textContent, label);
   }
   assert.equal(ui.get("connection-badge").getAttribute("role"), "status");
-  const model = html.match(/<div class="diagram-model">([\s\S]*?)<\/div>/)?.[1];
-  assert.ok(model?.includes('id="connection-badge"') && model.includes("FORZA NT-2402PRO"));
+  const indicator = html.match(/<span\b[^>]*id="connection-badge"[^>]*>([\s\S]*?)<\/svg>/)?.[1];
+  assert.match(indicator || "", /<svg\b[^>]*aria-hidden="true"/);
+  assert.equal(ui.get("connection-badge").getAttribute("role"), "status");
   assert.match(html, /class="sr-only">Conectando/);
 });
 
@@ -1405,9 +1433,11 @@ for (const transition of ["suspended", "resuming"]) {
     await flush();
     assert.equal(ui.get("energy-diagram").dataset.quality, transition);
     assert.equal(ui.get("energy-diagram").dataset.mode, "unknown");
+    assert.equal(ui.get("energy-diagram").dataset.inputActive, "false");
+    assert.equal(ui.get("energy-diagram").dataset.outputPowered, "false");
     assert.equal(ui.get("input-voltage").textContent, "—");
     assert.equal(ui.get("critical-dialog").open, false);
-    assert.equal(ui.get("connection-badge").className, `connection-indicator ${transition}`);
+    assert.equal(ui.get("connection-badge").className, `connection-indicator ups-power-indicator ${transition}`);
     assert.equal(ui.get("connection-badge").lastElementChild.textContent,
       transition === "suspended" ? "Lecturas en pausa por Windows" : "Reanudando lectura del UPS");
     assert.equal(ui.get("connection-notice").hidden, false);
@@ -1572,24 +1602,112 @@ test("the shared chart uses its mobile width for readable axes and correctly pos
   assert.equal(ui.get("chart-tooltip").hidden, true);
 });
 
-test("energy flow follows fresh line, AVR, battery and fault telemetry without claiming unknown modes", async () => {
+test("energy flow follows confirmed source and measured voltage without inventing unknown supply", async () => {
   const { ui, data } = await currentUi();
   const diagram = ui.get("energy-diagram");
   assert.equal(diagram.dataset.mode, "line");
   assert.equal(diagram.dataset.quality, "live");
-  for (const [changes, mode] of [
-    [{ on_battery: false, raw_status: "AVR mode" }, "line"],
-    [{ on_battery: true, raw_status: "Battery mode", input_voltage: 0 }, "battery"],
-    [{ on_battery: null, raw_status: "Fault mode", fault: true }, "fault"],
-    [{ on_battery: null, raw_status: "Unrecognized mode", fault: false }, "unknown"],
+  assert.equal(diagram.dataset.inputActive, "true");
+  assert.equal(diagram.dataset.outputPowered, "true");
+  for (const [changes, mode, input, output] of [
+    [{ on_battery: false, raw_status: "AVR mode" }, "line", true, true],
+    [{ on_battery: true, raw_status: "Battery mode", input_voltage: 0 }, "battery", false, true],
+    [{ on_battery: true, raw_status: "Battery mode", input_voltage: 220 }, "battery", false, true],
+    [{ on_battery: false, fault: true, raw_status: "Fault mode" }, "fault", false, false],
+    [{ on_battery: null, raw_status: "Unrecognized mode", fault: false }, "unknown", false, false],
   ]) {
     data.sample = liveSample(changes, ui.now());
     await pushStatus(ui, data);
     assert.equal(diagram.dataset.mode, mode);
     assert.equal(diagram.dataset.quality, "live");
+    assert.equal(diagram.dataset.inputActive, String(input));
+    assert.equal(diagram.dataset.outputPowered, String(output));
   }
   assert.equal(ui.calls.some((call) => call.options.method === "POST"), false);
   assert.doesNotMatch(html, /class="power-card\b|id="battery-tag"/);
+});
+
+test("a live source does not claim energized output without positive output voltage", async () => {
+  const { ui, data } = await currentUi();
+  const diagram = ui.get("energy-diagram");
+  for (const onBattery of [false, true]) {
+    for (const voltage of [0, null, undefined, NaN]) {
+      data.sample = liveSample({ on_battery: onBattery, output_voltage: voltage }, ui.now());
+      await pushStatus(ui, data);
+      assert.equal(diagram.dataset.outputPowered, "false");
+      assert.equal(ui.get("battery-flow-note").hidden, true);
+      assert.doesNotMatch(ui.get("power-detail").textContent, /Tus equipos reciben energía|está alimentando tus equipos/);
+      if (onBattery) assert.equal(ui.get("power-state").textContent, "Funcionando con batería");
+    }
+  }
+  data.sample = liveSample({ load_percent: 0, output_voltage: 220 }, ui.now());
+  await pushStatus(ui, data);
+  assert.equal(diagram.dataset.inputActive, "true");
+  assert.equal(diagram.dataset.outputPowered, "true", "zero load does not invalidate measured energized output");
+  assert.equal(ui.get("load-percent").textContent, "0");
+});
+
+test("losing the monitor clears active streams and supply notes until fresh confirmation returns", async () => {
+  const { ui, data } = await currentUi({ on_battery: true, input_voltage: 0 });
+  assert.equal(ui.get("energy-diagram").dataset.outputPowered, "true");
+  assert.equal(ui.get("battery-flow-note").hidden, false);
+  assert.equal(ui.get("input-supply-note").hidden, false);
+  ui.poll();
+  ui.calls.at(-1).reject(new TypeError("offline"));
+  await flush();
+  assert.equal(ui.get("energy-diagram").dataset.quality, "disconnected");
+  assert.equal(ui.get("energy-diagram").dataset.inputActive, "false");
+  assert.equal(ui.get("energy-diagram").dataset.outputPowered, "false");
+  assert.equal(ui.get("battery-flow-note").hidden, true);
+  assert.equal(ui.get("input-supply-note").hidden, true);
+  assert.equal(ui.get("input-supply-note").textContent, "");
+  data.sample = liveSample({}, ui.now());
+  await pushStatus(ui, data);
+  assert.equal(ui.get("energy-diagram").dataset.inputActive, "true");
+  assert.equal(ui.get("energy-diagram").dataset.outputPowered, "true");
+  assert.equal(ui.get("battery-flow-note").hidden, true);
+  assert.equal(ui.get("input-supply-note").hidden, true);
+});
+
+test("mains input motion needs a positive input reading and battery notes never invent missing zeroes", async () => {
+  const { ui, data } = await currentUi();
+  const diagram = ui.get("energy-diagram");
+  for (const [voltage, state] of [[0, "Entrada de red sin tensión"], [null, "Entrada de red sin confirmar"], [undefined, "Entrada de red sin confirmar"], [NaN, "Entrada de red sin confirmar"]]) {
+    data.sample = liveSample({ input_voltage: voltage }, ui.now());
+    await pushStatus(ui, data);
+    assert.equal(diagram.dataset.mode, "line");
+    assert.equal(diagram.dataset.inputActive, "false");
+    assert.equal(diagram.dataset.outputPowered, "true");
+    assert.equal(ui.get("power-state").textContent, state);
+    assert.equal(ui.get("input-supply-note").hidden, true);
+    assert.equal(ui.get("input-supply-note").textContent, "");
+  }
+  for (const [voltage, absent] of [[0, true], [null, false], [undefined, false], [220, false]]) {
+    data.sample = liveSample({ on_battery: true, input_voltage: voltage }, ui.now());
+    await pushStatus(ui, data);
+    assert.equal(diagram.dataset.inputActive, "false");
+    assert.equal(ui.get("input-supply-note").hidden, !absent);
+    assert.equal(ui.get("input-supply-note").textContent, absent ? "Sin red" : "");
+    assert.equal(ui.get("battery-flow-note").hidden, false);
+    assert.match(ui.get("battery-flow-note").textContent, /En uso/);
+  }
+});
+
+test("battery estimates change the labelled meter without claiming charging or battery supply", async () => {
+  const { ui, data } = await currentUi({ battery_percent: null, battery_percent_estimate: 5, battery_estimate_method: "fixture" });
+  assert.equal(ui.get("battery-note").textContent, "Carga estimada");
+  assert.equal(ui.get("battery-runtime").hidden, true);
+  assert.equal(ui.get("battery-flow-note").hidden, true);
+  assert.equal(ui.get("energy-diagram").dataset.mode, "line");
+  assert.equal(ui.get("energy-diagram").dataset.inputActive, "true");
+  assert.equal(ui.get("critical-dialog").open, false);
+  data.sample = liveSample({ on_battery: null, battery_percent_estimate: 90, battery_estimate_method: "fixture" }, ui.now());
+  await pushStatus(ui, data);
+  assert.equal(ui.get("energy-diagram").dataset.mode, "unknown");
+  assert.equal(ui.get("energy-diagram").dataset.inputActive, "false");
+  assert.equal(ui.get("energy-diagram").dataset.outputPowered, "false");
+  assert.equal(ui.get("battery-flow-note").hidden, true);
+  assert.equal(ui.get("battery-runtime").hidden, true);
 });
 
 test("diagram quality distinguishes unconfirmed, stale and disconnected readings and recovers", async () => {
@@ -1604,6 +1722,8 @@ test("diagram quality distinguishes unconfirmed, stale and disconnected readings
     await pushStatus(ui, data);
     assert.equal(ui.get("energy-diagram").dataset.mode, "unknown");
     assert.equal(ui.get("energy-diagram").dataset.quality, state);
+    assert.equal(ui.get("energy-diagram").dataset.inputActive, "false");
+    assert.equal(ui.get("energy-diagram").dataset.outputPowered, "false");
     assert.equal(ui.get("input-voltage").textContent, "—");
   }
   data.connection.state = "connected";
@@ -1632,11 +1752,17 @@ test("a displayed sample expires after fifteen seconds even without another fetc
   assert.equal(ui.calls.length, fetches);
   assert.equal(ui.get("energy-diagram").dataset.mode, "unknown");
   assert.equal(ui.get("energy-diagram").dataset.quality, "stale");
+  assert.equal(ui.get("energy-diagram").dataset.inputActive, "false");
+  assert.equal(ui.get("energy-diagram").dataset.outputPowered, "false");
+  assert.equal(ui.get("battery-flow-note").hidden, true);
+  assert.equal(ui.get("input-supply-note").hidden, true);
   assert.equal(ui.get("battery-percent").textContent, "—");
   assert.equal(ui.get("load-percent").textContent, "—");
   data.sample = liveSample({ battery_percent: 79 }, ui.now());
   await pushStatus(ui, data);
   assert.equal(ui.get("energy-diagram").dataset.quality, "live");
+  assert.equal(ui.get("energy-diagram").dataset.inputActive, "true");
+  assert.equal(ui.get("energy-diagram").dataset.outputPowered, "true");
   assert.equal(ui.get("battery-percent").textContent, "79");
 });
 
