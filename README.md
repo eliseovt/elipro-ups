@@ -79,6 +79,8 @@ Requisitos: Windows x64, Python 3.10 o posterior y el cable USB de datos del UPS
 
 Antes de usar USB directo, cierra el lector original de ForzaTracker para que un solo programa acceda al UPS. Elipro no sustituye el controlador HID de Windows.
 
+El lector distingue una respuesta reconocida de ForzaTracker de una comprobación inconclusa. Ante incertidumbre hace hasta tres intentos breves antes de registrar el problema; solo abre el USB cuando confirma que el puerto local del colector está cerrado. Una comprobación inconclusa persistente conserva el bloqueo y su aviso, sin afirmar que ForzaTracker esté activo.
+
 Desde PowerShell, en la carpeta del proyecto:
 
 ```powershell
