@@ -517,433 +517,383 @@ test("a stopped supervisor never appears as a healthy supervised monitor", async
   assert.equal(ui.get("connection-badge").lastElementChild.textContent, "UPS conectado");
 });
 
-const incidentRows = (ui) => ui.get("incidents-body").children.filter((row) => row.className?.split(" ").includes("incident-row"));
-const incidentDetails = (ui) => ui.get("incidents-body").children.filter((row) => row.className === "incident-detail-row");
+const recordRows = (ui) => ui.get("records-body").children.filter((row) => row.children.length === 6);
+const recordDetails = (ui) => ui.get("records-body").children.filter((row) => row.children.length === 1 && row.children[0].colSpan === 6);
 const queryParams = (call) => new URLSearchParams(call.url.split("?")[1]);
-const recordCalls = (ui, prefix) => ui.calls.filter((call) => call.url.startsWith(prefix));
-const lastRecordCall = (ui, prefix) => recordCalls(ui, prefix).at(-1);
-const emptyIncidents = () => ({ incidents: [], total: 0, next_cursor: null });
-const emptyEvents = () => ({ events: [], total: 0, next_cursor: null });
-function answerRecords(ui, incidents = emptyIncidents(), events = emptyEvents()) {
-  lastRecordCall(ui, "/api/incidents?").respond(incidents);
-  lastRecordCall(ui, "/api/events/search?").respond(events);
+const recordCalls = (ui, prefix = "/api/records?") => ui.calls.filter((call) => call.url.startsWith(prefix));
+const lastRecordCall = (ui, prefix = "/api/records?") => recordCalls(ui, prefix).at(-1);
+const emptyRecords = () => ({ records: [], total: 0, next_cursor: null });
+const incidentRecord = (changes = {}) => ({
+  id: "power:1", record_type: "incident", type: "power", category: "power",
+  timestamp: "2026-10-17T15:00:00Z", started_at: "2026-10-17T15:00:00Z",
+  ended_at: "2026-10-17T15:00:10Z", start_known: true, status: "recovered",
+  duration_seconds: 10, action_result: "none", description: "Corte registrado",
+  message: "Corte registrado", recovery_message: "Electricidad recuperada", actions: [], events: [], ...changes,
+});
+const eventRecord = (changes = {}) => ({
+  id: "event:2", record_type: "event", type: "battery_low", category: "alerts",
+  timestamp: "2026-10-17T15:00:00Z", description: "Batería baja registrada",
+  message: "Batería baja registrada", status: null, duration_seconds: null,
+  events: [{ id: 2, kind: "battery_low", timestamp: "2026-10-17T15:00:00Z", message: "Batería baja registrada" }],
+  ...changes,
+});
+function answerRecords(ui, data = emptyRecords()) {
+  lastRecordCall(ui).respond(data);
 }
-async function enterHistory(ui, incidents = emptyIncidents(), events = emptyEvents()) {
+async function enterHistory(ui, data = emptyRecords()) {
   ui.open("history");
-  answerRecords(ui, incidents, events);
+  answerRecords(ui, data);
   await flush();
 }
 
-test("shared dates query both tables in ISO and leave chart period and protection unchanged", async () => {
+test("one Registro request applies dates, category and message without changing chart period or protection", async () => {
   const ui = await connected();
   ui.get("history-period").value = "168";
   ui.get("records-from").value = "2026-10-17T10:00";
   ui.get("records-to").value = "2026-10-17T12:00";
+  ui.get("event-kind").value = "alerts";
+  ui.get("event-search").value = " <dato> literal ";
+  const before = ui.calls.length, chartRequests = ui.historyCalls.length;
   const pending = ui.get("records-form").emit("submit");
-  const incidentCall = lastRecordCall(ui, "/api/incidents?");
-  const eventCall = lastRecordCall(ui, "/api/events/search?");
-  const incidentParams = queryParams(incidentCall), eventParams = queryParams(eventCall);
-  for (const params of [incidentParams, eventParams]) {
-    assert.equal(params.get("from"), new Date("2026-10-17T10:00").toISOString());
-    assert.equal(params.get("to"), new Date("2026-10-17T12:00").toISOString());
-    assert.equal(params.has("cursor"), false);
-  }
-  assert.equal(incidentParams.has("q"), false);
-  assert.equal(incidentParams.get("sort"), "started_at");
-  assert.equal(incidentParams.get("direction"), "desc");
-  incidentCall.respond({ incidents: [{ id: "power:1", type: "power", status: "recovered",
-    started_at: "2026-10-17T15:00:00Z", ended_at: "2026-10-17T15:00:10Z", duration_seconds: 10,
-    message: "<dato> literal", actions: [], start_known: true }], total: 1, next_cursor: null });
-  eventCall.respond({ events: [{ id: 2, kind: "battery_low", timestamp: "2026-10-17T15:00:00Z", message: "<dato> literal" }], total: 1, next_cursor: null });
+  const call = lastRecordCall(ui), params = queryParams(call);
+  assert.equal(ui.calls.length, before + 1);
+  assert.equal(params.get("from"), new Date("2026-10-17T10:00").toISOString());
+  assert.equal(params.get("to"), new Date("2026-10-17T12:00").toISOString());
+  assert.equal(params.get("q"), "<dato> literal");
+  assert.equal(params.get("kind"), "alerts");
+  assert.equal(params.has("cursor"), false);
+  assert.equal(params.has("sort"), false);
+  assert.equal(params.has("direction"), false);
+  assert.equal(ui.get("records-list").getAttribute("aria-busy"), "true");
+  call.respond({ records: [
+    incidentRecord({ message: "<dato> literal", description: "<dato> literal" }),
+    eventRecord({ message: "<dato> literal", description: "<dato> literal" }),
+  ], total: 2, next_cursor: null });
   await pending;
-  const row = incidentRows(ui)[0], details = incidentDetails(ui)[0];
-  assert.equal(row.children[0].textContent, "Corte eléctrico");
-  assert.equal(row.children[1].textContent, "Recuperado");
-  assert.equal(row.children[4].textContent, "10 s");
-  assert.equal(row.children[5].textContent, "Sin acciones");
-  assert.equal(details.hidden, true);
-  assert.match(textOf(details), /Duración detectada: 10 s/);
-  assert.match(textOf(details), /Inicio: <dato> literal/);
-  const button = row.children[6].children[0];
-  assert.equal(button.getAttribute("aria-controls"), details.id);
-  button.emit("click");
-  assert.equal(details.hidden, false);
-  assert.equal(button.getAttribute("aria-expanded"), "true");
-  button.emit("click");
-  assert.equal(details.hidden, true);
-  const event = ui.get("archive-list").children[0];
-  assert.equal(event.children.length, 3);
-  assert.equal(event.children[1].textContent, "Batería baja del UPS");
-  assert.equal(event.children[2].textContent, "<dato> literal");
-  assert.match(ui.get("archive-count").textContent, /1/);
+  const rows = recordRows(ui), details = recordDetails(ui);
+  assert.equal(rows.length, 2);
+  assert.equal(rows[0].children.length, 6);
+  assert.equal(rows[0].children[1].textContent, "Corte eléctrico");
+  assert.match(textOf(rows[0].children[2]), /<dato> literal/);
+  assert.equal(rows[0].children[3].textContent, "Recuperado");
+  assert.equal(rows[0].children[4].textContent, "10 s");
+  assert.equal(rows[1].children[1].textContent, "Batería baja");
+  assert.match(textOf(rows[1].children[2]), /<dato> literal/);
+  assert.doesNotMatch(rows[1].children[3].textContent, /Recuperado|Sin recuperación/);
+  assert.equal(details.length, 2);
+  assert.equal(ui.get("records-list").getAttribute("aria-busy"), "false");
+  assert.match(ui.get("records-count").textContent, /2/);
   assert.equal(ui.get("history-period").value, "168");
+  assert.equal(ui.historyCalls.length, chartRequests);
   assert.equal(ui.get("policy-enabled").checked, false);
-  assert.equal(ui.calls.some((call) => call.options.method === "POST"), false);
+  assert.equal(ui.calls.some((entry) => entry.options.method === "POST"), false);
+  assert.equal(ui.calls.some((entry) => /\/api\/incidents|\/api\/events\/search/.test(entry.url)), false);
 });
 
-test("table query failures stay local without changing live UPS or notice availability", async () => {
+test("Registro failures remain local and can recover without disabling live UPS or notices", async () => {
   const ui = await connected();
   const pending = ui.get("records-form").emit("submit");
-  lastRecordCall(ui, "/api/incidents?").respond({ error: "Historial ocupado" }, false);
-  lastRecordCall(ui, "/api/events/search?").respond({ error: "No se pudo consultar" }, false);
+  lastRecordCall(ui).respond({ error: "Historial ocupado" }, false);
   await pending;
-  assert.match(ui.get("incidents-error").textContent, /Historial ocupado/);
-  assert.equal(ui.get("archive-error").hidden, false);
+  assert.match(ui.get("records-error").textContent, /Historial ocupado/);
   assert.equal(ui.get("service-notice").hidden, true);
-  assert.equal(ui.get("connection-badge").lastElementChild.textContent, "UPS conectado");
   assert.equal(ui.get("test-notifications").disabled, false);
-});
-
-test("historical incidents without recovery do not claim a current outage", async () => {
-  const ui = await connected();
-  const pending = ui.get("records-form").emit("submit");
-  answerRecords(ui, { incidents: ["power", "communication"].map((type, index) => ({ id: `${type}:${index}`, type, status: "open", actions: [] })), total: 2 });
-  await pending;
-  for (const row of incidentRows(ui)) assert.equal(row.children[1].textContent, "Sin recuperación registrada");
-  assert.match(textOf(incidentDetails(ui)[0]), /no confirma que el UPS siga en batería/);
-  assert.match(textOf(incidentDetails(ui)[1]), /no confirma que siga habiendo un problema/);
-  assert.equal(ui.get("connection-badge").lastElementChild.textContent, "UPS conectado");
-});
-
-test("incident and event pages use independent cursors and deduplicate repeated rows", async () => {
-  const ui = await connected();
-  const first = ui.get("records-form").emit("submit");
-  answerRecords(ui,
-    { incidents: [{ id: "usb:1", type: "communication", status: "open", actions: [] }], total: 2, next_cursor: "inc-next" },
-    { events: [{ id: 5, kind: "connection_lost", message: "USB desconectado" }], total: 2, next_cursor: "ev-next" });
-  await first;
-  assert.equal(ui.get("more-incidents").hidden, false);
-  assert.equal(ui.get("more-events").hidden, false);
-  const incidents = ui.get("more-incidents").emit("click");
-  let call = lastRecordCall(ui, "/api/incidents?");
-  assert.equal(queryParams(call).get("cursor"), "inc-next");
-  call.respond({ incidents: [{ id: "usb:1", type: "communication", actions: [] }, { id: "power:2", type: "power", actions: [] }], total: 2, next_cursor: null });
-  await incidents;
-  assert.equal(incidentRows(ui).length, 2);
-  const events = ui.get("more-events").emit("click");
-  call = lastRecordCall(ui, "/api/events/search?");
-  assert.equal(queryParams(call).get("cursor"), "ev-next");
-  call.respond({ events: [{ id: 5 }, { id: 4, message: "Evento anterior" }], total: 2, next_cursor: null });
-  await events;
-  assert.equal(ui.get("archive-list").children.length, 2);
-  assert.equal(ui.get("more-incidents").hidden, true);
-  assert.equal(ui.get("more-events").hidden, true);
-});
-
-test("applying newer common dates discards late pages in both tables and reloads only the latest range", async () => {
-  const ui = await connected();
-  ui.get("records-from").value = "2026-10-15T08:00";
-  const first = ui.get("records-form").emit("submit");
-  const oldIncidents = lastRecordCall(ui, "/api/incidents?"), oldEvents = lastRecordCall(ui, "/api/events/search?");
-  ui.get("records-from").value = "2026-10-16T08:00";
-  await ui.get("records-form").emit("submit");
-  ui.get("records-from").value = "2026-10-17T08:00";
-  await ui.get("records-form").emit("submit");
-  oldIncidents.respond({ incidents: [{ id: "old", message: "Obsoleto", duration_seconds: 999 }], total: 1, next_cursor: "old-i" });
-  oldEvents.respond({ events: [{ id: 9, message: "Obsoleto" }], total: 1, next_cursor: "old-e" });
-  await first;
-  await flush();
-  for (const prefix of ["/api/incidents?", "/api/events/search?"]) {
-    const call = lastRecordCall(ui, prefix), params = queryParams(call);
-    assert.equal(params.get("from"), new Date("2026-10-17T08:00").toISOString());
-    assert.equal(params.has("cursor"), false);
-    assert.equal(recordCalls(ui, prefix).length, 2);
-  }
-  assert.doesNotMatch(textOf(ui.get("incidents-body")), /999|Obsoleto/);
-  assert.doesNotMatch(textOf(ui.get("archive-list")), /Obsoleto/);
-  answerRecords(ui, emptyIncidents(), { events: [{ id: 10, message: "Nuevo" }], total: 1 });
-  await flush();
-  assert.equal(ui.get("archive-list").children[0].children[2].textContent, "Nuevo");
-});
-
-test("a failed new date range cannot restore cursors or rows from the previous interval", async () => {
-  const ui = await connected();
-  ui.get("records-from").value = "2026-10-16T08:00";
-  const first = ui.get("records-form").emit("submit");
-  answerRecords(ui,
-    { incidents: [{ id: "old:1", type: "power", message: "Intervalo anterior" }], total: 2, next_cursor: "old-i" },
-    { events: [{ id: 1, message: "Intervalo anterior" }], total: 2, next_cursor: "old-e" });
-  await first;
-  ui.get("records-from").value = "2026-10-17T08:00";
-  const next = ui.get("records-form").emit("submit");
-  for (const prefix of ["/api/incidents?", "/api/events/search?"]) {
-    const call = lastRecordCall(ui, prefix);
-    assert.equal(queryParams(call).has("cursor"), false);
-    call.respond({ error: "Historial ocupado" }, false);
-  }
-  await next;
-  assert.equal(ui.get("more-incidents").hidden, true);
-  assert.equal(ui.get("more-events").hidden, true);
-  assert.doesNotMatch(textOf(ui.get("incidents-body")), /Intervalo anterior/);
-  assert.doesNotMatch(textOf(ui.get("archive-list")), /Intervalo anterior/);
+  assert.equal(ui.get("policy-enabled").checked, false);
   const retry = ui.get("records-form").emit("submit");
-  for (const prefix of ["/api/incidents?", "/api/events/search?"]) {
-    const params = queryParams(lastRecordCall(ui, prefix));
-    assert.equal(params.get("from"), new Date("2026-10-17T08:00").toISOString());
-    assert.equal(params.has("cursor"), false);
-  }
   answerRecords(ui);
   await retry;
-  assert.equal(ui.get("incidents-error").hidden, true);
-  assert.equal(ui.get("archive-error").hidden, true);
+  assert.equal(ui.get("records-error").hidden, true);
+  assert.equal(recordRows(ui).length, 0);
+  assert.match(textOf(ui.get("records-body")), /No hay|Sin registros/);
+});
+
+test("open historical incidents stay historical and independent events do not invent an incident state", async () => {
+  const ui = await connected();
+  const pending = ui.get("records-form").emit("submit");
+  answerRecords(ui, { records: [
+    incidentRecord({ status: "open", ended_at: null, duration_seconds: null }),
+    incidentRecord({ id: "communication:3", type: "communication", category: "connection",
+      status: "open", ended_at: null, duration_seconds: null }),
+    eventRecord(),
+  ], total: 3, next_cursor: null });
+  await pending;
+  assert.equal(recordRows(ui).length, 3);
+  for (const detail of recordDetails(ui).slice(0, 2)) {
+    assert.match(textOf(detail), /no confirma.*problema continúe/);
+    assert.match(textOf(detail), /Consulta Resumen/);
+  }
+  assert.doesNotMatch(recordRows(ui)[2].children[3].textContent, /Recuperado|Sin recuperación/);
+  assert.equal(ui.get("protection-alert").hidden, true);
+  assert.equal(ui.get("critical-dialog").open, false);
+});
+
+test("mixed records paginate with one cursor, deduplicate record IDs and keep applied filters despite drafts", async () => {
+  const ui = await connected();
+  ui.get("records-from").value = "2026-10-16T08:00";
+  ui.get("event-kind").value = "protection";
+  ui.get("event-search").value = "cancelada";
+  const first = ui.get("records-form").emit("submit");
+  answerRecords(ui, { records: [incidentRecord()], total: 3, next_cursor: "records-page-2" });
+  await first;
+  ui.get("records-from").value = "2026-10-17T09:00";
+  ui.get("event-kind").value = "alerts";
+  ui.get("event-search").value = "borrador";
+  const more = ui.get("more-records").emit("click");
+  const call = lastRecordCall(ui), params = queryParams(call);
+  assert.equal(params.get("cursor"), "records-page-2");
+  assert.equal(params.get("from"), new Date("2026-10-16T08:00").toISOString());
+  assert.equal(params.get("kind"), "protection");
+  assert.equal(params.get("q"), "cancelada");
+  call.respond({ records: [incidentRecord(), eventRecord(), eventRecord({ id: "event:4" })],
+    total: 3, next_cursor: null });
+  await more;
+  assert.equal(recordRows(ui).length, 3);
+  assert.equal(recordDetails(ui).length, 3);
+  assert.equal(ui.get("more-records").hidden, true);
+  assert.match(ui.get("records-count").textContent, /3/);
+});
+
+for (const outcome of ["success", "error"]) {
+  test("a newer unified query discards an obsolete " + outcome + " and reloads only the latest submitted filters", async () => {
+    const ui = await connected();
+    ui.get("records-from").value = "2026-10-15T08:00";
+    const first = ui.get("records-form").emit("submit"), obsolete = lastRecordCall(ui);
+    ui.get("records-from").value = "2026-10-16T08:00";
+    ui.get("event-kind").value = "connection";
+    await ui.get("records-form").emit("submit");
+    ui.get("records-from").value = "2026-10-17T08:00";
+    ui.get("event-kind").value = "settings";
+    ui.get("event-search").value = "nuevo";
+    await ui.get("records-form").emit("submit");
+    assert.equal(recordCalls(ui).length, 1);
+    if (outcome === "success") {
+      obsolete.respond({ records: [eventRecord({ message: "Obsoleto", description: "Obsoleto" })], total: 1, next_cursor: "old" });
+    } else {
+      obsolete.respond({ error: "Error obsoleto" }, false);
+    }
+    await first;
+    await flush();
+    assert.equal(recordCalls(ui).length, 2);
+    const latest = lastRecordCall(ui), params = queryParams(latest);
+    assert.equal(params.get("from"), new Date("2026-10-17T08:00").toISOString());
+    assert.equal(params.get("kind"), "settings");
+    assert.equal(params.get("q"), "nuevo");
+    assert.equal(params.has("cursor"), false);
+    assert.doesNotMatch(textOf(ui.get("records-body")), /Obsoleto/);
+    assert.doesNotMatch(ui.get("records-error").textContent, /Error obsoleto/);
+    latest.respond({ records: [eventRecord({ message: "Nuevo", description: "Nuevo" })], total: 1, next_cursor: null });
+    await flush();
+    assert.match(textOf(recordRows(ui)[0].children[2]), /Nuevo/);
+    assert.equal(ui.get("records-error").hidden, true);
+  });
+}
+
+test("a failed changed filter cannot restore rows or pagination from the previous query", async () => {
+  const ui = await connected();
+  ui.get("records-from").value = "2026-10-16T08:00";
+  const first = ui.get("records-form").emit("submit");
+  answerRecords(ui, { records: [incidentRecord({ message: "Consulta anterior", description: "Consulta anterior" })],
+    total: 2, next_cursor: "old-page" });
+  await first;
+  ui.get("event-kind").value = "other";
+  ui.get("event-search").value = "consulta nueva";
+  const next = ui.get("records-form").emit("submit"), failed = lastRecordCall(ui);
+  assert.equal(queryParams(failed).has("cursor"), false);
+  failed.respond({ error: "Historial ocupado" }, false);
+  await next;
+  assert.equal(ui.get("more-records").hidden, true);
+  assert.doesNotMatch(textOf(ui.get("records-body")), /Consulta anterior/);
+  const retry = ui.get("records-form").emit("submit");
+  const params = queryParams(lastRecordCall(ui));
+  assert.equal(params.get("from"), new Date("2026-10-16T08:00").toISOString());
+  assert.equal(params.get("kind"), "other");
+  assert.equal(params.get("q"), "consulta nueva");
+  assert.equal(params.has("cursor"), false);
+  answerRecords(ui);
+  await retry;
+  assert.equal(ui.get("records-error").hidden, true);
   assert.equal(ui.get("service-notice").hidden, true);
 });
 
-test("message searches use applied dates, leave incidents alone and ignore newer date drafts", async () => {
+test("date, category and message drafts do not query until the single Registro form is submitted", async () => {
   const ui = await connected();
-  ui.get("records-from").value = "2026-10-16T08:00";
-  const first = ui.get("records-form").emit("submit");
+  const before = ui.calls.length;
+  ui.get("records-from").value = "2026-10-17T08:00";
+  ui.get("records-to").value = "2026-10-18T08:00";
+  ui.get("event-kind").value = "power";
+  ui.get("event-search").value = "corte";
+  ui.get("records-form").emit("input");
+  ui.get("event-kind").emit("change");
+  ui.get("event-search").emit("input");
+  assert.equal(ui.calls.length, before);
+  const pending = ui.get("records-form").emit("submit"), params = queryParams(lastRecordCall(ui));
+  assert.equal(ui.calls.length, before + 1);
+  assert.equal(params.get("kind"), "power");
+  assert.equal(params.get("q"), "corte");
+  assert.equal(params.get("to"), new Date("2026-10-18T08:00").toISOString());
   answerRecords(ui);
-  await first;
-  const incidentCount = recordCalls(ui, "/api/incidents?").length;
-  ui.get("records-from").value = "2026-10-17T09:00";
-  ui.get("event-search").value = " batería <dato> ";
-  ui.get("event-kind").value = "battery_low";
-  const search = ui.get("event-search-form").emit("submit");
-  const call = lastRecordCall(ui, "/api/events/search?"), params = queryParams(call);
-  assert.equal(params.get("from"), new Date("2026-10-16T08:00").toISOString());
-  assert.equal(params.get("q"), "batería <dato>");
-  assert.equal(params.get("kind"), "battery_low");
-  assert.equal(params.has("cursor"), false);
-  assert.equal(recordCalls(ui, "/api/incidents?").length, incidentCount);
-  call.respond({ events: [{ id: 2, message: "Coincidencia" }], total: 2, next_cursor: "search-page" });
-  await search;
-  ui.get("event-search").value = "borrador";
-  ui.get("event-kind").value = "power_lost";
-  const more = ui.get("more-events").emit("click");
-  const page = lastRecordCall(ui, "/api/events/search?"), pageParams = queryParams(page);
-  assert.equal(pageParams.get("q"), "batería <dato>");
-  assert.equal(pageParams.get("kind"), "battery_low");
-  assert.equal(pageParams.get("from"), params.get("from"));
-  assert.equal(pageParams.get("cursor"), "search-page");
-  page.respond(emptyEvents());
-  await more;
+  await pending;
 });
 
-test("a newer event search replaces late event results without restarting incidents", async () => {
-  const ui = await connected();
-  const first = ui.get("records-form").emit("submit");
-  const incidents = lastRecordCall(ui, "/api/incidents?"), obsolete = lastRecordCall(ui, "/api/events/search?");
-  ui.get("event-search").value = "nuevo";
-  await ui.get("event-search-form").emit("submit");
-  incidents.respond(emptyIncidents());
-  obsolete.respond({ events: [{ id: 1, message: "Obsoleto" }], total: 1 });
-  await first;
-  await flush();
-  assert.equal(recordCalls(ui, "/api/incidents?").length, 1);
-  const latest = lastRecordCall(ui, "/api/events/search?");
-  assert.notEqual(latest, obsolete);
-  assert.equal(queryParams(latest).get("q"), "nuevo");
-  latest.respond({ events: [{ id: 2, message: "Nuevo" }], total: 1 });
-  await flush();
-  assert.equal(ui.get("archive-list").children[0].children[2].textContent, "Nuevo");
-});
-
-test("every incident column sorts through the server with applied dates and fresh pagination", async () => {
-  const ui = await connected();
-  ui.get("records-from").value = "2026-10-16T08:00";
-  ui.get("records-to").value = "2026-10-18T09:00";
-  const apply = ui.get("records-form").emit("submit");
-  answerRecords(ui);
-  await apply;
-  ui.get("records-from").value = "2026-10-17T09:00";
-  for (const key of ["type", "status", "started_at", "ended_at", "duration_seconds", "action_result"]) {
-    for (const direction of ["asc", "desc"]) {
-      const pending = ui.get(`incident-sort-${key}`).emit("click");
-      const call = lastRecordCall(ui, "/api/incidents?"), params = queryParams(call);
-      assert.equal(params.get("sort"), key);
-      assert.equal(params.get("direction"), direction);
-      assert.equal(params.get("from"), new Date("2026-10-16T08:00").toISOString());
-      assert.equal(params.get("to"), new Date("2026-10-18T09:00").toISOString());
-      assert.equal(params.has("cursor"), false);
-      assert.equal(ui.get(`incident-head-${key}`).getAttribute("aria-sort"), direction === "asc" ? "ascending" : "descending");
-      call.respond({ incidents: [], total: 0, next_cursor: `cursor-${key}-${direction}` });
-      await pending;
-    }
-  }
-  const more = ui.get("more-incidents").emit("click");
-  const call = lastRecordCall(ui, "/api/incidents?"), params = queryParams(call);
-  assert.equal(params.get("cursor"), "cursor-action_result-desc");
-  assert.equal(params.get("sort"), "action_result");
-  call.respond(emptyIncidents());
-  await more;
-});
-
-test("sorting during a date refresh retains the submitted range and discards late rows", async () => {
-  const ui = await connected();
-  ui.get("records-from").value = "2026-10-16T08:00";
-  const apply = ui.get("records-form").emit("submit");
-  const obsolete = lastRecordCall(ui, "/api/incidents?");
-  lastRecordCall(ui, "/api/events/search?").respond(emptyEvents());
-  ui.get("records-from").value = "2026-10-17T09:00";
-  await ui.get("incident-sort-duration_seconds").emit("click");
-  obsolete.respond({ incidents: [{ id: "obsolete", message: "Respuesta descartada" }], total: 1 });
-  await apply;
-  await flush();
-  const latest = lastRecordCall(ui, "/api/incidents?"), params = queryParams(latest);
-  assert.equal(params.get("from"), new Date("2026-10-16T08:00").toISOString());
-  assert.equal(params.get("sort"), "duration_seconds");
-  assert.equal(params.get("direction"), "asc");
-  assert.doesNotMatch(textOf(ui.get("incidents-body")), /Respuesta descartada/);
-  latest.respond({ incidents: [{ id: "new", type: "communication", status: "recovered" }], total: 1 });
-  await flush();
-  assert.equal(incidentRows(ui)[0].children[0].textContent, "Problema de comunicación");
-  assert.equal(ui.get("records-from").value, "2026-10-17T09:00");
-});
-
-test("a failed incident sort restores its displayed order and original cursor", async () => {
+test("expired Registro pagination retains visible rows and recovers through a fresh form submission", async () => {
   const ui = harness({ navigation: true });
   ui.calls[0].respond(snapshot());
   await flush();
-  await enterHistory(ui, { incidents: [{ id: "power:1", type: "power", duration_seconds: 8 }], total: 2, next_cursor: "valid-start-desc" });
-  const pending = ui.get("incident-sort-duration_seconds").emit("click");
-  lastRecordCall(ui, "/api/incidents?").respond({ error: "Historial temporalmente ocupado" }, false);
+  await enterHistory(ui, { records: [incidentRecord()], total: 2, next_cursor: "expired" });
+  const pending = ui.get("more-records").emit("click");
+  lastRecordCall(ui).respond({ code: "record_cursor_expired", error: "La consulta venció. Vuelve a consultar el registro." }, false);
   await pending;
-  assert.equal(ui.get("incident-head-started_at").getAttribute("aria-sort"), "descending");
-  assert.equal(ui.get("incident-head-duration_seconds").getAttribute("aria-sort"), "none");
-  assert.equal(incidentRows(ui)[0].children[4].textContent, "8 s");
-  const more = ui.get("more-incidents").emit("click");
-  const call = lastRecordCall(ui, "/api/incidents?"), params = queryParams(call);
-  assert.equal(params.get("cursor"), "valid-start-desc");
-  assert.equal(params.get("sort"), "started_at");
-  call.respond({ incidents: [{ id: "power:2", type: "power" }], total: 2 });
-  await more;
-  assert.equal(incidentRows(ui).length, 2);
-});
-
-test("an obsolete sort failure cannot roll back the latest selected order", async () => {
-  const ui = harness({ navigation: true });
-  ui.calls[0].respond(snapshot());
-  await flush();
-  await enterHistory(ui);
-  const pending = ui.get("incident-sort-duration_seconds").emit("click"), obsolete = lastRecordCall(ui, "/api/incidents?");
-  await ui.get("incident-sort-type").emit("click");
-  await ui.get("incident-sort-type").emit("click");
-  obsolete.respond({ error: "Consulta anterior fallida" }, false);
-  await pending;
-  await flush();
-  const latest = lastRecordCall(ui, "/api/incidents?");
-  assert.equal(queryParams(latest).get("sort"), "type");
-  assert.equal(queryParams(latest).get("direction"), "desc");
-  latest.respond(emptyIncidents());
-  await flush();
-  assert.equal(ui.get("incident-head-type").getAttribute("aria-sort"), "descending");
-  assert.equal(ui.get("incidents-error").hidden, true);
-});
-
-test("expired incident pages retain visible rows and recover through the shared date apply", async () => {
-  const ui = harness({ navigation: true });
-  ui.calls[0].respond(snapshot());
-  await flush();
-  await enterHistory(ui, { incidents: [{ id: "power:1", type: "power" }], total: 2, next_cursor: "expired" });
-  const pending = ui.get("more-incidents").emit("click");
-  lastRecordCall(ui, "/api/incidents?").respond({ code: "incident_cursor_expired", error: "La consulta venció. Vuelve a consultar incidentes." }, false);
-  await pending;
-  assert.equal(incidentRows(ui).length, 1);
-  assert.match(ui.get("incidents-error").textContent, /La consulta venció/);
-  assert.equal(ui.get("more-incidents").hidden, true);
+  assert.equal(recordRows(ui).length, 1);
+  assert.match(ui.get("records-error").textContent, /La consulta venció/);
+  assert.equal(ui.get("more-records").hidden, true);
   assert.equal(ui.get("apply-records").disabled, false);
   assert.equal(ui.get("service-notice").hidden, true);
   const refresh = ui.get("records-form").emit("submit");
-  assert.equal(queryParams(lastRecordCall(ui, "/api/incidents?")).has("cursor"), false);
+  assert.equal(queryParams(lastRecordCall(ui)).has("cursor"), false);
   answerRecords(ui);
   await refresh;
-  assert.equal(ui.get("incidents-error").hidden, true);
+  assert.equal(ui.get("records-error").hidden, true);
 });
 
-test("incident details preserve recovery and protection sequence as literal text", async () => {
+test("incident details preserve literal opening, recovery and protection messages with accessible disclosure", async () => {
   const ui = harness({ navigation: true });
   ui.calls[0].respond(snapshot());
   await flush();
-  await enterHistory(ui, { incidents: [{ id: "power:1", type: "power", status: "recovered", start_known: false,
-    started_at: "2026-10-17T10:00:00Z", ended_at: "2026-10-17T10:01:00Z", duration_seconds: 60,
-    action_result: "failed", message: "<inicio>", recovery_message: "<recuperado>", actions: [
-      { kind: "policy_countdown", timestamp: "2026-10-17T10:00:10Z", message: "<cuenta>" },
-      { kind: "policy_action_failed", timestamp: "2026-10-17T10:00:20Z", message: "<fallo>" },
-    ] }], total: 1 });
-  const row = incidentRows(ui)[0], detail = incidentDetails(ui)[0];
-  assert.equal(row.children[2].textContent, "Inicio no registrado");
-  assert.equal(row.children[5].textContent, "Fallida");
-  assert.match(textOf(detail), /Duración detectada desde el primer registro disponible: 1 min/);
-  assert.match(textOf(detail), /Inicio: <inicio>.*Recuperación: <recuperado>/);
-  const sequence = detail.children[0].children[0].children.at(-1);
-  assert.equal(sequence.children.length, 2);
-  assert.match(sequence.children[0].textContent, /<cuenta>$/);
-  assert.match(sequence.children[1].textContent, /<fallo>$/);
+  const actions = [
+    { id: 2, kind: "policy_countdown", timestamp: "2026-10-17T10:00:10Z", message: "<cuenta>" },
+    { id: 3, kind: "policy_action_failed", timestamp: "2026-10-17T10:00:20Z", message: "<fallo>" },
+  ];
+  await enterHistory(ui, { records: [incidentRecord({ start_known: false,
+    timestamp: "2026-10-17T10:00:00Z", started_at: "2026-10-17T10:00:00Z",
+    ended_at: "2026-10-17T10:01:00Z", duration_seconds: 60, action_result: "failed",
+    description: "<inicio>", message: "<inicio>", recovery_message: "<recuperado>", actions,
+    events: [
+      { id: 1, kind: "power_lost", timestamp: "2026-10-17T10:00:00Z", message: "<inicio>" },
+      ...actions,
+      { id: 4, kind: "power_restored", timestamp: "2026-10-17T10:01:00Z", message: "<recuperado>" },
+    ],
+  })], total: 1, next_cursor: null });
+  const row = recordRows(ui)[0], detail = recordDetails(ui)[0];
+  assert.match(textOf(row), /Inicio no registrado/);
+  assert.equal(row.children[4].textContent, "1 min");
+  assert.equal(detail.hidden, true);
+  for (const message of ["<inicio>", "<recuperado>", "<cuenta>", "<fallo>"]) assert.ok(textOf(detail).includes(message), message);
+  const button = row.children[5].children[0];
+  assert.equal(button.getAttribute("aria-expanded"), "false");
+  assert.equal(button.getAttribute("aria-controls"), detail.id);
+  button.emit("click");
+  assert.equal(detail.hidden, false);
+  assert.equal(button.getAttribute("aria-expanded"), "true");
+  button.emit("click");
+  assert.equal(detail.hidden, true);
+  assert.equal(button.getAttribute("aria-expanded"), "false");
 });
 
-test("invalid shared date drafts do not query either table or replace applied dates", async () => {
+test("frontend renders authoritative mixed rows without regrouping overlapping incident members", async () => {
+  const ui = await connected();
+  const action = { id: 7, kind: "policy_action_started", timestamp: "2026-10-17T15:00:04Z", message: "Hibernación solicitada" };
+  const pending = ui.get("records-form").emit("submit");
+  answerRecords(ui, { records: [
+    incidentRecord({ actions: [action], events: [action], action_result: "started" }),
+    incidentRecord({ id: "communication:3", type: "communication", category: "connection",
+      actions: [action], events: [action], action_result: "started" }),
+    eventRecord(),
+  ], total: 3, next_cursor: null });
+  await pending;
+  assert.equal(recordRows(ui).length, 3);
+  assert.match(textOf(recordDetails(ui)[0]), /Hibernación solicitada/);
+  assert.match(textOf(recordDetails(ui)[1]), /Hibernación solicitada/);
+  assert.equal(recordRows(ui)[2].children[1].textContent, "Batería baja");
+});
+
+test("invalid date drafts neither query nor replace the previously applied category, message and pagination", async () => {
   const ui = await connected();
   ui.get("records-from").value = "2026-10-16T08:00";
+  ui.get("event-kind").value = "protection";
+  ui.get("event-search").value = "hibernación";
   const apply = ui.get("records-form").emit("submit");
-  answerRecords(ui);
+  answerRecords(ui, { records: [incidentRecord()], total: 2, next_cursor: "valid-page" });
   await apply;
   ui.get("records-from").value = "2026-10-18T10:00";
   ui.get("records-to").value = "2026-10-17T10:00";
+  ui.get("event-kind").value = "alerts";
+  ui.get("event-search").value = "borrador";
   const before = ui.calls.length;
   await ui.get("records-form").emit("submit");
   assert.equal(ui.calls.length, before);
   assert.match(ui.get("records-feedback").textContent, /Desde debe ser anterior/);
-  const sort = ui.get("incident-sort-type").emit("click");
-  const call = lastRecordCall(ui, "/api/incidents?");
-  assert.equal(queryParams(call).get("from"), new Date("2026-10-16T08:00").toISOString());
-  call.respond(emptyIncidents());
-  await sort;
+  const more = ui.get("more-records").emit("click"), call = lastRecordCall(ui), params = queryParams(call);
+  assert.equal(params.get("from"), new Date("2026-10-16T08:00").toISOString());
+  assert.equal(params.get("kind"), "protection");
+  assert.equal(params.get("q"), "hibernación");
+  assert.equal(params.get("cursor"), "valid-page");
+  answerRecords(ui);
+  await more;
   assert.equal(ui.get("service-notice").hidden, true);
 });
 
-test("clearing dates refreshes both tables while preserving the chart period and applied event search", async () => {
+test("Limpiar resets every Registro filter and queries afresh while preserving the chart period", async () => {
   const ui = await connected();
+  ui.get("history-period").value = "168";
+  const chartRequests = ui.historyCalls.length;
   ui.get("records-from").value = "2026-10-17T10:00";
-  const apply = ui.get("records-form").emit("submit");
-  answerRecords(ui);
-  await apply;
+  ui.get("records-to").value = "2026-10-18T10:00";
   ui.get("event-search").value = "corte";
-  const search = ui.get("event-search-form").emit("submit");
-  lastRecordCall(ui, "/api/events/search?").respond(emptyEvents());
-  await search;
-  const hours = ui.get("history-period").value;
-  const clear = ui.get("clear-records").emit("click");
-  for (const prefix of ["/api/incidents?", "/api/events/search?"]) {
-    const params = queryParams(lastRecordCall(ui, prefix));
-    assert.equal(params.has("from"), false);
-    assert.equal(params.has("to"), false);
-    assert.equal(params.has("cursor"), false);
-  }
-  assert.equal(queryParams(lastRecordCall(ui, "/api/events/search?")).get("q"), "corte");
+  ui.get("event-kind").value = "power";
+  const apply = ui.get("records-form").emit("submit");
+  answerRecords(ui, { records: [incidentRecord()], total: 2, next_cursor: "old" });
+  await apply;
+  const clear = ui.get("clear-records").emit("click"), params = queryParams(lastRecordCall(ui));
+  for (const name of ["from", "to", "kind", "q", "cursor"]) assert.equal(params.has(name), false, name);
   answerRecords(ui);
   await clear;
-  assert.equal(ui.get("records-from").value, "");
-  assert.equal(ui.get("records-to").value, "");
-  assert.equal(ui.get("history-period").value, hours);
+  for (const id of ["records-from", "records-to", "event-search", "event-kind"]) assert.equal(ui.get(id).value, "", id);
+  assert.equal(ui.get("history-period").value, "168");
+  assert.equal(ui.historyCalls.length, chartRequests);
 });
 
-test("CSV export uses applied dates and message filters without pagination or newer drafts", async () => {
+test("Registro CSV export sends applied filters without pagination or newer drafts and returns the full server file", async () => {
   const ui = await connected();
   ui.get("records-from").value = "2026-10-17T10:00";
-  const apply = ui.get("records-form").emit("submit");
-  answerRecords(ui);
-  await apply;
+  ui.get("records-to").value = "2026-10-18T10:00";
   ui.get("event-search").value = "corte & retorno";
-  ui.get("event-kind").value = "power_lost";
-  const search = ui.get("event-search-form").emit("submit");
-  lastRecordCall(ui, "/api/events/search?").respond({ events: [], total: 3, next_cursor: "csv-page" });
-  await search;
+  ui.get("event-kind").value = "power";
+  const apply = ui.get("records-form").emit("submit");
+  answerRecords(ui, { records: [incidentRecord()], total: 75, next_cursor: "csv-page" });
+  await apply;
   ui.get("records-from").value = "2026-10-18T11:00";
   ui.get("event-search").value = "borrador";
-  ui.get("event-kind").value = "ups_fault";
-  const pending = ui.get("export-events").emit("click"), call = ui.calls.at(-1), params = queryParams(call);
-  assert.ok(call.url.startsWith("/api/events/export.csv?"));
+  ui.get("event-kind").value = "alerts";
+  const pending = ui.get("export-records").emit("click"), call = ui.calls.at(-1), params = queryParams(call);
+  assert.ok(call.url.startsWith("/api/records/export.csv?"));
   assert.equal(params.get("q"), "corte & retorno");
-  assert.equal(params.get("kind"), "power_lost");
+  assert.equal(params.get("kind"), "power");
   assert.equal(params.get("from"), new Date("2026-10-17T10:00").toISOString());
+  assert.equal(params.get("to"), new Date("2026-10-18T10:00").toISOString());
   assert.equal(params.has("cursor"), false);
   assert.equal(params.has("limit"), false);
-  call.respond({ error: "No se pudo exportar" }, false);
+  assert.equal(ui.get("export-records").disabled, true);
+  const file = { size: 4096, type: "text/csv", fullHistory: true };
+  call.respondBlob(file);
   await pending;
-  assert.match(ui.get("archive-summary").textContent, /No se pudo exportar/);
+  assert.equal(ui.downloads.length, 1);
+  assert.equal(ui.downloads[0], file);
+  assert.equal(ui.get("export-records").disabled, false);
+  assert.equal(recordRows(ui).length, 1);
+  assert.equal(ui.get("more-records").hidden, false);
+});
+
+test("Registro CSV failure reports locally and permits another export without affecting protection", async () => {
+  const ui = await connected();
+  const pending = ui.get("export-records").emit("click");
+  ui.calls.at(-1).respond({ error: "No se pudo exportar" }, false);
+  await pending;
+  assert.match(ui.get("records-summary").textContent, /No se pudo exportar/);
+  assert.equal(ui.get("export-records").disabled, false);
+  assert.equal(ui.downloads.length, 0);
   assert.equal(ui.get("service-notice").hidden, true);
   assert.equal(ui.get("test-notifications").disabled, false);
+  assert.equal(ui.get("policy-enabled").checked, false);
 });
 
 test("exiting the monitor requires an explicit second click and never requests a Windows action", async () => {
@@ -1058,7 +1008,7 @@ test("section navigation defaults to Resumen and keeps one status polling loop",
   ui.calls[0].respond(snapshot());
   await flush();
   assert.equal(ui.intervals.filter((item) => item.ms === 2000).length, 1);
-  assert.equal(ui.calls.some((call) => /incidents|events\/search/.test(call.url)), false);
+  assert.equal(ui.calls.some((call) => /records|incidents|events\/search/.test(call.url)), false);
   for (const name of ["protection", "overview"]) ui.open(name);
   assert.equal(ui.intervals.filter((item) => item.ms === 2000).length, 1);
   assert.equal(ui.calls.some((call) => call.options.method === "POST"), false);
@@ -1164,15 +1114,15 @@ test("sidebar monitoring and critical protection controls remain accurate across
   assert.equal(ui.get("toast").textContent, "El monitor confirmó la cancelación de la prueba.");
 });
 
-test("Historial loads both tables together and legacy incident links resolve to the shared section", async () => {
+test("Historial loads one Registro and legacy incident links resolve without issuing legacy queries", async () => {
   const ui = harness({ navigation: true, hash: "#incidentes" });
   assert.equal(ui.get("view-title").textContent, "Historial");
   assert.equal(ui.get("page-history").hidden, false);
   ui.calls[0].respond(snapshot());
   await flush();
-  assert.equal(recordCalls(ui, "/api/incidents?").length, 1);
-  assert.equal(recordCalls(ui, "/api/events/search?").length, 1);
-  for (const prefix of ["/api/incidents?", "/api/events/search?"]) assert.equal(queryParams(lastRecordCall(ui, prefix)).has("from"), false);
+  assert.equal(recordCalls(ui).length, 1);
+  assert.equal(queryParams(lastRecordCall(ui)).has("from"), false);
+  assert.equal(ui.calls.some((call) => /\/api\/incidents|\/api\/events\/search/.test(call.url)), false);
   answerRecords(ui);
   await flush();
   const queryCount = ui.calls.length;
@@ -1181,14 +1131,26 @@ test("Historial loads both tables together and legacy incident links resolve to 
   assert.equal(ui.calls.length, queryCount);
   ui.get("records-from").value = "2026-10-17T10:00";
   const pending = ui.get("records-form").emit("submit");
-  assert.equal(ui.calls.length, queryCount + 2);
-  for (const prefix of ["/api/incidents?", "/api/events/search?"]) {
-    assert.equal(queryParams(lastRecordCall(ui, prefix)).get("from"), new Date("2026-10-17T10:00").toISOString());
-  }
+  assert.equal(ui.calls.length, queryCount + 1);
+  assert.equal(queryParams(lastRecordCall(ui)).get("from"), new Date("2026-10-17T10:00").toISOString());
   answerRecords(ui);
   await pending;
   assert.equal(ui.calls.some((entry) => entry.options.method === "POST"), false);
   assert.doesNotMatch(html, /id="page-incidents"|id="incidents-form"|id="refresh-incidents"|id="refresh-records"/);
+});
+
+test("Registro has one visible filter form, six accessible columns and all six categories", () => {
+  const page = html.match(/<section id="page-history"[\s\S]*?(?=<section id="page-protection")/)[0];
+  assert.equal([...page.matchAll(/<table\b/g)].length, 1);
+  assert.equal([...page.matchAll(/<form\b/g)].length, 1);
+  assert.equal([...page.matchAll(/<th\b[^>]*scope="col"/g)].length, 6);
+  assert.match(page, /<caption\b/);
+  assert.match(page, /id="records-list"[^>]*tabindex="0"/);
+  assert.match(page, /id="records-list"[^>]*aria-label="[^"]+"/);
+  for (const category of ["power", "connection", "protection", "alerts", "settings", "other"]) {
+    assert.ok(page.includes(`value="${category}"`), category);
+  }
+  assert.doesNotMatch(page, /<details\b|id="event-search-form"|id="incidents-body"|id="archive-list"|incident-sort/);
 });
 
 test("section shortcuts and keyboard navigation are accessible and do not submit forms", async () => {
@@ -1363,7 +1325,7 @@ test("Resumen and Historial share the chart while recent events remain exclusive
   assert.equal(ui.get("recent-events-card").hidden, true);
   assert.equal(ui.get("page-history").hidden, false);
   assert.equal(ui.get("shared-history").hidden, false);
-  assert.match(ui.calls.at(-1).url, /^\/api\/events\/search\?/);
+  assert.match(ui.calls.at(-1).url, /^\/api\/records\?/);
   ui.open("overview");
   assert.equal(ui.get("recent-events-card").hidden, false);
   assert.equal(ui.get("history-chart"), chart);

@@ -77,6 +77,13 @@ class IncidentCursorExpired(ValueError):
         super().__init__("La consulta venció porque cambió el historial conservado. Vuelve a consultar incidentes.")
 
 
+class RecordCursorExpired(ValueError):
+    """The grouped register no longer contains the cursor's retained anchor."""
+
+    def __init__(self):
+        super().__init__("La consulta venció porque cambió el historial conservado. Vuelve a consultar el registro.")
+
+
 def validate_policy(value):
     """Validate partial/full policy; booleans and numbers are never coerced."""
     if not isinstance(value, dict):
@@ -566,6 +573,171 @@ class Store:
                 **({"sort": sort, "direction": direction, "as_of": as_of} if sort is not None else {}),
                 "retention_days": self.retention_days,
                 "note": "Duración detectada entre lecturas; los incidentes anteriores a la retención pueden estar incompletos."}
+
+    @classmethod
+    def _record_filters(cls, start=None, end=None, kind=None, query=None):
+        filters = cls._event_filters(start, end, kind, query)
+        if kind is not None and kind not in {"power", "connection", "protection", "alerts", "settings", "other"}:
+            raise ValueError("Categoría del registro no válida")
+        return filters
+
+    @staticmethod
+    def _record_category(kind):
+        if kind in {"power_lost", "power_restored"}:
+            return "power"
+        if kind in {"connection_lost", "connection_restored", "monitor_error", "monitor_restarted"}:
+            return "connection"
+        if kind in {"policy_changed", "notifications_changed", "notification_settings_changed"}:
+            return "settings"
+        if kind in {"battery_low", "overload", "ups_fault"}:
+            return "alerts"
+        if kind == "simulation" or kind.startswith(("policy_", "ups_poweroff_", "ups_battery_test", "ups_cancel_test", "windows_action_")):
+            return "protection"
+        return "other"
+
+    @classmethod
+    def _decode_record_cursor(cls, cursor, filters):
+        if cursor is None:
+            return None
+        if not isinstance(cursor, str) or not 1 <= len(cursor) <= 512:
+            raise ValueError("Cursor del registro inválido")
+        try:
+            value = json.loads(base64.urlsafe_b64decode(cursor + "=" * (-len(cursor) % 4)))
+            if (set(value) != {"v", "high", "before", "as_of", "filter"}
+                    or type(value["v"]) is not int or value["v"] != 1
+                    or type(value["high"]) is not int or not 0 < value["high"] < 2 ** 63 - 1
+                    or not isinstance(value["before"], str) or len(value["before"]) > 64
+                    or value["filter"] != cls._cursor_fingerprint(filters, "records")):
+                raise ValueError()
+            category, event_id = value["before"].split(":")
+            if category not in {"power", "connection", "event"} or not event_id.isascii() or not event_id.isdecimal():
+                raise ValueError()
+            if not 0 < int(event_id) <= value["high"]:
+                raise ValueError()
+            value["as_of"] = iso_utc(_timestamp(value["as_of"]))
+        except (ValueError, TypeError, KeyError, UnicodeError, OverflowError, AttributeError) as exc:
+            raise ValueError("Cursor inválido o perteneciente a otros filtros") from exc
+        return value
+
+    @classmethod
+    def _encode_record_cursor(cls, high, before, as_of, filters):
+        value = {"v": 1, "high": high, "before": before, "as_of": as_of,
+                 "filter": cls._cursor_fingerprint(filters, "records")}
+        return base64.urlsafe_b64encode(json.dumps(value, separators=(",", ":")).encode()).decode().rstrip("=")
+
+    @classmethod
+    def _group_records(cls, events, as_of):
+        """Associate only outage evidence and protection actions with incidents.
+
+        Alerts and configuration are independent conditions, even during an
+        outage. A shared protection action can appear in two incident details
+        while its event ID is suppressed only once in the standalone feed.
+        """
+        active, incidents, members = {}, [], set()
+        opening = {"power_lost": "power", "connection_lost": "connection", "monitor_error": "connection"}
+        recovery = {"power_restored": "power", "connection_restored": "connection"}
+        for event in events:
+            kind = event["kind"]
+            if (kind in {"connection_lost", "monitor_error"} and isinstance(event["data"], dict)
+                    and event["data"].get("error_kind") == "stopped"):
+                continue
+            event_type = opening.get(kind)
+            if event_type is not None:
+                if event_type not in active:
+                    incident = {"id": event_type + ":" + str(event["id"]), "record_type": "incident",
+                                "type": event_type, "category": event_type,
+                                "timestamp": event["timestamp"], "description": event["message"],
+                                "status": "open", "started_at": event["timestamp"], "ended_at": None,
+                                "opening_event_id": event["id"], "recovery_event_id": None,
+                                "message": event["message"], "recovery_message": None,
+                                "actions": [], "events": [], "start_known": True,
+                                "error_kind": event["data"].get("error_kind") if isinstance(event["data"], dict) else None}
+                    active[event_type] = incident
+                    incidents.append(incident)
+                active[event_type]["events"].append(event)
+                members.add(event["id"])
+            elif kind in recovery:
+                incident = active.pop(recovery[kind], None)
+                if incident is not None:
+                    incident.update(status="recovered", ended_at=event["timestamp"],
+                                    recovery_event_id=event["id"], recovery_message=event["message"])
+                    incident["events"].append(event)
+                    members.add(event["id"])
+            elif (kind == "simulation" or kind.startswith(("policy_", "ups_poweroff_", "windows_action_"))) and kind != "policy_changed":
+                for incident in active.values():
+                    incident["actions"].append(event)
+                    incident["events"].append(event)
+                    members.add(event["id"])
+        for incident in incidents:
+            end = _timestamp(incident["ended_at"]) if incident["ended_at"] else as_of
+            incident["duration_seconds"] = max(0, round((end - _timestamp(incident["started_at"])).total_seconds(), 3))
+            kinds = {event["kind"] for event in incident["actions"]}
+            incident["action_result"] = ("failed" if "policy_action_failed" in kinds else
+                                         "started" if "policy_action_started" in kinds else
+                                         "cancelled" if "policy_cancelled" in kinds else
+                                         "simulated" if "simulation" in kinds else "none")
+        records = list(incidents)
+        for event in events:
+            if event["id"] not in members:
+                records.append({"id": "event:" + str(event["id"]), "record_type": "event",
+                                "type": event["kind"], "category": cls._record_category(event["kind"]),
+                                "timestamp": event["timestamp"], "description": event["message"],
+                                "status": None, "duration_seconds": None, "action_result": None,
+                                "kind": event["kind"], "message": event["message"], "data": event["data"],
+                                "events": [event]})
+        return records
+
+    def _record_feed(self, filters, position=None):
+        with self._lock:
+            high = position["high"] if position else self._db.execute("SELECT COALESCE(MAX(id),0) FROM events").fetchone()[0]
+        now = _timestamp(position["as_of"]) if position else utc_now()
+        records = self._group_records(list(self.iter_events(_high_id=high)), now)
+        lower = _timestamp(filters["from"]) if filters["from"] else None
+        upper = _timestamp(filters["to"]) if filters["to"] else None
+        query = filters["query"].casefold() if filters["query"] else None
+        selected = []
+        for record in records:
+            began = _timestamp(record["timestamp"])
+            ended = _timestamp(record["ended_at"]) if record.get("ended_at") else None
+            if record["record_type"] == "incident":
+                in_range = (lower is None or ended is None or ended >= lower) and (upper is None or began <= upper)
+            else:
+                in_range = (lower is None or began >= lower) and (upper is None or began <= upper)
+            if not in_range:
+                continue
+            if filters["kind"] and filters["kind"] not in ({record["category"]} | {
+                    self._record_category(event["kind"]) for event in record["events"]}):
+                continue
+            if query and not any(query in (str(event["message"]) + "\n" + event["kind"] + "\n" +
+                                         json.dumps(event["data"], ensure_ascii=False)).casefold() for event in record["events"]):
+                continue
+            selected.append(record)
+        selected.sort(key=lambda item: (_timestamp(item["timestamp"]),
+                                       item.get("opening_event_id", item["events"][0]["id"])), reverse=True)
+        return selected, high, iso_utc(now)
+
+    def records(self, *, start=None, end=None, kind=None, query=None, limit=50, cursor=None):
+        """Filter and page the complete grouped register, never raw event pages."""
+        filters = self._record_filters(start, end, kind, query)
+        self._page_limit(limit)
+        position = self._decode_record_cursor(cursor, filters)
+        records, high, as_of = self._record_feed(filters, position)
+        offset = 0
+        if position:
+            anchor = next((index for index, record in enumerate(records) if record["id"] == position["before"]), None)
+            if anchor is None:
+                raise RecordCursorExpired()
+            offset = anchor + 1
+        rows = records[offset:offset + limit]
+        more = offset + len(rows) < len(records)
+        return {"records": rows, "total": len(records), "limit": limit, **filters,
+                "next_cursor": self._encode_record_cursor(high, rows[-1]["id"], as_of, filters) if more else None,
+                "as_of": as_of, "retention_days": self.retention_days}
+
+    def iter_records(self, *, start=None, end=None, kind=None, query=None):
+        """Export all matching grouped rows from one fixed event/time snapshot."""
+        records, _high, _as_of = self._record_feed(self._record_filters(start, end, kind, query))
+        yield from records
 
     def close(self):
         with self._lock:

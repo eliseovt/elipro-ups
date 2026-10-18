@@ -64,27 +64,16 @@
     historyInterval: 10000,
     statusGeneration: 0,
     recordVersion: 0,
-    recordDates: "",
-    archiveFilters: "",
-    incidents: [],
-    incidentCursor: null,
-    incidentQuery: "",
-    incidentsBusy: false,
-    incidentSort: "started_at",
-    incidentDirection: "desc",
-    incidentAppliedSort: "started_at",
-    incidentAppliedDirection: "desc",
-    archive: [],
-    archiveCursor: null,
-    archiveBusy: false,
-    archiveQuery: "",
+    recordFilters: "",
+    records: [],
+    recordCursor: null,
+    recordQuery: "",
+    recordsBusy: false,
+    recordsLoaded: false,
     downloadBusy: false,
     stopAcknowledged: false,
     activeView: "overview",
     navigationReady: false,
-    incidentsLoaded: false,
-    archiveLoaded: false,
-    incidentVersion: 0,
     criticalKnown: new Map(),
     criticalAcknowledged: new Set(),
     criticalItems: new Map(),
@@ -321,10 +310,7 @@
 
   function loadViewData() {
     if (!state.navigationReady || !state.serviceAvailable) return;
-    if (state.activeView === "history") {
-      if (!state.incidentsLoaded) loadIncidents();
-      if (!state.archiveLoaded) loadArchive();
-    }
+    if (state.activeView === "history" && !state.recordsLoaded) loadRecords();
   }
 
   function activateView(name, { writeHash = false, focus = false } = {}) {
@@ -497,11 +483,9 @@
       : state.policyDirty ? "Guarda los cambios antes de simular."
       : !simulationIncludesUps() ? `Simulación de ${finite(state.status?.policy?.countdown_seconds) ? state.status.policy.countdown_seconds : 15} s para Windows. Sin apagado adicional del UPS. No ejecuta acciones reales.`
       : `Simulación de ${finite(state.status?.policy?.countdown_seconds) ? state.status.policy.countdown_seconds : "—"} s guardados para Windows y ${simulationDelayDescription().toLocaleLowerCase("es")}. No apaga ni hiberna Windows ni corta la energía.`);
-    for (const id of ["apply-records", "search-events", "clear-records"]) $(id).disabled = unavailable;
-    $("export-events").disabled = unavailable || state.downloadBusy;
-    $("more-incidents").disabled = unavailable || state.incidentsBusy;
-    updateIncidentSortHeaders();
-    $("more-events").disabled = unavailable || state.archiveBusy;
+    for (const id of ["apply-records", "clear-records"]) $(id).disabled = unavailable;
+    $("export-records").disabled = unavailable || state.downloadBusy;
+    $("more-records").disabled = unavailable || state.recordsBusy;
     $("stop-monitor").disabled = unavailable || busy || physicalTest;
     $("confirm-stop-monitor").disabled = unavailable || busy || physicalTest;
   }
@@ -1054,36 +1038,29 @@
     setText("health-cpu", confirmed ? `CPU ${finite(process.cpu_percent) ? `${numeric(process.cpu_percent, 1)} %` : "midiendo"}` : "—");
   }
 
-  function readRecordDates() {
+  function readRecordFilters() {
     const params = new URLSearchParams();
     const values = [$("records-from").value, $("records-to").value];
-    const dates = values.map((value) => value ? parseDate(value) : null);
+    const dates = values.map(value => value ? parseDate(value) : null);
     if (values.some((value, index) => value && !dates[index])) throw new Error("Revisa las fechas de la consulta.");
     if (dates[0] && dates[1] && dates[0] > dates[1]) throw new Error("La fecha Desde debe ser anterior o igual a Hasta.");
     if (dates[0]) params.set("from", dates[0].toISOString());
     if (dates[1]) params.set("to", dates[1].toISOString());
-    return params;
-  }
-
-  function readEventFilters() {
-    const params = new URLSearchParams();
     if ($("event-kind").value) params.set("kind", $("event-kind").value);
     if ($("event-search").value.trim()) params.set("q", $("event-search").value.trim());
-    return params.toString();
-  }
-
-  function recordFilters(includeEvents = false) {
-    const params = new URLSearchParams(state.recordDates);
-    if (includeEvents) for (const [key, value] of new URLSearchParams(state.archiveFilters)) params.set(key, value);
     return params;
   }
 
-  function renderRecordDates() {
-    const dates = new URLSearchParams(state.recordDates);
-    const start = dates.get("from"), end = dates.get("to");
-    const label = start && end ? `${formatMoment(start)} – ${formatMoment(end)}`
+  function recordFilters() {
+    return new URLSearchParams(state.recordFilters);
+  }
+
+  function renderRecordFilters() {
+    const filters = recordFilters();
+    const start = filters.get("from"), end = filters.get("to");
+    const range = start && end ? `${formatMoment(start)} – ${formatMoment(end)}`
       : start ? `Desde ${formatMoment(start)}` : end ? `Hasta ${formatMoment(end)}` : "Todas las fechas";
-    setText("records-feedback", `${label}. Fechas aplicadas a ambas tablas; la gráfica usa su propio período.`);
+    setText("records-feedback", `${range}. La gráfica usa su propio período.`);
   }
 
   function sectionError(id, error) {
@@ -1094,39 +1071,16 @@
   function appendDetail(parent, text, className = "") {
     const paragraph = document.createElement("p");
     paragraph.textContent = text;
-    if (className) paragraph.className = className;
+    paragraph.className = className;
     parent.append(paragraph);
   }
 
-  const incidentColumns = [
-    ["type", "Tipo"], ["status", "Estado"], ["started_at", "Inicio"],
-    ["ended_at", "Recuperación"], ["duration_seconds", "Duración"], ["action_result", "Protección"],
-  ];
-
-  function updateIncidentSortHeaders() {
-    for (const [key, label] of incidentColumns) {
-      const active = state.incidentSort === key;
-      const direction = active && state.incidentDirection === "asc" ? "desc" : "asc";
-      $(`incident-head-${key}`).setAttribute("aria-sort", active ? state.incidentDirection === "asc" ? "ascending" : "descending" : "none");
-      const button = $(`incident-sort-${key}`);
-      button.disabled = !state.serviceAvailable;
-      button.setAttribute("aria-label", `Ordenar por ${label.toLocaleLowerCase("es")}, ${direction === "asc" ? "ascendente" : "descendente"}`);
-      button.replaceChildren(document.createTextNode(`${label} `));
-      const indicator = document.createElement("span");
-      indicator.setAttribute("aria-hidden", "true");
-      indicator.textContent = active ? state.incidentDirection === "asc" ? "↑" : "↓" : "↕";
-      button.append(indicator);
-    }
-  }
-
-  function renderIncidents(emptyMessage = "No hay incidentes en este intervalo.") {
-    const body = $("incidents-body");
+  function renderRecords(emptyMessage = "No hay registros que coincidan con los filtros.") {
+    const body = $("records-body");
     body.replaceChildren();
-    updateIncidentSortHeaders();
-    if (!state.incidents.length) {
-      const row = document.createElement("tr");
-      const cell = document.createElement("td");
-      cell.colSpan = 7;
+    if (!state.records.length) {
+      const row = document.createElement("tr"), cell = document.createElement("td");
+      cell.colSpan = 6;
       cell.className = "section-empty";
       cell.textContent = emptyMessage;
       row.append(cell);
@@ -1134,232 +1088,146 @@
       return;
     }
     const actionLabels = { failed: "Fallida", started: "Iniciada", cancelled: "Cancelada", simulated: "Simulada", none: "Sin acciones" };
-    state.incidents.forEach((incident, index) => {
+    const categoryLabels = { power: "Energía", connection: "Comunicación", protection: "Protección", alerts: "Alerta del UPS", settings: "Configuración", other: "Evento" };
+    const alertLabels = { battery_low: "Batería baja", overload: "Sobrecarga", ups_fault: "Falla del UPS" };
+    for (const [index, record] of state.records.entries()) {
+      const incident = record.record_type === "incident";
+      const type = incident ? record.type === "power" ? "Corte eléctrico" : "Comunicación" : alertLabels[record.kind || record.type] || categoryLabels[record.category] || eventLabel(record.kind || record.type) || "Evento";
+      const date = incident && record.start_known === false ? "Inicio no registrado" : formatMoment(record.timestamp || record.started_at);
+      const description = String(record.description || record.message || type);
+      const duration = incident && finite(record.duration_seconds) ? runtimeLabel(record.duration_seconds) : "—";
       const row = document.createElement("tr");
-      row.className = incident.status === "open" ? "incident-row incident-row-open" : "incident-row";
-      const type = incident.type === "power" ? "Corte eléctrico" : "Problema de comunicación";
-      const start = incident.start_known === false ? "Inicio no registrado" : formatMoment(incident.started_at);
-      const end = incident.ended_at ? formatMoment(incident.ended_at) : "Sin recuperación registrada";
-      const duration = finite(incident.duration_seconds) ? runtimeLabel(incident.duration_seconds) : "Sin confirmar";
-      for (const [column, value] of [type, incident.status === "open" ? "Sin recuperación registrada" : "Recuperado", start, end, duration, actionLabels[incident.action_result] || "Sin acciones"].entries()) {
-        const cell = document.createElement("td");
-        cell.textContent = value;
-        if (column === 1 && incident.status !== "open") cell.className = "incident-status-recovered";
-        if (column === 5 && incident.action_result === "started") cell.className = "incident-action-started";
-        row.append(cell);
+      row.className = "record-row";
+      const dateCell = document.createElement("td"), typeCell = document.createElement("td"), descriptionCell = document.createElement("td");
+      dateCell.textContent = date;
+      typeCell.textContent = type;
+      appendDetail(descriptionCell, description);
+      if (incident) {
+        const notes = [];
+        if (record.ended_at) notes.push(`Recuperación: ${formatMoment(record.ended_at)}`);
+        if (record.action_result && record.action_result !== "none") notes.push(`Protección: ${actionLabels[record.action_result] || record.action_result}`);
+        if (notes.length) appendDetail(descriptionCell, notes.join(" · "), "record-meta");
       }
-      const detailRow = document.createElement("tr");
+      const statusCell = document.createElement("td"), durationCell = document.createElement("td");
+      statusCell.textContent = incident ? record.status === "open" ? "Sin cierre registrado" : "Recuperado" : "—";
+      if (incident) statusCell.className = record.status === "open" ? "records-status-active" : "records-status-recovered";
+      durationCell.textContent = duration;
+      row.append(dateCell, typeCell, descriptionCell, statusCell, durationCell);
+
+      const detailRow = document.createElement("tr"), detailCell = document.createElement("td"), details = document.createElement("div");
       detailRow.className = "incident-detail-row";
+      detailRow.id = `record-detail-${index}`;
       detailRow.hidden = true;
-      detailRow.id = `incident-detail-${index}`;
-      const detailCell = document.createElement("td");
-      detailCell.colSpan = 7;
-      const details = document.createElement("div");
+      detailCell.colSpan = 6;
       details.className = "incident-details";
-      const durationLabel = incident.status === "open" ? "Tiempo desde la detección" : `Duración detectada${incident.start_known === false ? " desde el primer registro disponible" : ""}`;
-      appendDetail(details, `${durationLabel}: ${duration}`);
-      if (incident.status === "open") appendDetail(details, incident.type === "power" ? "Un registro sin cierre no confirma que el UPS siga en batería; consulta el estado actual de arriba." : "Un registro sin cierre no confirma que siga habiendo un problema de comunicación; consulta el estado actual de arriba.", "incident-warning");
-      if (incident.message) appendDetail(details, `Inicio: ${String(incident.message)}`);
-      if (incident.recovery_message) appendDetail(details, `Recuperación: ${String(incident.recovery_message)}`);
-      const actions = Array.isArray(incident.actions) ? incident.actions : [];
-      if (actions.length) {
-        appendDetail(details, "Secuencia de protección:", "incident-actions-label");
+      if (incident) {
+        appendDetail(details, `Inicio: ${date}`);
+        appendDetail(details, record.ended_at ? `Recuperación: ${formatMoment(record.ended_at)}` : "Sin recuperación registrada.");
+        appendDetail(details, `${record.status === "open" ? "Tiempo desde la detección" : "Duración detectada"}: ${duration}`);
+        if (record.message) appendDetail(details, String(record.message));
+        if (record.recovery_message) appendDetail(details, String(record.recovery_message));
+        appendDetail(details, `Protección: ${actionLabels[record.action_result] || "Sin acciones"}`);
+        if (record.status === "open") appendDetail(details, "Un registro sin cierre no confirma que el problema continúe. Consulta Resumen para comprobar el estado actual.", "incident-warning");
+      }
+      const events = Array.isArray(record.events) && record.events.length ? record.events : Array.isArray(record.actions) ? record.actions : [];
+      if (events.length) {
         const sequence = document.createElement("ol");
         sequence.className = "incident-action-sequence";
-        for (const action of actions) {
+        for (const event of events) {
           const item = document.createElement("li");
-          item.textContent = `${formatMoment(action.timestamp)} · ${eventMessage(action) || eventLabel(action.kind) || "Evento de protección"}`;
+          item.textContent = `${formatMoment(event.timestamp)} · ${eventLabel(event.kind) || "Evento"} · ${eventMessage(event) || ""}`;
           sequence.append(item);
         }
         details.append(sequence);
-      } else appendDetail(details, "Sin acciones de protección registradas durante este incidente.");
+      } else if (!incident) appendDetail(details, `${date} · ${type} · ${description}`);
+      if (!incident && record.data && Object.keys(record.data).length) {
+        const data = document.createElement("pre");
+        data.className = "record-data";
+        data.textContent = JSON.stringify(record.data, null, 2);
+        details.append(data);
+      }
       detailCell.append(details);
       detailRow.append(detailCell);
-      const buttonCell = document.createElement("td");
-      const button = document.createElement("button");
+      const buttonCell = document.createElement("td"), button = document.createElement("button");
       button.type = "button";
       button.className = "button button-quiet incident-details-toggle";
       button.textContent = "Ver detalles";
-      button.setAttribute("aria-expanded", "false");
       button.setAttribute("aria-controls", detailRow.id);
-      button.setAttribute("aria-label", `Ver detalles: ${type}, ${start}`);
+      button.setAttribute("aria-expanded", "false");
+      button.setAttribute("aria-label", `Ver detalles: ${type}, ${date}`);
       button.addEventListener("click", () => {
         detailRow.hidden = !detailRow.hidden;
         button.textContent = detailRow.hidden ? "Ver detalles" : "Ocultar detalles";
         button.setAttribute("aria-expanded", String(!detailRow.hidden));
-        button.setAttribute("aria-label", `${detailRow.hidden ? "Ver" : "Ocultar"} detalles: ${type}, ${start}`);
+        button.setAttribute("aria-label", `${detailRow.hidden ? "Ver" : "Ocultar"} detalles: ${type}, ${date}`);
       });
       buttonCell.append(button);
       row.append(buttonCell);
       body.append(row, detailRow);
-    });
-  }
-
-  async function loadIncidents(append = false) {
-    if (!state.serviceAvailable || state.incidentsBusy) return;
-    const version = state.incidentVersion;
-    const currentVersion = () => state.incidentVersion;
-    const requestedSort = state.incidentSort;
-    const requestedDirection = state.incidentDirection;
-    let params;
-    let filters;
-    try {
-      filters = recordFilters().toString();
-      params = new URLSearchParams(filters);
-      params.set("sort", requestedSort);
-      params.set("direction", requestedDirection);
-    }
-    catch (error) { sectionError("incidents-error", error); return; }
-    const query = params.toString();
-    if (append && query !== state.incidentQuery) append = false;
-    if (append && state.incidentCursor) params.set("cursor", state.incidentCursor);
-    params.set("limit", "50");
-    state.incidentsBusy = true;
-    $("incidents-list").setAttribute("aria-busy", "true");
-    updateMutationControls();
-    sectionError("incidents-error", null);
-    try {
-      const data = await request(`/api/incidents?${params}`);
-      if (version !== currentVersion()) return;
-      if (!Array.isArray(data.incidents)) throw new Error("El monitor no devolvió una lista de incidentes válida.");
-      const combined = append ? [...state.incidents, ...data.incidents] : data.incidents;
-      state.incidents = combined.filter((item, index) => combined.findIndex((other) => String(other.id) === String(item.id)) === index);
-      state.incidentCursor = data.next_cursor || null;
-      state.incidentQuery = query;
-      state.incidentAppliedSort = requestedSort;
-      state.incidentAppliedDirection = requestedDirection;
-      state.incidentsLoaded = true;
-      const total = finite(data.total) ? data.total : state.incidents.length;
-      setText("incidents-count", `${numeric(total)} ${total === 1 ? "incidente" : "incidentes"}`);
-      $("incidents-count").title = `${state.incidents.length} incidentes mostrados`;
-      $("more-incidents").hidden = !state.incidentCursor;
-      renderIncidents();
-    } catch (error) {
-      if (version === currentVersion()) {
-        state.incidentSort = state.incidentAppliedSort;
-        state.incidentDirection = state.incidentAppliedDirection;
-        updateIncidentSortHeaders();
-        if (error.code === "incident_cursor_expired") {
-          state.incidentCursor = null;
-          $("more-incidents").hidden = true;
-        }
-        sectionError("incidents-error", new Error(`No se pudieron consultar los incidentes. ${error.message}`));
-        if (!state.incidents.length) renderIncidents("No se pudieron cargar los incidentes.");
-      }
-    } finally {
-      state.incidentsBusy = false;
-      $("incidents-list").setAttribute("aria-busy", "false");
-      updateMutationControls();
-      if (version !== currentVersion()) loadIncidents();
     }
   }
 
-  function renderArchive(emptyMessage = "No hay eventos que coincidan con la búsqueda.") {
-    const list = $("archive-list");
-    list.replaceChildren();
-    if (!state.archive.length) {
-      const row = document.createElement("tr"), cell = document.createElement("td");
-      cell.colSpan = 3;
-      cell.className = "section-empty";
-      cell.textContent = emptyMessage;
-      row.append(cell);
-      list.append(row);
-      return;
-    }
-    for (const event of state.archive) {
-      const row = document.createElement("tr");
-      row.className = "archive-event";
-      const dateCell = document.createElement("td");
-      const time = document.createElement("time");
-      time.textContent = formatMoment(event.timestamp);
-      const parsed = parseDate(event.timestamp);
-      if (parsed) time.dateTime = parsed.toISOString();
-      dateCell.append(time);
-      const kindCell = document.createElement("td"), messageCell = document.createElement("td");
-      kindCell.textContent = eventLabel(event.kind);
-      messageCell.textContent = eventMessage(event);
-      row.append(dateCell, kindCell, messageCell);
-      list.append(row);
-    }
-  }
-
-  async function loadArchive(append = false) {
-    if (!state.serviceAvailable || state.archiveBusy) return;
+  async function loadRecords(append = false) {
+    if (!state.serviceAvailable || state.recordsBusy || append && !state.recordCursor) return;
     const version = state.recordVersion;
-    let params;
-    try { params = recordFilters(true); }
-    catch (error) { sectionError("archive-error", error); return; }
+    const params = recordFilters();
     const query = params.toString();
-    if (append && query !== state.archiveQuery) append = false;
-    if (append && state.archiveCursor) params.set("cursor", state.archiveCursor);
+    if (append && query !== state.recordQuery) append = false;
+    if (append) params.set("cursor", state.recordCursor);
     params.set("limit", "50");
-    state.archiveBusy = true;
-    $("archive-list").setAttribute("aria-busy", "true");
+    state.recordsBusy = true;
+    $("records-list").setAttribute("aria-busy", "true");
     updateMutationControls();
-    sectionError("archive-error", null);
+    sectionError("records-error", null);
     try {
-      const data = await request(`/api/events/search?${params}`);
+      const data = await request(`/api/records?${params}`);
       if (version !== state.recordVersion) return;
-      if (!Array.isArray(data.events)) throw new Error("El monitor no devolvió una lista de eventos válida.");
-      const combined = append ? [...state.archive, ...data.events] : data.events;
-      state.archive = combined.filter((item, index) => combined.findIndex((other) => String(other.id) === String(item.id)) === index);
-      state.archiveQuery = query;
-      state.archiveLoaded = true;
-      state.archiveCursor = data.next_cursor || null;
-      $("more-events").hidden = !state.archiveCursor;
-      const total = finite(data.total) ? data.total : state.archive.length;
-      setText("archive-count", `${numeric(total)} ${total === 1 ? "evento" : "eventos"}`);
-      setText("archive-summary", `${numeric(state.archive.length)} ${state.archive.length === 1 ? "evento mostrado" : "eventos mostrados"}${finite(data.total) ? ` de ${numeric(data.total)}` : ""}. El CSV incluye todos los resultados con los filtros aplicados.`);
-      $("archive-summary").hidden = false;
-      renderArchive();
+      if (!Array.isArray(data.records)) throw new Error("El monitor no devolvió un registro válido.");
+      const combined = append ? [...state.records, ...data.records] : data.records;
+      state.records = combined.filter((record, index) => combined.findIndex(other => String(other.id) === String(record.id)) === index);
+      state.recordQuery = query;
+      state.recordCursor = data.next_cursor || null;
+      state.recordsLoaded = true;
+      const total = finite(data.total) ? data.total : state.records.length;
+      setText("records-count", `${numeric(total)} ${total === 1 ? "registro" : "registros"}`);
+      setText("records-summary", `${numeric(state.records.length)} ${state.records.length === 1 ? "mostrado" : "mostrados"} de ${numeric(total)}. El CSV incluye todos los resultados filtrados.`);
+      $("more-records").hidden = !state.recordCursor;
+      renderRecords();
     } catch (error) {
       if (version === state.recordVersion) {
-        sectionError("archive-error", new Error(`No se pudieron consultar los eventos. ${error.message}`));
-        setText("archive-summary", "No se cargaron eventos para esta consulta.");
-        $("archive-summary").hidden = false;
-        if (!state.archive.length) renderArchive("No se pudieron cargar los eventos.");
+        if (error.code === "record_cursor_expired") {
+          state.recordCursor = null;
+          $("more-records").hidden = true;
+        }
+        sectionError("records-error", new Error(`No se pudo consultar el registro. ${error.message}`));
+        if (!state.records.length) renderRecords("No se pudo cargar el registro.");
       }
     } finally {
-      state.archiveBusy = false;
-      $("archive-list").setAttribute("aria-busy", "false");
+      state.recordsBusy = false;
+      $("records-list").setAttribute("aria-busy", "false");
       updateMutationControls();
-      if (version !== state.recordVersion) loadArchive();
+      if (version !== state.recordVersion) loadRecords();
     }
   }
 
   async function refreshRecords() {
     if (!state.serviceAvailable) return;
-    let dates;
-    try {
-      dates = readRecordDates().toString();
-    }
+    let filters;
+    try { filters = readRecordFilters().toString(); }
     catch (error) { setText("records-feedback", error.message); return; }
-    const changed = dates !== state.recordDates;
-    state.recordDates = dates;
+    const changed = filters !== state.recordFilters;
+    state.recordFilters = filters;
     state.recordVersion += 1;
-    state.incidentVersion += 1;
-    state.incidentCursor = state.archiveCursor = null;
-    $("more-incidents").hidden = $("more-events").hidden = true;
+    state.recordCursor = null;
+    $("more-records").hidden = true;
     if (changed) {
-      state.incidents = [];
-      state.archive = [];
-      setText("incidents-count", "—");
-      setText("archive-count", "—");
-      setText("archive-summary", "Consultando los eventos del intervalo…");
-      renderIncidents("Consultando incidentes…");
-      renderArchive("Consultando eventos…");
+      state.records = [];
+      setText("records-count", "—");
+      setText("records-summary", "Consultando el registro…");
+      renderRecords("Consultando el registro…");
     }
-    renderRecordDates();
-    await Promise.all([loadIncidents(), loadArchive()]);
-  }
-
-  async function searchArchive() {
-    if (!state.serviceAvailable) return;
-    state.archiveFilters = readEventFilters();
-    state.recordVersion += 1;
-    state.archiveCursor = null;
-    $("more-events").hidden = true;
-    await loadArchive();
+    renderRecordFilters();
+    await loadRecords();
   }
 
   async function downloadFile(path, filename, feedbackId) {
@@ -1877,30 +1745,15 @@
     }
   });
 
-  for (const [key] of incidentColumns) {
-    $(`incident-sort-${key}`).addEventListener("click", () => {
-      if (!state.serviceAvailable) return;
-      state.incidentDirection = state.incidentSort === key && state.incidentDirection === "asc" ? "desc" : "asc";
-      state.incidentSort = key;
-      updateIncidentSortHeaders();
-      state.incidentVersion += 1;
-
-      return loadIncidents();
-    });
-  }
   $("records-form").addEventListener("submit", (event) => { event.preventDefault(); return refreshRecords(); });
-  $("event-search-form").addEventListener("submit", (event) => { event.preventDefault(); return searchArchive(); });
+  $("records-form").addEventListener("input", () => setText("records-feedback", "Cambios sin aplicar. Pulsa «Aplicar filtros»."));
   $("clear-records").addEventListener("click", () => {
-    $("records-from").value = "";
-    $("records-to").value = "";
+    for (const id of ["records-from", "records-to", "event-search", "event-kind"]) $(id).value = "";
     return refreshRecords();
   });
-  $("more-incidents").addEventListener("click", () => loadIncidents(true));
-  $("more-events").addEventListener("click", () => loadArchive(true));
-  $("export-events").addEventListener("click", () => {
-    try { return downloadFile(`/api/events/export.csv?${recordFilters(true)}`, "elipro-eventos.csv", "archive-summary"); }
-    catch (error) { sectionError("archive-error", error); }
-  });
+  $("more-records").addEventListener("click", () => loadRecords(true));
+  $("export-records").addEventListener("click", () => downloadFile(
+    `/api/records/export.csv?${recordFilters()}`, "elipro-registro.csv", "records-summary"));
   $("stop-monitor").addEventListener("click", () => { if (!upsPhysicalTestActive()) $("stop-confirmation").hidden = false; });
   $("cancel-stop-monitor").addEventListener("click", () => { $("stop-confirmation").hidden = true; });
   $("confirm-stop-monitor").addEventListener("click", async () => {
@@ -1934,7 +1787,7 @@
   });
   $("history-period").value = String(state.hours);
   setupNavigation();
-  renderRecordDates();
+  renderRecordFilters();
   updateMutationControls();
   renderChart();
   loadStatus();

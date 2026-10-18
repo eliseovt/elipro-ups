@@ -23,7 +23,7 @@ from urllib.parse import parse_qs, urlsplit
 from . import __version__
 from .adapters import TelemetryError
 from .native_adapter import make_adapter
-from .core import (BATTERY_ESTIMATE_FIELDS, DEFAULT_POLICY, SAMPLE_FIELDS, IncidentCursorExpired, PolicyEngine,
+from .core import (BATTERY_ESTIMATE_FIELDS, DEFAULT_POLICY, SAMPLE_FIELDS, IncidentCursorExpired, RecordCursorExpired, PolicyEngine,
                    TelemetryRingBuffer, battery_estimate_fields, iso_utc, validate_policy)
 from .alerts import AlertManager, DEFAULT_NOTIFICATION_SETTINGS
 from .instance_guard import MonitorInstanceGuard, InstanceGuardError
@@ -104,6 +104,24 @@ def write_events_csv(store, options, target):
     for event in store.iter_events(**options):
         row = {key: event.get(key) for key in ("id", "timestamp", "kind", "message")}
         row["data"] = json.dumps(event.get("data", {}), ensure_ascii=False, allow_nan=False)
+        writer.writerow({key: csv_cell(value) for key, value in row.items()})
+
+
+def write_records_csv(store, options, target):
+    fields = ("fecha", "tipo", "descripcion", "estado", "duracion_segundos", "recuperacion", "proteccion", "detalles")
+    writer = csv.DictWriter(target, fieldnames=fields)
+    writer.writeheader()
+    categories = {"power": "Energía", "connection": "Conexión", "protection": "Protección",
+                  "alerts": "Alertas", "settings": "Configuración", "other": "Otros"}
+    states = {"open": "Sin recuperación registrada", "recovered": "Recuperado"}
+    actions = {"none": "Sin acciones", "failed": "Fallida", "started": "Iniciada",
+               "cancelled": "Cancelada", "simulated": "Simulada"}
+    for record in store.iter_records(**options):
+        row = {"fecha": record["timestamp"], "tipo": categories[record["category"]],
+               "descripcion": record["description"], "estado": states.get(record["status"], ""),
+               "duracion_segundos": record["duration_seconds"], "recuperacion": record.get("ended_at"),
+               "proteccion": actions.get(record["action_result"], ""),
+               "detalles": json.dumps(record["events"], ensure_ascii=False, allow_nan=False)}
         writer.writerow({key: csv_cell(value) for key, value in row.items()})
 
 
@@ -1453,6 +1471,16 @@ class Handler(BaseHTTPRequestHandler):
             finally:
                 text_output.detach()
 
+    def _records_csv(self, options):
+        with tempfile.SpooledTemporaryFile(max_size=4_000_000, mode="w+b") as binary:
+            text_output = io.TextIOWrapper(binary, encoding="utf-8-sig", newline="")
+            try:
+                write_records_csv(self.monitor.store, options, text_output)
+                text_output.flush()
+                return self._send_file(binary, "text/csv; charset=utf-8", "elipro-registro.csv")
+            finally:
+                text_output.detach()
+
     def _measurements_csv(self):
         with tempfile.SpooledTemporaryFile(max_size=4_000_000, mode="w+b") as binary:
             text_output = io.TextIOWrapper(binary, encoding="utf-8-sig", newline="")
@@ -1482,6 +1510,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(self.monitor.snapshot())
             if parsed.path == "/api/events":
                 return self._json({"events": self.monitor.events()})
+            if parsed.path == "/api/records":
+                return self._json(self.monitor.store.records(**archive_options(parsed.query)))
+            if parsed.path == "/api/records/export.csv":
+                return self._records_csv(archive_options(parsed.query, pagination=False))
             if parsed.path == "/api/events/search":
                 return self._json(self.monitor.store.events_page(**archive_options(parsed.query)))
             if parsed.path == "/api/events/export.csv":
@@ -1503,6 +1535,8 @@ class Handler(BaseHTTPRequestHandler):
                 mime = "image/vnd.microsoft.icon" if filename.endswith(".ico") else "text/html" if filename.endswith("html") else "text/javascript" if filename.endswith("js") else "text/css"
                 return self._send((ROOT / "static" / filename).read_bytes(), mime if filename.endswith(".ico") else mime + "; charset=utf-8")
             self._json({"error": "No encontrado."}, 404)
+        except RecordCursorExpired as exc:
+            self._json({"error": str(exc), "code": "record_cursor_expired"}, 400)
         except IncidentCursorExpired as exc:
             self._json({"error": str(exc), "code": "incident_cursor_expired"}, 400)
         except HistoryUnavailable as exc:

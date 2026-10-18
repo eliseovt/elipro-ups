@@ -158,57 +158,27 @@
       </section>
       </section>
 
-      <section id="page-history" class="page-view" data-page="history" aria-label="Historial de incidentes y eventos" hidden>
+      <section id="page-history" class="page-view" data-page="history" aria-label="Historial de mediciones y registro del UPS" hidden>
         <section class="records-card card" aria-labelledby="records-heading">
-          <h2 id="records-heading" class="records-filter-heading">Fechas de incidentes y eventos</h2>
+          <div class="section-header records-header"><h2 id="records-heading" class="history-section-heading"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5h13M8 12h13M8 19h13"/><circle cx="3" cy="5" r=".8"/><circle cx="3" cy="12" r=".8"/><circle cx="3" cy="19" r=".8"/></svg>Registro</h2><div class="records-actions"><span id="records-count" class="count-badge">0 registros</span><button id="export-records" type="button" class="button button-secondary" disabled><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12m-4-4 4 4 4-4M5 16v5h14v-5"/></svg><span id="export-records-label">Exportar registro CSV</span></button></div></div>
           <form id="records-form" class="records-filters">
             <label>Desde<input id="records-from" type="datetime-local" aria-describedby="records-feedback"></label>
             <label>Hasta<input id="records-to" type="datetime-local" aria-describedby="records-feedback"></label>
-            <button id="apply-records" type="submit" class="button button-secondary" disabled>Aplicar fechas</button>
+            <label class="records-search-field">Buscar mensaje<input id="event-search" type="search" maxlength="200" placeholder="Por ejemplo: batería"></label>
+            <label>Categoría<select id="event-kind"><option value="">Todos</option><option value="power">Cortes eléctricos</option><option value="connection">Comunicación</option><option value="protection">Protección</option><option value="alerts">Alertas del UPS</option><option value="settings">Configuración</option><option value="other">Otros</option></select></label>
+            <button id="apply-records" type="submit" class="button button-secondary" disabled>Aplicar filtros</button>
             <button id="clear-records" type="button" class="button button-quiet">Limpiar</button>
           </form>
-          <p id="records-feedback" class="section-note" role="status">Las fechas se aplican a ambas tablas. Sin fechas, se muestra todo el historial conservado.</p>
-
-          <section class="history-records-section" aria-labelledby="incidents-heading">
-            <div class="section-header"><h2 id="incidents-heading" class="history-section-heading"><svg class="history-incident-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m13.5 2-8 12h6L10.5 22l8-12h-6Z"/></svg>Incidentes</h2><span id="incidents-count" class="count-badge">0 incidentes</span></div>
-            <p id="incidents-feedback" class="section-note" role="status" hidden></p>
-            <p id="incidents-error" class="section-error" role="status" hidden></p>
-          <div id="incidents-list" class="incident-table-scroll" tabindex="0" role="region" aria-label="Incidentes consultados" aria-busy="false">
-            <table class="incident-table">
-              <caption class="sr-only">Registro de incidentes. Los encabezados permiten cambiar el orden.</caption>
-              <thead><tr>
-                <th id="incident-head-type" scope="col" aria-sort="none"><button id="incident-sort-type" class="incident-sort" type="button" aria-label="Ordenar por tipo, ascendente">Tipo <span aria-hidden="true">↕</span></button></th>
-                <th id="incident-head-status" scope="col" aria-sort="none"><button id="incident-sort-status" class="incident-sort" type="button" aria-label="Ordenar por estado, ascendente">Estado <span aria-hidden="true">↕</span></button></th>
-                <th id="incident-head-started_at" scope="col" aria-sort="descending"><button id="incident-sort-started_at" class="incident-sort" type="button" aria-label="Ordenar por inicio, ascendente">Inicio <span aria-hidden="true">↓</span></button></th>
-                <th id="incident-head-ended_at" scope="col" aria-sort="none"><button id="incident-sort-ended_at" class="incident-sort" type="button" aria-label="Ordenar por recuperación, ascendente">Recuperación <span aria-hidden="true">↕</span></button></th>
-                <th id="incident-head-duration_seconds" scope="col" aria-sort="none"><button id="incident-sort-duration_seconds" class="incident-sort" type="button" aria-label="Ordenar por duración, ascendente">Duración <span aria-hidden="true">↕</span></button></th>
-                <th id="incident-head-action_result" scope="col" aria-sort="none"><button id="incident-sort-action_result" class="incident-sort" type="button" aria-label="Ordenar por protección, ascendente">Protección <span aria-hidden="true">↕</span></button></th>
-                <th scope="col">Detalles</th>
-              </tr></thead>
-              <tbody id="incidents-body"><tr><td colspan="7" class="section-empty">Aún no has consultado los incidentes.</td></tr></tbody>
+          <p id="records-feedback" class="section-note" role="status">Los filtros se aplican al registro.</p>
+          <p id="records-error" class="section-error" role="status" hidden></p>
+          <div id="records-list" class="unified-records-scroll" tabindex="0" role="region" aria-label="Registro del UPS" aria-busy="false">
+            <table class="unified-records-table">
+              <caption class="sr-only">Registro del UPS filtrado por fecha, mensaje y tipo.</caption>
+              <thead><tr><th scope="col">Fecha y hora</th><th scope="col">Tipo</th><th scope="col">Descripción</th><th scope="col">Estado</th><th scope="col">Duración</th><th scope="col">Detalles</th></tr></thead>
+              <tbody id="records-body"><tr><td colspan="6" class="section-empty">Cargando registro.</td></tr></tbody>
             </table>
           </div>
-        <button id="more-incidents" class="button button-quiet more-records" type="button" hidden><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>Cargar más incidentes</button>
-          </section>
-
-          <section class="history-records-section" aria-labelledby="event-archive-heading">
-            <div class="section-header"><h2 id="event-archive-heading" class="history-section-heading"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5h13M8 12h13M8 19h13"/><circle cx="3" cy="5" r=".8"/><circle cx="3" cy="12" r=".8"/><circle cx="3" cy="19" r=".8"/></svg>Eventos</h2><div class="records-actions"><span id="archive-count" class="count-badge">0 eventos</span><button id="export-events" type="button" class="button button-secondary" disabled><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12m-4-4 4 4 4-4M5 16v5h14v-5"/></svg>Exportar eventos CSV</button></div></div>
-            <form id="event-search-form" class="event-search-form">
-              <label>Buscar mensaje<input id="event-search" type="search" maxlength="200" placeholder="Por ejemplo: batería"></label>
-              <label>Tipo de evento<select id="event-kind"><option value="">Todos los tipos</option><option value="power_lost">Corte eléctrico</option><option value="power_restored">Regreso de electricidad</option><option value="connection_lost">Comunicación perdida</option><option value="connection_restored">Comunicación recuperada</option><option value="monitor_error">Error del monitor</option><option value="monitor_restarted">Reinicio de Elipro</option><option value="battery_low">Batería baja</option><option value="overload">Sobrecarga</option><option value="ups_fault">Falla del UPS</option><option value="policy_countdown">Cuenta atrás</option><option value="policy_cancelled">Acción cancelada</option><option value="policy_unknown">Protección sin datos válidos</option><option value="policy_action_started">Acción iniciada</option><option value="policy_action_failed">Acción fallida</option><option value="policy_changed">Configuración de protección</option><option value="simulation">Simulaciones</option></select></label>
-              <button id="search-events" type="submit" class="button button-secondary" disabled>Buscar</button>
-            </form>
-            <p id="archive-summary" class="section-note" role="status" hidden></p>
-            <p id="archive-error" class="section-error" role="status" hidden></p>
-            <div id="event-archive-table-scroll" class="event-archive-table-scroll" tabindex="0" role="region" aria-label="Eventos del historial" aria-busy="false">
-              <table class="event-archive-table">
-                <caption class="sr-only">Eventos del historial filtrados por fecha, tipo y mensaje.</caption>
-                <thead><tr><th scope="col">Fecha y hora</th><th scope="col">Tipo</th><th scope="col">Mensaje</th></tr></thead>
-                <tbody id="archive-list"><tr><td colspan="3" class="section-empty">Cargando eventos.</td></tr></tbody>
-              </table>
-            </div>
-            <button id="more-events" class="button button-quiet more-records" type="button" hidden><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>Cargar más eventos</button>
-          </section>
+          <div class="records-pagination"><p id="records-summary" class="section-note" role="status"></p><button id="more-records" class="button button-quiet more-records" type="button" hidden><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg><span id="more-records-label">Cargar más registros</span></button></div>
         </section>
       </section>
       <section id="page-protection" class="page-view" data-page="protection" aria-label="Protección de Windows y del UPS" hidden>

@@ -9,12 +9,12 @@ Elipro es un proyecto independiente en desarrollo. No es software oficial de For
 ## Funciones
 
 - Lectura de alimentación de red/batería, voltajes de entrada y salida, frecuencia, carga del UPS, voltaje de batería y señales de batería baja o falla.
-- Cuatro secciones: **Resumen, Protección, Historial y Sistema**; temas claro y oscuro con selector sol/luna. Historial reúne las mediciones, los incidentes y los eventos, conservando sus filtros al navegar. Los eventos recientes permanecen en Resumen.
+- Cuatro secciones: **Resumen, Protección, Historial y Sistema**; temas claro y oscuro con selector sol/luna. Historial reúne las mediciones y una única tabla **Registro**, conservando sus filtros al navegar. Los eventos recientes permanecen en Resumen.
 - Resumen con un diagrama de energía: red, UPS, equipos y batería. Integra la carga del UPS en su frontal y mantiene la frecuencia junto a la salida; los recorridos solo se activan con lecturas recientes y suministro confirmado.
 - Ventana modal global para batería baja, sobrecarga, falla del UPS y cuentas atrás reales o simuladas. Durante el aviso inicial ofrece un único botón **Cancelar protección**; reconocer una alarma no cancela la actuación.
 - Avisos de Windows, sonido e icono de bandeja aunque se cierre el navegador.
 - Avisos eléctricos retenidos durante bloqueo o desconexión de sesión, con acuse de aceptación nativa y recuperación del contexto al reanudar.
-- Historial local SQLite, gráficas, tabla de incidentes con columnas ordenables, filtros y exportación CSV.
+- Historial local SQLite, gráficas, registro de incidentes y eventos sin duplicados, filtros y exportación CSV.
 - Reglas deterministas con cuenta atrás cancelable; simulación de la cuenta sin ejecutar acciones de energía.
 - Identificación independiente del UPS, simulación y control de salida separado. Incluye un perfil ligado a una unidad NT-2402PRO observada; otras unidades permanecen bloqueadas. Distingue evidencia física y tiempos configurables por el usuario.
 - Separación del historial, la lectura, los avisos y la protección; exclusión de instancias y recuperación supervisada del lector.
@@ -181,9 +181,11 @@ Guardar documentos sigue siendo necesario: el UPS usa un temporizador y no esper
 
 Al ejecutar desde el código, los datos se guardan en `data/`; el servicio instalado utiliza la carpeta de ProgramData indicada arriba. La retención predeterminada es de 30 días. Las exportaciones incluyen lo que todavía se conserva; no recuperan información ya eliminada por retención.
 
-**Historial** muestra la gráfica de mediciones, la tabla de incidentes y la tabla de eventos, sin secciones contraídas. La gráfica conserva su propio período, como los últimos 15 minutos. Los filtros **Desde** y **Hasta** se aplican conjuntamente a incidentes y eventos; no cambian el período de la gráfica. Cada tabla mantiene sus filtros específicos, su orden y la carga de más resultados. La exportación CSV corresponde a los eventos filtrados.
+**Historial** muestra la gráfica de mediciones y una única tabla **Registro**, sin secciones contraídas. La gráfica conserva su propio período, como los últimos 15 minutos. Los filtros **Desde** y **Hasta**, la categoría y la búsqueda por mensaje se aplican al Registro; no cambian el período de la gráfica. Las categorías son energía, conexión, protección, alertas, ajustes y otros. Filtrar por protección también encuentra los incidentes que contienen esas acciones, conservando su tipo principal.
 
-La tabla de incidentes permite ordenar por tipo, estado, inicio, recuperación, duración o resultado de protección. El orden se aplica a todos los resultados del intervalo consultado, incluso al cargar más páginas. Los detalles conservan los mensajes y las acciones registradas; un registro sin recuperación no confirma por sí solo que el problema continúe actualmente.
+El Registro agrupa los cortes eléctricos y los problemas de comunicación con su recuperación y sus acciones de protección. Los eventos que ya forman parte de un incidente se consultan en sus detalles; los demás aparecen como registros independientes. Los detalles conservan los mensajes y las acciones registradas, incluso cuando coinciden un corte y una pérdida de comunicación. Un incidente sin recuperación registrada no confirma por sí solo que el problema continúe actualmente.
+
+**Cargar más** amplía los resultados mostrados sin cambiar los filtros. La exportación CSV incluye todos los registros que coinciden con los filtros aplicados, no solo la página visible. La exportación de mediciones se conserva por separado.
 
 Los errores de SQLite se muestran por separado y no deben interrumpir una lectura válida ni los avisos. Las muestras normales se guardan por lotes de hasta 32 registros o 30 segundos; los eventos críticos solicitan volcado inmediato. Una cola limitada conserva registros mientras la escritura falla; si se llena, puede descartar muestras y lo informa. Los datos pendientes en memoria se pierden al finalizar el proceso.
 

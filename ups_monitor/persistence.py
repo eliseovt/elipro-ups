@@ -16,7 +16,7 @@ from collections import deque
 from dataclasses import dataclass
 
 from .alerts import CRITICAL_HISTORY_EVENTS, DEFAULT_NOTIFICATION_SETTINGS, validate_notification_settings
-from .core import (DEFAULT_POLICY, SAMPLE_FIELDS, IncidentCursorExpired, Store, _timestamp,
+from .core import (DEFAULT_POLICY, SAMPLE_FIELDS, IncidentCursorExpired, RecordCursorExpired, Store, _timestamp,
                    battery_estimate_fields, iso_utc, validate_policy)
 
 
@@ -255,7 +255,7 @@ class ResilientStore:
                 backend = self._backend
             try:
                 result = getattr(backend, method)(*args, **kwargs)
-            except IncidentCursorExpired:
+            except (IncidentCursorExpired, RecordCursorExpired):
                 raise
             except Exception as exc:
                 self._failed(exc, "read")
@@ -293,6 +293,16 @@ class ResilientStore:
     def iter_events(self, *, start=None, end=None, kind=None, query=None):
         Store._event_filters(start, end, kind, query)
         return self._export("iter_events", start=start, end=end, kind=kind, query=query)
+
+    def records(self, *, start=None, end=None, kind=None, query=None, limit=50, cursor=None):
+        filters = Store._record_filters(start, end, kind, query)
+        Store._page_limit(limit)
+        Store._decode_record_cursor(cursor, filters)
+        return self._read("records", start=start, end=end, kind=kind, query=query, limit=limit, cursor=cursor)
+
+    def iter_records(self, *, start=None, end=None, kind=None, query=None):
+        Store._record_filters(start, end, kind, query)
+        return self._export("iter_records", start=start, end=end, kind=kind, query=query)
 
     def _export(self, method, **options):
         iterator = None
