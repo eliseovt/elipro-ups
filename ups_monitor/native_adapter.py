@@ -3,13 +3,17 @@ from __future__ import annotations
 
 import socket
 import time
-from dataclasses import dataclass
+from collections import deque
+from dataclasses import dataclass, replace
+from datetime import datetime, timezone
 from enum import Enum
+import threading
 
 from .adapters import TelemetryError
 from .battery_estimation import Nt2402ProBatteryEstimator
 from .hid_windows import StatusTransport, enumerate_ups_bounded as enumerate_ups
 from .qs_protocol import parse_qs
+from .windows_udp import UdpPortReason, udp_port_occupancy
 
 
 class ForzaProbeReason(str, Enum):
@@ -20,6 +24,13 @@ class ForzaProbeReason(str, Enum):
     TIMEOUT = "timeout"
     PERMISSION_DENIED = "permission_denied"
     SOCKET_ERROR = "socket_error"
+    ENDPOINT_TABLE_EMPTY = "endpoint_table_empty"
+    ENDPOINT_OCCUPIED = "endpoint_occupied"
+    ENDPOINT_API_UNAVAILABLE = "endpoint_api_unavailable"
+    ENDPOINT_API_ERROR = "endpoint_api_error"
+    ENDPOINT_INVALID_TABLE = "endpoint_invalid_table"
+    ENDPOINT_TABLE_LIMIT = "endpoint_table_limit"
+    ENDPOINT_TABLE_UNSTABLE = "endpoint_table_unstable"
 
 
 @dataclass(frozen=True)
@@ -28,6 +39,20 @@ class ForzaProbeResult:
     reason: ForzaProbeReason
     winerror: int | None = None
     errno: int | None = None
+    pids: tuple[int, ...] = ()
+    reply_reason: ForzaProbeReason | None = None
+    family: int | None = None
+
+
+@dataclass(frozen=True)
+class OwnershipDiagnostic:
+    checked_at: str
+    duration_ms: int
+    attempts: tuple[ForzaProbeResult, ...]
+
+    @property
+    def result(self):
+        return self.attempts[-1]
 
 
 def _probe_error_result(exc, *, query_error=False):
@@ -40,13 +65,11 @@ def _probe_error_result(exc, *, query_error=False):
     return ForzaProbeResult("unknown", reason, winerror, error_number)
 
 
-def probe_forza_monitor():
-    """Distinguish a recognized OEM reply from confirmed absence or uncertainty.
+def _probe_forza_reply():
+    """Attempt positive OEM recognition after Windows found an occupied port.
 
-    A timeout/permission error is not proof that it is safe to open a second
-    collector. Only an explicit local UDP port-unreachable during the query
-    means no listener. Socket construction/configuration/close failures remain
-    uncertain even if their error number resembles a port-unreachable error.
+    Negative UDP responses are diagnostic details only; none authorizes USB or
+    overrides the ownership table. Socket setup and close errors remain unknown.
     """
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
@@ -70,6 +93,30 @@ def probe_forza_monitor():
     return result
 
 
+def probe_forza_monitor():
+    """Authorize absence from Windows tables; UDP can only recognize presence."""
+    ownership = udp_port_occupancy()
+    if ownership.state == "absent":
+        return ForzaProbeResult("absent", ForzaProbeReason.ENDPOINT_TABLE_EMPTY)
+    if ownership.state != "occupied":
+        reasons = {
+            UdpPortReason.API_UNAVAILABLE: ForzaProbeReason.ENDPOINT_API_UNAVAILABLE,
+            UdpPortReason.API_ERROR: ForzaProbeReason.ENDPOINT_API_ERROR,
+            UdpPortReason.INVALID_TABLE: ForzaProbeReason.ENDPOINT_INVALID_TABLE,
+            UdpPortReason.TABLE_LIMIT: ForzaProbeReason.ENDPOINT_TABLE_LIMIT,
+            UdpPortReason.TABLE_UNSTABLE: ForzaProbeReason.ENDPOINT_TABLE_UNSTABLE,
+        }
+        return ForzaProbeResult("unknown", reasons.get(ownership.reason, ForzaProbeReason.ENDPOINT_API_ERROR),
+                                 winerror=ownership.error_code, family=ownership.family)
+    reply = _probe_forza_reply()
+    if reply.state == "active":
+        return replace(reply, pids=ownership.pids)
+    # A timeout/closed port/error can never override a bound Windows endpoint.
+    return ForzaProbeResult("unknown", ForzaProbeReason.ENDPOINT_OCCUPIED,
+                             winerror=reply.winerror, errno=reply.errno,
+                             pids=ownership.pids, reply_reason=reply.reason)
+
+
 def forza_monitor_running():
     """Compatibility guard: uncertainty still blocks native USB or selects bridge."""
     return probe_forza_monitor().state != "absent"
@@ -85,6 +132,41 @@ class NativeHidAdapter:
         self._battery_estimator = Nt2402ProBatteryEstimator(clock=self._clock)
         self._failures = 0
         self._retry_at = 0
+        self.last_ownership_result = None
+        self._ownership_lock = threading.Lock()
+        self._ownership_current = None
+        self._ownership_recent = deque(maxlen=16)
+
+    def _record_ownership(self, attempts, started):
+        diagnostic = OwnershipDiagnostic(
+            datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            max(0, round((time.monotonic() - started) * 1000)), tuple(attempts))
+        with self._ownership_lock:
+            previous = self.last_ownership_result
+            self.last_ownership_result = diagnostic.result
+            self._ownership_current = diagnostic
+            if diagnostic.result != previous or len(diagnostic.attempts) > 1:
+                self._ownership_recent.append(diagnostic)
+
+    @staticmethod
+    def _ownership_json(diagnostic):
+        if diagnostic is None:
+            return None
+        def result_json(result):
+            return {"state": result.state, "reason": result.reason.value,
+                    "winerror": result.winerror, "errno": result.errno,
+                    "pids": list(result.pids), "family": result.family,
+                    "reply_reason": result.reply_reason.value if result.reply_reason is not None else None}
+        return {"checked_at": diagnostic.checked_at, "duration_ms": diagnostic.duration_ms,
+                "attempts": [result_json(result) for result in diagnostic.attempts],
+                "result": result_json(diagnostic.result)}
+
+    def ownership_status(self):
+        """Copy bounded immutable evidence without any disk or notification I/O."""
+        with self._ownership_lock:
+            current, recent = self._ownership_current, tuple(self._ownership_recent)
+        return {"current": self._ownership_json(current),
+                "recent": [self._ownership_json(diagnostic) for diagnostic in recent]}
 
     @property
     def retry_after_seconds(self):
@@ -93,12 +175,16 @@ class NativeHidAdapter:
     def read(self):
         if self.retry_after_seconds:
             raise TelemetryError("USB en reconexión automática; próximo intento tras el plazo de espera.")
+        started = time.monotonic()
         result = probe_forza_monitor()
+        attempts = [result]
         for _ in range(2):
             if result.state != "unknown":
                 break
             time.sleep(0.1)
             result = probe_forza_monitor()
+            attempts.append(result)
+        self._record_ownership(attempts, started)
         if result.state != "absent":
             self._battery_estimator.reset()
             self.transport = None
@@ -106,6 +192,9 @@ class NativeHidAdapter:
                 raise TelemetryError("El colector ForzaTracker está activo. Detén ese lector antes de usar USB directo para evitar consultas simultáneas.")
             code = (f", winerror={result.winerror}" if result.winerror is not None else "")
             code += (f", errno={result.errno}" if result.errno is not None else "")
+            code += (f", pids={result.pids}" if result.pids else "")
+            code += (f", reply={result.reply_reason.value}" if result.reply_reason is not None else "")
+            code += (f", family={result.family}" if result.family is not None else "")
             raise TelemetryError("No se pudo confirmar que el USB esté libre. Elipro reintentará automáticamente. "
                                  f"Motivo: {result.reason.value}{code}.")
         try:

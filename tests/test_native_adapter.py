@@ -1,4 +1,6 @@
 import socket
+import json
+import time
 from dataclasses import FrozenInstanceError
 import unittest
 from unittest.mock import Mock, patch
@@ -6,7 +8,8 @@ from unittest.mock import Mock, patch
 from ups_monitor.adapters import ForzaBridge, TelemetryError
 from ups_monitor.battery_estimation import BATTERY_ESTIMATE_METHOD
 from ups_monitor.native_adapter import (ForzaProbeReason, ForzaProbeResult, NativeHidAdapter,
-                                        forza_monitor_running, make_adapter, probe_forza_monitor)
+                                        forza_monitor_running, make_adapter, probe_forza_monitor, _probe_forza_reply)
+from ups_monitor.windows_udp import UdpPortReason, UdpPortResult
 
 PATH = r"\\?\hid#vid_0665&pid_5161#unit#{4d1e55b2-f16f-11cf-88cb-001111000030}"
 FRAME = bytes.fromhex("236701206c206701206c200820500f2012c00020e9203c200920a20d")
@@ -85,6 +88,9 @@ class NativeAdapterTests(unittest.TestCase):
         self.assertEqual(sample["battery_percent_estimate"], 100)
         transport.query_status.assert_called_once_with()
         self.assertEqual(adapter._failures, 0)
+        evidence = adapter.ownership_status()
+        self.assertEqual([attempt["state"] for attempt in evidence["current"]["attempts"]], ["unknown", "absent"])
+        self.assertEqual(evidence["recent"][-1], evidence["current"])
 
     def test_retry_stops_immediately_when_oem_is_confirmed(self):
         adapter = NativeHidAdapter()
@@ -291,7 +297,7 @@ class NativeAdapterTests(unittest.TestCase):
         context.__enter__ = Mock(return_value=probe)
         context.__exit__ = Mock(return_value=False)
         with patch("ups_monitor.native_adapter.socket.socket", return_value=context):
-            self.assertIs(forza_monitor_running(), True)
+            self.assertEqual(_probe_forza_reply().state, "active")
         probe.settimeout.assert_called_once_with(0.3)
         probe.connect.assert_called_once_with(("127.0.0.1", 51222))
         probe.send.assert_called_once_with(b"VP_LINK")
@@ -308,7 +314,7 @@ class NativeAdapterTests(unittest.TestCase):
                 channel.recv.return_value = reply
                 context = Mock(__enter__=Mock(return_value=channel), __exit__=Mock(return_value=False))
                 with patch("ups_monitor.native_adapter.socket.socket", return_value=context):
-                    result = probe_forza_monitor()
+                    result = _probe_forza_reply()
                 self.assertEqual((result.state, result.reason), (state, reason))
                 context.__exit__.assert_called_once()
 
@@ -327,7 +333,7 @@ class NativeAdapterTests(unittest.TestCase):
                     getattr(channel, operation).side_effect = error
                     context = Mock(__enter__=Mock(return_value=channel), __exit__=Mock(return_value=False))
                     with patch("ups_monitor.native_adapter.socket.socket", return_value=context):
-                        result = probe_forza_monitor()
+                        result = _probe_forza_reply()
                     self.assertEqual((result.state, result.reason), (state, reason))
                     self.assertEqual(result.errno, error.errno)
                     self.assertEqual(result.winerror, getattr(error, "winerror", None))
@@ -350,7 +356,7 @@ class NativeAdapterTests(unittest.TestCase):
                 else:
                     context.__exit__.side_effect = error
                 with patch("ups_monitor.native_adapter.socket.socket", factory):
-                    result = probe_forza_monitor()
+                    result = _probe_forza_reply()
                 self.assertEqual((result.state, result.reason), ("unknown", ForzaProbeReason.SOCKET_ERROR))
                 self.assertEqual(result.errno, 10061)
 
@@ -362,13 +368,14 @@ class NativeAdapterTests(unittest.TestCase):
                 context = Mock(__enter__=Mock(return_value=channel),
                                __exit__=Mock(side_effect=OSError(10061, "close failed")))
                 with patch("ups_monitor.native_adapter.socket.socket", return_value=context), \
+                     patch("ups_monitor.native_adapter.udp_port_occupancy", return_value=UdpPortResult("occupied", UdpPortReason.ENDPOINT_BOUND, pids=(0,))), \
                      patch("ups_monitor.native_adapter.time.sleep") as sleep, \
                      patch("ups_monitor.native_adapter.enumerate_ups") as enumerate_hid, \
                      patch("ups_monitor.native_adapter.StatusTransport") as transport:
-                    result = probe_forza_monitor()
+                    result = _probe_forza_reply()
                     self.assertEqual((result.state, result.reason, result.errno),
                                      ("unknown", ForzaProbeReason.SOCKET_ERROR, 10061))
-                    with self.assertRaisesRegex(TelemetryError, "socket_error, errno=10061"):
+                    with self.assertRaisesRegex(TelemetryError, "endpoint_occupied, errno=10061"):
                         NativeHidAdapter().read()
                 self.assertEqual(context.__enter__.call_count, 4)
                 self.assertEqual(context.__exit__.call_count, 4)
@@ -382,6 +389,110 @@ class NativeAdapterTests(unittest.TestCase):
                  patch("ups_monitor.native_adapter.probe_forza_monitor", return_value=result):
                 self.assertIs(forza_monitor_running(), expected)
 
+    def test_table_absence_allows_native_qs_without_udp_even_if_socket_would_fail(self):
+        transport = Mock()
+        transport.query_status.return_value = FRAME
+        with patch("ups_monitor.native_adapter.udp_port_occupancy", return_value=UdpPortResult("absent", UdpPortReason.NO_ENDPOINT)) as table, \
+             patch("ups_monitor.native_adapter.socket.socket", side_effect=AssertionError("No UDP is needed")) as socket_factory, \
+             patch("ups_monitor.native_adapter.enumerate_ups", return_value=[metadata()]), \
+             patch("ups_monitor.native_adapter.StatusTransport", return_value=transport):
+            adapter = NativeHidAdapter()
+            self.assertEqual(adapter.read()["battery_percent_estimate"], 100)
+            self.assertEqual(adapter.read()["battery_voltage"], 27.41)
+        self.assertEqual(table.call_count, 2)
+        socket_factory.assert_not_called()
+        self.assertEqual(transport.query_status.call_count, 2)
+        self.assertEqual(adapter.last_ownership_result.reason, ForzaProbeReason.ENDPOINT_TABLE_EMPTY)
+
+    def test_bound_endpoint_cannot_be_overridden_by_negative_or_uncertain_udp(self):
+        for error in (ConnectionRefusedError(111, "closed"), TimeoutError(), PermissionError(13, "private text")):
+            with self.subTest(error=type(error).__name__):
+                channel = Mock()
+                channel.recv.side_effect = error
+                context = Mock(__enter__=Mock(return_value=channel), __exit__=Mock(return_value=False))
+                with patch("ups_monitor.native_adapter.udp_port_occupancy", return_value=UdpPortResult(
+                        "occupied", UdpPortReason.ENDPOINT_BOUND, pids=(0, 42))), \
+                     patch("ups_monitor.native_adapter.socket.socket", return_value=context), \
+                     patch("ups_monitor.native_adapter.time.sleep"), \
+                     patch("ups_monitor.native_adapter.enumerate_ups") as enumerate_hid, \
+                     patch("ups_monitor.native_adapter.StatusTransport") as transport:
+                    adapter = NativeHidAdapter()
+                    with self.assertRaisesRegex(TelemetryError, "endpoint_occupied") as error_context:
+                        adapter.read()
+                self.assertNotIn("ForzaTracker está activo", str(error_context.exception))
+                self.assertNotIn("private text", str(error_context.exception))
+                self.assertEqual(adapter.last_ownership_result.pids, (0, 42))
+                self.assertEqual(adapter.last_ownership_result.state, "unknown")
+                self.assertEqual(channel.recv.call_count, 3)
+                enumerate_hid.assert_not_called()
+                transport.assert_not_called()
+
+    def test_table_failure_blocks_usb_without_udp_recognition_and_preserves_family(self):
+        with patch("ups_monitor.native_adapter.udp_port_occupancy", return_value=UdpPortResult(
+                "unknown", UdpPortReason.API_ERROR, error_code=5, family=23)) as table, \
+             patch("ups_monitor.native_adapter.socket.socket") as socket_factory, \
+             patch("ups_monitor.native_adapter.time.sleep"), \
+             patch("ups_monitor.native_adapter.enumerate_ups") as enumerate_hid, \
+             patch("ups_monitor.native_adapter.StatusTransport") as transport:
+            adapter = NativeHidAdapter()
+            with self.assertRaisesRegex(TelemetryError, "endpoint_api_error, winerror=5, family=23"):
+                adapter.read()
+        self.assertEqual(table.call_count, 3)
+        self.assertEqual(adapter.last_ownership_result.family, 23)
+        socket_factory.assert_not_called()
+        enumerate_hid.assert_not_called()
+        transport.assert_not_called()
+
+    def test_endpoint_appearing_between_reads_stops_cached_qs_and_records_only_state_changes(self):
+        table_results = [UdpPortResult("absent", UdpPortReason.NO_ENDPOINT)] * 2 + [
+            UdpPortResult("occupied", UdpPortReason.ENDPOINT_BOUND, pids=(42,))]
+        channel = Mock()
+        channel.recv.return_value = b"monitorOK"
+        context = Mock(__enter__=Mock(return_value=channel), __exit__=Mock(return_value=False))
+        transport = Mock()
+        transport.query_status.return_value = FRAME
+        with patch("ups_monitor.native_adapter.udp_port_occupancy", side_effect=table_results), \
+             patch("ups_monitor.native_adapter.socket.socket", return_value=context), \
+             patch("ups_monitor.native_adapter.enumerate_ups", return_value=[metadata()]), \
+             patch("ups_monitor.native_adapter.StatusTransport", return_value=transport), \
+             self.assertNoLogs("elipro.monitor", level="INFO"):
+            adapter = NativeHidAdapter()
+            adapter.read()
+            adapter.read()
+            with self.assertRaisesRegex(TelemetryError, "ForzaTracker está activo"):
+                adapter.read()
+        self.assertEqual(transport.query_status.call_count, 2)
+        self.assertIsNone(adapter.transport)
+        evidence = adapter.ownership_status()
+        self.assertEqual(len(evidence["recent"]), 2)
+        self.assertEqual(evidence["recent"][0]["result"]["reason"], "endpoint_table_empty")
+        self.assertEqual(evidence["current"]["result"]["pids"], [42])
+        self.assertEqual(evidence["current"]["result"]["state"], "active")
+        self.assertEqual(len(evidence["current"]["attempts"]), 1)
+        self.assertGreaterEqual(evidence["current"]["duration_ms"], 0)
+        self.assertTrue(evidence["current"]["checked_at"].endswith("Z"))
+        self.assertNotIn("monitorOK", json.dumps(evidence))
+
+    def test_diagnostic_memory_is_bounded_copied_and_retains_transient_attempts(self):
+        adapter = NativeHidAdapter()
+        self.assertEqual(adapter.ownership_status(), {"current": None, "recent": []})
+        for code in range(40):
+            transient = ForzaProbeResult("unknown", ForzaProbeReason.ENDPOINT_API_ERROR, winerror=code, family=23)
+            adapter._record_ownership((transient, ABSENT), time.monotonic())
+        evidence = adapter.ownership_status()
+        self.assertEqual(len(evidence["recent"]), 16)
+        self.assertEqual(evidence["recent"][0]["attempts"][0]["winerror"], 24)
+        self.assertEqual(evidence["current"]["attempts"][0]["family"], 23)
+        self.assertEqual(len(evidence["current"]["attempts"]), 2)
+        json.dumps(evidence, allow_nan=False)
+        evidence["current"]["result"]["state"] = "mutated"
+        evidence["recent"].clear()
+        evidence["current"]["attempts"][0]["pids"].append(999)
+        actual = adapter.ownership_status()
+        self.assertEqual(actual["current"]["result"]["state"], "absent")
+        self.assertEqual(actual["current"]["attempts"][0]["pids"], [])
+        self.assertEqual(len(actual["recent"]), 16)
+
     def test_udp_uncertainty_and_unexpected_replies_block_native_reads(self):
         for error, unsafe in [(TimeoutError(), True), (PermissionError(13, "denied"), True),
                               (OSError("unknown"), True), (ConnectionResetError(10054, "unreachable"), False),
@@ -392,7 +503,7 @@ class NativeAdapterTests(unittest.TestCase):
             context.__enter__ = Mock(return_value=probe)
             context.__exit__ = Mock(return_value=False)
             with patch("ups_monitor.native_adapter.socket.socket", return_value=context):
-                self.assertIs(forza_monitor_running(), unsafe)
+                self.assertIs(_probe_forza_reply().state != "absent", unsafe)
         for reply in [b"unexpected", b""]:
             probe = Mock()
             probe.recv.return_value = reply
@@ -400,7 +511,7 @@ class NativeAdapterTests(unittest.TestCase):
             context.__enter__ = Mock(return_value=probe)
             context.__exit__ = Mock(return_value=False)
             with patch("ups_monitor.native_adapter.socket.socket", return_value=context):
-                self.assertIs(forza_monitor_running(), True)
+                self.assertEqual(_probe_forza_reply().state, "unknown")
 
 
 if __name__ == "__main__":

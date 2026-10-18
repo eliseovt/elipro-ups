@@ -124,13 +124,15 @@ begin
   end;
   if FileExists(ExpandConstant('{app}\Elipro.exe')) then
   begin
-    if not RunServiceCommand('stop') then
-      Result := 'No se pudo detener el servicio de Elipro. Ciérralo desde Servicios de Windows e inténtalo de nuevo.';
+    // End this session's notifications before the planned service outage.
+    // An unexpected service loss still warns through the running agent.
+    if not Exec(ExpandConstant('{app}\Elipro.exe'), 'agent --stop',
+      ExpandConstant('{app}'), SW_HIDE, ewWaitUntilTerminated, ResultCode) or
+      (ResultCode <> 0) then
+      Result := 'No se pudo cerrar el agente de avisos de Elipro. Ciérralo e inténtalo de nuevo.';
     if Result = '' then
-      if not Exec(ExpandConstant('{app}\Elipro.exe'), 'agent --stop',
-        ExpandConstant('{app}'), SW_HIDE, ewWaitUntilTerminated, ResultCode) or
-        (ResultCode <> 0) then
-        Result := 'No se pudo cerrar el agente de avisos de Elipro. Ciérralo e inténtalo de nuevo.';
+      if not RunServiceCommand('stop') then
+        Result := 'No se pudo detener el servicio de Elipro. Ciérralo desde Servicios de Windows e inténtalo de nuevo.';
   end;
   if Result = '' then
     if CheckForMutexes('Global\EliproUPS.Monitor,Global\EliproUPS.Guardian') then
@@ -162,13 +164,13 @@ var
 begin
   if CurUninstallStep = usUninstall then
   begin
-    if not RunServiceCommand('stop') then
-      RaiseException('No se pudo detener el servicio de Elipro; la desinstalación se ha detenido.');
-    if not RunServiceCommand('remove') then
-      RaiseException('No se pudo quitar el servicio de Elipro; la desinstalación se ha detenido.');
     if not Exec(ExpandConstant('{app}\Elipro.exe'), 'agent --stop',
       ExpandConstant('{app}'), SW_HIDE, ewWaitUntilTerminated, ResultCode) or
       (ResultCode <> 0) then
       RaiseException('No se pudo cerrar el agente de avisos de Elipro; la desinstalación se ha detenido.');
+    if not RunServiceCommand('stop') then
+      RaiseException('No se pudo detener el servicio de Elipro; la desinstalación se ha detenido.');
+    if not RunServiceCommand('remove') then
+      RaiseException('No se pudo quitar el servicio de Elipro; la desinstalación se ha detenido.');
   end;
 end;

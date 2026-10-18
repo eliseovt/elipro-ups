@@ -286,6 +286,9 @@ class Monitor:
             "next_poll_in_seconds": max(0, round(self._next_poll_at - self.health.clock(), 2))
                 if self._next_poll_at is not None else 0,
         })
+        ownership_status = getattr(type(self.adapter), "ownership_status", None)
+        if callable(ownership_status):
+            status["usb_ownership"] = self.adapter.ownership_status()
         observation = getattr(self, "observation", None)
         if observation is not None:
             status["observation"] = observation.status()
