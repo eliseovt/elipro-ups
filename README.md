@@ -11,6 +11,7 @@ Elipro es un proyecto independiente en desarrollo. No es software oficial de For
 - Lectura de alimentación de red/batería, voltajes de entrada y salida, frecuencia, carga del UPS, voltaje de batería y señales de batería baja o falla.
 - Seis secciones: **Resumen, Incidentes, Historial, Protección, Avisos y Sistema**; temas claro y oscuro.
 - Avisos de Windows, sonido e icono de bandeja aunque se cierre el navegador.
+- Avisos eléctricos retenidos durante bloqueo o desconexión de sesión, con acuse de aceptación nativa y recuperación del contexto al reanudar.
 - Historial local SQLite, gráficas, incidentes, filtros, exportación CSV, diagnóstico y respaldo ZIP.
 - Reglas deterministas con cuenta atrás cancelable; simulación de la cuenta sin ejecutar acciones de energía.
 - Separación del historial, la lectura, los avisos y la protección; exclusión de instancias y recuperación supervisada del lector.
@@ -33,14 +34,31 @@ La desinstalación detiene y elimina el servicio y el inicio del agente, pero co
 
 ### GitHub Actions
 
-El workflow **Windows x64 installer** ejecuta las pruebas, empaqueta el programa, genera el instalador y comprueba una instalación/desinstalación en el runner desechable de Windows. Su modo de comprobación del servicio no utiliza USB ni ejecuta acciones de energía.
+El workflow **Windows x64 installer** ejecuta las pruebas, empaqueta el programa en directorio (`onedir`), genera el instalador y comprueba instalación, actualización y desinstalación en el runner desechable de Windows. La prueba inicia el monitor completo como servicio en Sesión 0 con un UPS simulado: verifica API, transiciones, historial y motor de protección sin USB ni escritorio interactivo. Las acciones reales están bloqueadas en la simulación.
 
 Se ejecuta al subir cambios a `main`, en etiquetas `v*`, en pull requests y desde **Actions → Windows x64 installer → Run workflow**. Al finalizar correctamente, el artefacto `Elipro-Windows-x64-<número>` contiene:
 
 - `Elipro-Setup-x64.exe`
 - `Elipro-Setup-x64.exe.sha256`
+- `signing-status.json`, que distingue compilación firmada y sin firmar.
 
 Los artefactos se conservan 14 días. El workflow no publica automáticamente una GitHub Release.
+
+### Firma digital opcional
+
+La compilación normal no requiere certificado y se identifica como **sin firmar**. La firma auténtica necesita un certificado de firma de código válido con su clave privada. No se crean certificados de prueba ni se modifican almacenes de confianza para aparentar una firma válida. Una firma no garantiza eliminar advertencias de reputación de SmartScreen ni detecciones de antivirus.
+
+Para compilar con un certificado ya instalado en el almacén personal de Windows:
+
+```powershell
+.\packaging\windows\Build-Windows.ps1 -SigningCertificateThumbprint '<huella de 40 caracteres hexadecimales>' -RequireSigning
+```
+
+`-RequireSigning` rechaza una compilación si falta el certificado, la herramienta, el sellado de tiempo o una verificación válida. Sin esa opción, un intento de firma configurado que falla tampoco se rebaja silenciosamente a una distribución sin firmar. Las contraseñas y el archivo PFX no se pasan como argumentos a SignTool. El SHA256 del instalador se calcula después de firmar.
+
+En GitHub, la firma usa un job separado y manual desde `main` o una etiqueta `v*`, después del job normal aprobado. Antes de utilizarlo, configura el entorno **release-signing** con revisores requeridos y restricciones para esas referencias. Guarda allí los secretos `ELIPRO_SIGNING_PFX_BASE64` y `ELIPRO_SIGNING_PFX_PASSWORD`; no los incluyas en archivos ni mensajes. La variable opcional `ELIPRO_SIGNING_TIMESTAMP_URL` permite elegir el servidor HTTPS de sellado RFC3161.
+
+En **Run workflow**, activa `sign_release` solo cuando ese entorno y un certificado válido estén preparados. El job importa temporalmente el certificado en el almacén personal del runner, firma y verifica, y elimina el PFX y la clave importada al terminar. Las pull requests y compilaciones normales no reciben esos secretos. El artefacto firmado lleva `signed` en su nombre.
 
 ### Compilar localmente
 

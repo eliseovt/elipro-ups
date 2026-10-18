@@ -71,7 +71,9 @@ class NativeHidAdapter:
 
 
 def make_adapter(source, forza_url):
-    from .adapters import ForzaBridge
+    from .adapters import ForzaBridge, SimulationAdapter
+    if source == "simulation":
+        return SimulationAdapter()
     if source not in ("auto", "native", "bridge"):
         raise ValueError("Fuente de datos no válida.")
     if source == "auto":

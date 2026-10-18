@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import math
 import re
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -12,6 +13,38 @@ from datetime import datetime, timezone
 
 class TelemetryError(RuntimeError):
     pass
+
+
+class SimulationAdapter:
+    """Explicit CI-only telemetry source; never enumerates HID or opens sockets.
+
+    A 40-second repeatable scenario exercises online, battery, low battery and
+    recovery through the real monitor/engine. Unsupported battery percentage
+    and runtime stay unavailable. The marker independently blocks OS actions.
+    """
+
+    source = "SIMULACIÓN CI · sin UPS físico"
+    bridge_required = False
+    simulation = True
+    cycle_seconds = 40
+
+    def __init__(self, *, clock=time.monotonic, utc_clock=None):
+        self._clock = clock
+        self._utc_clock = utc_clock or (lambda: datetime.now(timezone.utc))
+        self._started_at = clock()
+
+    def read(self):
+        elapsed = max(0, self._clock() - self._started_at) % self.cycle_seconds
+        phase = "online" if elapsed < 6 or elapsed >= 30 else ("battery" if elapsed < 12 else "low_battery")
+        on_battery = phase != "online"
+        return {"timestamp": self._utc_clock().astimezone(timezone.utc).isoformat(),
+                "input_voltage": 0.0 if on_battery else 220.0,
+                "output_voltage": 220.0, "frequency_hz": 60.0, "load_percent": 10,
+                "battery_percent": None, "battery_voltage": 24.0 if phase == "low_battery" else 27.4,
+                "runtime_seconds": None, "temperature_c": None, "on_battery": on_battery,
+                "low_battery": phase == "low_battery", "fault": False, "estimated_watts": None,
+                "watts_is_estimate": False, "raw_status": "SIMULATION/" + phase,
+                "simulated": True}
 
 
 def number(value, minimum=None, maximum=None):

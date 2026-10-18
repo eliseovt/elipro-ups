@@ -85,7 +85,9 @@ def write_events_csv(store, options, target):
 class Monitor:
     def __init__(self, store, adapter, *, dry_run=False, action_callback=None, alerts=None, health_clock=None,
                  telemetry_capacity=256, poll_interval=2):
-        self.store, self.adapter, self.dry_run = store, adapter, dry_run
+        self.store, self.adapter = store, adapter
+        self.simulation_source = getattr(adapter, "simulation", False) is True
+        self.dry_run = bool(dry_run) or self.simulation_source
         self.alerts = alerts
         self.lock = threading.RLock()
         self.settings_lock = threading.Lock()
@@ -168,7 +170,7 @@ class Monitor:
     def _update_alerts(self):
         if self.alerts is not None and not self.stop_event.is_set():
             try:
-                protection = {**self.engine.status(), "simulation": self.dry_run}
+                protection = {**self.engine.status(), "simulation": self.power_actions_blocked}
                 self.alerts.update(protection, {"state": self.connection}, self.sample)
             except Exception as exc:
                 log_failure("No se pudieron actualizar los avisos locales", exc)
@@ -194,13 +196,17 @@ class Monitor:
         return self.snapshot()
 
     def _policy_event(self, kind, message, data):
-        if self.dry_run and kind == "policy_action_started":
+        if self.power_actions_blocked and kind == "policy_action_started":
             return
         # Routine online/disabled states add no noise to the incident history.
         if kind not in ("policy_online", "policy_disabled", "policy_on_battery"):
             if kind == "policy_countdown":
-                data = {**(data or {}), **self.engine.status(), "simulation": self.dry_run}
+                data = {**(data or {}), **self.engine.status(), "simulation": self.power_actions_blocked}
             self._event(kind, message, data)
+
+    @property
+    def power_actions_blocked(self):
+        return self.dry_run or self.simulation_source
 
     def _act(self, action):
         if self.stop_event.is_set():
@@ -213,7 +219,7 @@ class Monitor:
             raise RuntimeError("El procesador de telemetría no está activo; acción bloqueada.")
         if self._processing_sequence is not None and not self.telemetry.is_latest(self._processing_sequence):
             raise RuntimeError("Hay telemetría más reciente pendiente; acción bloqueada.")
-        if self.dry_run:
+        if self.power_actions_blocked:
             self._event("simulation", "Modo de desarrollo: acción simulada; Windows sigue encendido.")
         else:
             if not self._fresh_sample(self.sample):
@@ -594,9 +600,9 @@ class Monitor:
                      "action_failed": "blocked", "action_started": "executed"}.get(raw["state"], "idle")
             remaining = raw["countdown_remaining"]
             notice = self.test_deadline is not None and raw["state"] != "countdown"
-            simulation = self.dry_run or notice
+            simulation = self.power_actions_blocked or notice
             reason = raw["reason"]
-            if self.dry_run and raw["state"] == "action_started":
+            if self.power_actions_blocked and raw["state"] == "action_started":
                 reason = "Acción simulada; Windows sigue encendido."
             if notice:
                 remaining = max(0, int(self.test_deadline - time.monotonic() + 0.999))
@@ -622,9 +628,10 @@ class Monitor:
                                "deadline": iso_utc(datetime.now(timezone.utc) + timedelta(seconds=remaining)) if remaining else None},
                 "meta": {"name": "Elipro UPS", "model": "Forza NT-2402PRO", "capacity_watts": 1200,
                          "capacity_va": 2400, "history_interval_seconds": 10, "retention_days": self.store.retention_days,
-                         "dry_run": self.dry_run, "version": __version__,
+                         "dry_run": self.power_actions_blocked, "simulation_source": self.simulation_source, "version": __version__,
                          "runtime_mode": getattr(self, "runtime_mode", "session"),
-                         "source": "bridge" if getattr(self.adapter, "bridge_required", True) else "native",
+                         "source": "simulation" if self.simulation_source else (
+                             "bridge" if getattr(self.adapter, "bridge_required", True) else "native"),
                          "bridge_required": getattr(self.adapter, "bridge_required", True)},
             }
 
@@ -653,7 +660,7 @@ class Monitor:
                 observation = getattr(self, "observation", None)
                 if observation is not None:
                     try:
-                        observation.record_policy_change(value["enabled"], self.dry_run)
+                        observation.record_policy_change(value["enabled"], self.power_actions_blocked)
                     except Exception as exc:
                         log_failure("No se pudo registrar el cambio de política en la observación", exc)
                 self._event("policy_changed", "Protección automática " + ("activada." if value["enabled"] else "desactivada."))
@@ -871,7 +878,7 @@ def main(argv=None, *, stop_event=None, ready_callback=None):
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--data-dir", type=Path, default=default_data_dir())
     parser.add_argument("--forza-url", default="http://127.0.0.1:15179/Forza")
-    parser.add_argument("--source", choices=("auto", "native", "bridge"), default="auto")
+    parser.add_argument("--source", choices=("auto", "native", "bridge", "simulation"), default="auto")
     parser.add_argument("--usb-info", action="store_true", help="Inspecciona metadatos HID sin enviar consultas")
     parser.add_argument("--dry-run", action="store_true", help="Bloquea acciones reales en Windows para desarrollo")
     parser.add_argument("--diagnose", action="store_true", help="Lee una muestra real y termina")
@@ -879,6 +886,10 @@ def main(argv=None, *, stop_event=None, ready_callback=None):
     parser.add_argument("--observe-hours", type=float, default=0,
                         help="Inicia una observación de estabilidad (0 desactiva; hasta 168 horas)")
     args = parser.parse_args(argv)
+    if args.source == "simulation":
+        args.dry_run = True
+        if args.usb_info:
+            parser.error("La simulación no permite inspeccionar USB")
     if not math.isfinite(args.observe_hours) or not (args.observe_hours == 0 or 0.01 <= args.observe_hours <= 168):
         parser.error("--observe-hours debe ser 0 o un valor entre 0.01 y 168")
     if args.usb_info:
@@ -909,6 +920,8 @@ def _run_owned_monitor(args, ownership, *, stop_event=None, ready_callback=None)
     monitor = server = alerts = store = log_handler = observation = None
     safe_to_release = True
     try:
+        if args.source == "simulation":
+            args.dry_run = True
         adapter = make_adapter(args.source, args.forza_url)
         if args.diagnose:
             print(json.dumps(adapter.read(), indent=2, ensure_ascii=False))

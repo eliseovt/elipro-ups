@@ -27,3 +27,15 @@ El broker vuelve a construir los avisos a partir del contexto reciente. Un corte
 El notificador Python y el lanzador C# solicitan PMv2 antes de crear ventanas. Las ventanas propias ajustan geometría y fuentes y procesan `WM_DPICHANGED`. Las API ausentes o un contexto ya fijado no impiden iniciar el agente. Estas pruebas de API no sustituyen una revisión visual en el monitor y escalado de destino.
 
 Referencias: [DPI de proceso](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-setprocessdpiawarenesscontext), [estado WTSInfoEx](https://learn.microsoft.com/en-us/windows/win32/api/wtsapi32/ns-wtsapi32-wtsinfoex_level1_w) y [programas de servicio](https://learn.microsoft.com/en-us/windows/win32/services/service-programs).
+
+## Empaquetado y CI
+
+PyInstaller genera un directorio con dependencias en `_internal`, instalado en Program Files. No se utiliza un ejecutable autoextraíble `onefile`. Las herramientas Python de compilación están fijadas con versión y SHA256 en `requirements-build.txt`; CI las instala con `--require-hashes --only-binary=:all:`. UPX permanece desactivado y no se incorporan datos de usuario.
+
+La comprobación del instalador está restringida al runner Windows x64 desechable. Su modo de simulación ejecuta el monitor, API, historial y protección reales con un adaptador artificial y timestamps recientes. El adaptador, el monitor y el host del servicio fuerzan el bloqueo de acciones reales. Se comprueban la cuenta LocalSystem, Sesión 0, transiciones eléctricas, una acción simulada, actualización y conservación de datos al desinstalar. No se requiere agente gráfico ni UPS físico.
+
+La firma es opcional y usa una huella explícita del almacén personal de certificados. SignTool utiliza SHA256, sellado RFC3161 y verificación Authenticode; la verificación comprueba además la huella seleccionada y el certificado de sellado. Se firman los ejecutables propios, Setup y el desinstalador; las dependencias de otros proveedores conservan sus firmas. El checksum se calcula después de la firma. Un error de firma o verificación detiene la compilación solicitada, sin rebajarla silenciosamente a una compilación sin firmar.
+
+Sin certificado configurado se genera un informe explícito de distribución sin firmar. `-RequireSigning` exige todos los requisitos de firma. No se crean certificados ni raíces de confianza para superar una prueba. La ruta CI con secretos requiere ejecución manual sobre una referencia admitida y un entorno de firma protegido; importa el PFX temporalmente y limpia su archivo y clave privada en `finally`. El entorno requiere configuración administrativa de revisores y restricciones antes de utilizarlo. No se ha validado una firma real mientras no se disponga de un certificado.
+
+Referencias: [SignTool](https://learn.microsoft.com/en-us/windows/win32/seccrypto/signtool) y [entornos protegidos de GitHub Actions](https://docs.github.com/en/actions/deployment/targeting-different-environments/managing-environments-for-deployment).
