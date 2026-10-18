@@ -1,0 +1,13 @@
+Elipro UPS Windows distribution
+
+This distribution includes the Python runtime. Its license and incorporated
+third-party notices are in licenses/Python-LICENSE.txt.
+Python: https://www.python.org/
+
+The executable is packaged with PyInstaller. The bootloader's GPL license has
+a special exception allowing distributions made with PyInstaller. The exact
+terms are in licenses/PyInstaller-COPYING.txt.
+PyInstaller: https://pyinstaller.org/
+
+Elipro UPS is an independent project, not an official Forza application.
+Third-party names identify compatible products and remain their owners' marks.

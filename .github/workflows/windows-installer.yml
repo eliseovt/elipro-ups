@@ -1,0 +1,82 @@
+name: Windows x64 installer
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+
+# No release publishing, repository writes, credentials or signing secrets.
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-installer-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Test and build Windows x64
+    runs-on: windows-2025
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      PYTHONUTF8: "1"
+      PYTHONDONTWRITEBYTECODE: "1"
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python x64
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+          architecture: x64
+
+      - name: Set up Node.js for interface tests
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24"
+          package-manager-cache: false
+
+      - name: Run Python tests with mocked hardware and power actions
+        run: python -m unittest discover -s tests -v
+
+      - name: Run interface tests
+        run: node --test tests/test_notifications_ui.js
+
+      - name: Install verified build dependencies
+        run: python -m pip install --require-hashes --only-binary=:all: -r requirements-build.txt
+
+      - name: Build and check executable and installer
+        run: ./packaging/windows/Build-Windows.ps1
+
+      - name: Install and uninstall on the disposable runner
+        run: ./packaging/windows/Test-Installer.ps1
+
+      - name: Upload installer and checksum
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: Elipro-Windows-x64-${{ github.run_number }}
+          path: |
+            dist/installer/Elipro-Setup-x64.exe
+            dist/installer/Elipro-Setup-x64.exe.sha256
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
+
+      - name: Upload installer test diagnostics
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: Installer-diagnostics-${{ github.run_number }}
+          path: dist/installer-test/*.log
+          if-no-files-found: ignore
+          retention-days: 7

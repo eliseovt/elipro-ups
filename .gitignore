@@ -1,0 +1,57 @@
+# Local monitor data, settings, reports and development databases
+/data/
+/.test-data/
+*.sqlite3
+*.sqlite3-*
+*.sqlite3.*
+*.db-wal
+*.db-shm
+*.pid
+*.log
+
+# Python / test / editor caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+coverage/
+.cache/
+.venv/
+venv/
+env/
+node_modules/
+.idea/
+.vscode/
+
+# Packaging output; source specifications and artwork remain versioned
+/build/
+/dist/
+/artifacts/
+*.egg-info/
+/Elipro-Setup*.exe
+/Elipro-Setup*.msi
+/Elipro-*.zip
+
+# Credentials and local-only configuration
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.pfx
+*.p12
+credentials.json
+secrets.json
+
+# Local screenshots contain unit telemetry and third-party application UI.
+# Design exploration is retained locally, outside the published source.
+/docs/*.png
+/docs/design/
+
+# Operating-system metadata
+Thumbs.db
+Desktop.ini
+.DS_Store

@@ -1,0 +1,227 @@
+<!doctype html>
+<html lang="es" data-theme="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#0b1015">
+  <title>Elipro UPS · Monitor local</title>
+  <link rel="icon" href="/favicon.ico" type="image/vnd.microsoft.icon">
+  <script src="/app.js"></script>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <div class="app-layout">
+    <aside class="sidebar" aria-label="Navegación de Elipro UPS">
+      <a class="brand sidebar-brand" href="#resumen" data-go-view="overview" aria-label="Elipro UPS, resumen">
+        <span class="brand-mark" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="m13.5 2-8 12h6L10.5 22l8-12h-6Z"/></svg></span>
+        <span>elipro<span class="brand-local">UPS</span></span>
+      </a>
+      <div class="sidebar-label">CENTRO DE ENERGÍA</div>
+      <nav class="sidebar-nav" aria-label="Secciones del monitor">
+        <button type="button" class="nav-item active" data-view="overview" aria-controls="page-overview" aria-current="page"><span class="nav-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg></span><span>Resumen</span></button>
+        <button type="button" class="nav-item" data-view="incidents" aria-controls="page-incidents"><span class="nav-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="m13.5 2-8 12h6L10.5 22l8-12h-6Z"/></svg></span><span>Incidentes</span></button>
+        <button type="button" class="nav-item" data-view="history" aria-controls="page-history"><span class="nav-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M4 4v16h16M7 15l4-5 4 3 5-7"/></svg></span><span>Historial</span></button>
+        <button type="button" class="nav-item" data-view="protection" aria-controls="page-protection"><span class="nav-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="m12 3 8 3v6c0 5-8 9-8 9s-8-4-8-9V6Z"/><path d="m8 12 3 3 5-6"/></svg></span><span>Protección</span></button>
+        <button type="button" class="nav-item" data-view="notifications" aria-controls="page-notifications"><span class="nav-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M18 8a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9M10 21h4"/></svg></span><span>Avisos</span></button>
+        <button type="button" class="nav-item" data-view="system" aria-controls="page-system"><span class="nav-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="13" rx="2"/><path d="M8 21h8m-4-4v4M7 10h2l2-3 3 7 2-4h2"/></svg></span><span>Sistema</span></button>
+      </nav>
+      <div class="sidebar-footer"><span class="sidebar-model">FORZA NT-2402PRO</span><span>2400 VA · 1200 W nominales</span><span id="sidebar-connection" class="sidebar-status"><i class="status-dot" aria-hidden="true"></i><span id="sidebar-connection-text">Conectando al UPS</span></span><span class="sidebar-local">Tus datos se quedan en esta PC</span></div>
+    </aside>
+
+    <main class="workspace">
+      <header class="topbar workspace-header">
+        <div class="workspace-identity"><span class="workspace-name">Elipro UPS</span><span class="local-label"><span aria-hidden="true">↳</span> Solo en esta PC</span></div>
+        <div class="topbar-right"><span id="connection-badge" class="connection-badge"><span class="status-dot"></span><span>Conectando</span></span><div class="last-sync"><span class="sync-icon" aria-hidden="true">↻</span><div><span class="meta-label">ÚLTIMA LECTURA</span><strong id="last-updated">Esperando conexión</strong></div></div><button id="theme-toggle" class="theme-toggle" type="button" aria-label="Cambiar a modo claro" title="Cambiar a modo claro" aria-pressed="false"><span id="theme-icon" aria-hidden="true"><svg class="theme-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M2 12h2m16 0h2M5 5l1.5 1.5m11 11L19 19M5 19l1.5-1.5m11-11L19 5"/></svg><svg class="theme-moon" viewBox="0 0 24 24"><path d="M20 15.4A8.8 8.8 0 0 1 8.6 4a8.8 8.8 0 1 0 11.4 11.4Z"/></svg></span></button></div>
+      </header>
+
+      <div class="global-status-bar" aria-label="Estado de protección de Windows">
+        <span class="global-status-primary"><span class="global-status-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="m12 3 8 3v6c0 5-8 9-8 9s-8-4-8-9V6Z"/><path d="m8 12 3 3 5-6"/></svg></span><strong id="protection-global-status">Consultando protección de Windows</strong></span>
+        <span id="protection-global-detail" class="global-status-policy">Esperando al monitor local.</span>
+        <button type="button" class="text-link" data-go-view="protection">Ver protección <span aria-hidden="true">→</span></button>
+      </div>
+
+      <section class="page-heading" aria-labelledby="page-title">
+        <div><div class="eyebrow">CENTRO DE ENERGÍA</div><h1 id="page-title" tabindex="-1"><span id="view-title">Resumen</span><span class="heading-dot">.</span></h1><p id="view-description">Lo esencial de tu UPS, de un vistazo.</p></div>
+      </section>
+
+
+
+<div id="service-notice" class="notice service-notice" role="status" hidden></div>
+      <div id="connection-notice" class="notice connection-notice" role="status" hidden></div>
+      <div id="history-notice" class="notice history-notice" role="status" hidden></div>
+      <section id="protection-alert" class="protection-alert" aria-live="assertive" hidden>
+        <div class="alert-icon" aria-hidden="true">!</div><div class="protection-alert-content"><h2 id="protection-title">Apagado programado</h2><p id="protection-reason"></p></div><strong id="countdown" class="countdown" aria-live="off" aria-label="Tiempo restante">—</strong><button class="button button-warning" id="cancel-shutdown" type="button">Cancelar esta acción</button>
+      </section>
+
+      <section id="page-overview" class="page-view" data-page="overview" aria-label="Resumen del UPS">
+<section class="overview" aria-label="Estado actual del UPS">
+        <article class="power-card card">
+          <div class="card-label"><span class="tiny-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M9 3v5m6-5v5M7 8h10v4a5 5 0 0 1-10 0Zm5 9v4"/></svg></span> SUMINISTRO ELÉCTRICO</div>
+          <div class="power-main"><div><span id="power-state" class="power-state">Esperando al UPS</span><p id="power-detail">Las lecturas aparecerán al conectar el equipo.</p></div><div id="power-orbit" class="power-orbit" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="m13.5 2-8 12h6L10.5 22l8-12h-6Z"/></svg></div></div>
+          <div class="voltage-row"><div><span class="metric-caption">ENTRADA</span><div class="voltage-value"><span id="input-voltage">—</span><span class="unit">V</span></div></div><span class="flow-line" aria-hidden="true"><span></span>→</span><div><span class="metric-caption">SALIDA</span><div class="voltage-value"><span id="output-voltage">—</span><span class="unit">V</span></div></div><span id="source-label" class="source-label">Lectura local</span></div>
+        </article>
+
+        <article class="battery-card card">
+          <div class="card-label"><span class="tiny-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><rect x="3" y="6" width="17" height="12" rx="2"/><path d="M22 10v4M7 10v4m4-4v4m4-4v4"/></svg></span> BATERÍA</div>
+          <div class="battery-reading" aria-describedby="battery-note"><span id="battery-percent">—</span><span id="battery-unit" class="reading-unit">%</span><span id="battery-tag" class="subtle-tag">Sin lectura</span></div>
+          <div id="battery-track" class="battery-track" aria-hidden="true"><span id="battery-bar"></span></div>
+          <p id="battery-note" class="battery-note sr-only" hidden></p>
+          <div class="battery-footer"><div id="battery-runtime"><span class="metric-caption">AUTONOMÍA REPORTADA</span><strong id="runtime">No disponible</strong></div><svg class="battery-art" viewBox="0 0 48 28" aria-hidden="true"><rect x="1" y="3" width="41" height="22" rx="4"/><path d="M46 10v8M8 10v8m7-8v8m7-8v8m7-8v8m7-8v8"/></svg></div>
+        </article>
+
+        <article class="load-card card">
+          <div class="card-label"><span class="tiny-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M4 17a9 9 0 1 1 16 0M12 13l4-5M5 17h14"/><circle cx="12" cy="13" r="1"/></svg></span> CARGA DEL UPS <span class="info-tip" tabindex="0" role="note" aria-label="Porcentaje de la capacidad nominal del UPS. No es una medición precisa de consumo.">i<span>Porcentaje de la capacidad nominal. No equivale a una medición precisa de consumo.</span></span></div>
+          <div class="load-reading"><span id="load-percent">—</span><span class="reading-unit">%</span></div>
+          <div class="load-track" aria-hidden="true"><span id="load-bar"></span><i></i><i></i><i></i></div>
+          <div id="load-footer" class="load-footer" hidden><strong id="watts">— W</strong><span id="watts-label">Potencia no disponible</span></div>
+        </article>
+      </section>
+
+      <section class="details-row" aria-label="Lecturas adicionales">
+        <div class="detail-item"><span>Frecuencia</span><strong><span id="frequency">—</span> <small>Hz</small></strong></div>
+        <div id="detail-battery-voltage" class="detail-item"><span>Voltaje de batería</span><strong><span id="battery-voltage">—</span> <small>V</small></strong></div>
+        <div id="detail-temperature" class="detail-item" hidden><span>Temperatura</span><strong><span id="temperature">—</span> <small>°C</small></strong></div>
+        <div class="detail-item"><span>Protección de Windows</span><strong id="protection-summary" class="protection-summary">Desactivada</strong></div>
+      </section>
+        <div class="overview-secondary">
+          <article class="summary-chart-card card" aria-labelledby="summary-chart-heading">
+            <div class="section-header"><div><div class="eyebrow">ÚLTIMA HORA</div><h2 id="summary-chart-heading">Voltaje de entrada y salida</h2></div><button type="button" class="text-link" data-go-view="history">Ver historial <span aria-hidden="true">→</span></button></div>
+            <div class="chart-legend summary-chart-legend"><span><i class="legend-input"></i>Entrada</span><span><i class="legend-output"></i>Salida</span><span class="chart-unit">VOLTIOS</span></div>
+            <div class="summary-chart"><svg id="summary-history-spark" role="img" aria-label="Voltaje de la última hora. Esperando mediciones." viewBox="0 0 800 170" preserveAspectRatio="none"></svg></div>
+          </article>
+          <article class="summary-incident card" aria-label="Último evento del monitor" aria-labelledby="summary-incident-heading">
+            <div class="eyebrow">REGISTRO DEL MONITOR</div><h2 id="summary-incident-heading">Último evento</h2>
+            <strong id="summary-last-incident" class="summary-value">Consultando eventos</strong><p id="summary-incident-time" class="section-note">Último evento de energía, conexión o protección del monitor.</p>
+            <button type="button" class="text-link" data-go-view="history">Ver eventos <span aria-hidden="true">→</span></button>
+          </article>
+        </div>
+        <div class="summary-health" aria-label="Estado del monitor">
+          <div class="summary-system"><span class="summary-status-icon" aria-hidden="true">✓</span><div><h3>Salud del monitor</h3><p id="summary-health">Esperando el estado del monitor.</p></div><button type="button" class="text-link" data-go-view="system">Ver sistema <span aria-hidden="true">→</span></button></div>
+          <div class="summary-observation"><span class="summary-status-icon" aria-hidden="true">◷</span><div><h3>Observación de estabilidad</h3><p id="summary-observation">Consultando el estado de la observación.</p></div><button type="button" class="text-link" data-go-view="system">Ver observación <span aria-hidden="true">→</span></button></div>
+        </div>
+      </section>
+
+      <section id="page-incidents" class="page-view" data-page="incidents" aria-label="Incidentes del UPS" hidden>
+        <section class="incidents-card card" aria-labelledby="incidents-heading">
+          <div class="section-header"><div><div class="eyebrow">INCIDENTES</div><h2 id="incidents-heading">Cada corte, con su principio y su final</h2></div><div class="records-actions"><span id="incidents-count" class="count-badge">Sin consultar</span><button id="refresh-incidents" type="button" class="button button-secondary" disabled>Consultar incidentes</button></div></div>
+          <p class="section-intro">Consulta la duración, recuperación y secuencia de cada incidente. Los cortes eléctricos y los problemas de comunicación se agrupan por separado.</p>
+          <form id="incidents-form" class="records-filters">
+            <label>Desde <span>(hora de esta PC)</span><input id="incidents-from" type="datetime-local"></label>
+            <label>Hasta <span>(hora de esta PC)</span><input id="incidents-to" type="datetime-local"></label>
+            <button id="apply-incidents" type="submit" class="button button-secondary" disabled>Aplicar fechas</button>
+            <button id="clear-incidents" type="button" class="button button-quiet">Limpiar fechas</button>
+          </form>
+          <p id="incidents-feedback" class="section-note" role="status">Las fechas vacías incluyen todos los incidentes conservados.</p>
+<p id="incidents-error" class="section-error" role="status" hidden></p>
+        <div id="incidents-list" class="incident-list" tabindex="0" role="region" aria-label="Incidentes consultados"><p class="section-empty">Aún no has consultado los incidentes.</p></div>
+        <button id="more-incidents" class="button button-secondary more-records" type="button" hidden>Cargar más incidentes</button>
+        </section>
+      </section>
+
+      <section id="page-history" class="page-view" data-page="history" aria-label="Historial de mediciones y eventos" hidden>
+<section class="history-events">
+        <article class="history-card card" aria-labelledby="history-heading">
+          <div class="section-header"><div><div class="eyebrow">HISTORIAL</div><h2 id="history-heading">Tu energía en el tiempo</h2></div><a class="text-link export-link" href="/api/export.csv" download title="Exporta todas las mediciones conservadas, no solo el período del gráfico."><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12m-4-4 4 4 4-4M5 16v5h14v-5"/></svg> Exportar mediciones CSV</a></div>
+          <div class="chart-toolbar"><div class="segmented" role="group" aria-label="Métrica del historial"><button type="button" class="active" data-metric="voltage" aria-pressed="true">Voltaje</button><button type="button" data-metric="battery" aria-pressed="false">Batería</button><button type="button" data-metric="load" aria-pressed="false">Carga</button></div><label class="period-select"><span class="sr-only">Período del historial</span><select id="history-period"><option value="0.25">Últimos 15 minutos</option><option value="1" selected>Última hora</option><option value="6">Últimas 6 horas</option><option value="24">Últimas 24 horas</option><option value="168">Últimos 7 días</option></select></label></div>
+          <div id="chart-legend" class="chart-legend"><span><i class="legend-input"></i>Entrada</span><span><i class="legend-output"></i>Salida</span><span class="chart-unit">VOLTIOS</span></div>
+          <div class="chart-container" id="chart-container"><svg id="history-chart" role="img" aria-label="Historial de voltaje. Aún no hay datos." viewBox="0 0 800 230" preserveAspectRatio="none"></svg><div id="chart-empty" class="chart-empty"><svg viewBox="0 0 32 32" aria-hidden="true"><path d="M3 26h26M5 20l6-6 6 4 10-12"/></svg><strong>El historial empieza aquí</strong><p>Las lecturas reales se guardarán mientras el monitor esté en ejecución.</p></div><div id="chart-tooltip" class="chart-tooltip" role="status" hidden></div></div>
+          <p id="chart-note" class="chart-note"><span aria-hidden="true"></span> Los intervalos sin conexión aparecen como huecos.</p>
+        </article>
+
+        <article class="events-card card" aria-labelledby="events-heading"><div class="section-header"><div><div class="eyebrow">REGISTRO</div><h2 id="events-heading">Eventos recientes</h2></div><span id="event-count" class="count-badge">0</span></div><label class="events-filter"><span>Filtrar registros</span><select id="events-filter"><option value="all">Todos</option><option value="power">Energía</option><option value="connection">Conexión</option><option value="protection">Protección</option></select></label><div id="events-list" class="events-list"><div class="events-empty"><span aria-hidden="true">✓</span><strong>Sin eventos registrados</strong><p>Los cortes, retornos de energía y cambios de conexión aparecerán aquí.</p></div></div></article>
+      </section>
+        <section class="records-card card" aria-labelledby="records-heading">
+          <div class="section-header"><div><div class="eyebrow">ARCHIVO COMPLETO</div><h2 id="records-heading">Consulta y exporta los eventos</h2></div><button id="refresh-records" type="button" class="button button-secondary" disabled>Consultar eventos</button></div>
+          <p class="section-intro">Busca los registros conservados por fecha, mensaje o tipo de evento. La búsqueda incluye más que los 100 eventos recientes.</p>
+<form id="records-form" class="records-filters">
+          <label>Desde <span>(hora de esta PC)</span><input id="records-from" type="datetime-local"></label>
+          <label>Hasta <span>(hora de esta PC)</span><input id="records-to" type="datetime-local"></label>
+          <button id="apply-records" type="submit" class="button button-secondary" disabled>Aplicar fechas</button>
+          <button id="clear-records" type="button" class="button button-quiet">Limpiar fechas</button>
+        </form>
+        <p id="records-feedback" class="section-note" role="status">Pulsa «Consultar eventos» para cargar el archivo. Las fechas vacías incluyen todo el historial conservado.</p>
+<details id="event-archive" class="event-archive" open>
+          <summary>Buscar y exportar eventos</summary>
+          <form id="event-search-form" class="event-search-form">
+            <label>Buscar en el mensaje<input id="event-search" type="search" maxlength="200" placeholder="Por ejemplo: batería"></label>
+            <label>Tipo de evento<select id="event-kind"><option value="">Todos los tipos</option><option value="power_lost">Corte eléctrico</option><option value="power_restored">Regreso de electricidad</option><option value="connection_lost">Comunicación perdida</option><option value="connection_restored">Comunicación recuperada</option><option value="monitor_error">Error del monitor</option><option value="monitor_restarted">Reinicio de Elipro</option><option value="battery_low">Batería baja</option><option value="overload">Sobrecarga</option><option value="ups_fault">Falla del UPS</option><option value="policy_countdown">Cuenta atrás</option><option value="policy_cancelled">Acción cancelada</option><option value="policy_unknown">Protección sin datos válidos</option><option value="policy_action_started">Acción iniciada</option><option value="policy_action_failed">Acción fallida</option><option value="policy_changed">Configuración de protección</option><option value="simulation">Simulaciones</option></select></label>
+            <button id="search-events" type="submit" class="button button-secondary" disabled>Buscar eventos</button>
+            <button id="export-events" type="button" class="button button-quiet" disabled>Exportar eventos CSV</button>
+          </form>
+          <p id="archive-summary" class="section-note" role="status">La exportación incluye todos los resultados de la búsqueda y respeta las fechas seleccionadas.</p>
+          <p id="archive-error" class="section-error" role="status" hidden></p>
+          <div id="archive-list" class="archive-list" tabindex="0" role="region" aria-label="Eventos de la búsqueda"></div>
+          <button id="more-events" class="button button-secondary more-records" type="button" hidden>Cargar más eventos</button>
+        </details>
+        </section>
+      </section>
+
+      <section id="page-protection" class="page-view" data-page="protection" aria-label="Protección de Windows" hidden>
+      <div id="development-notice" class="notice" hidden>Modo de prueba del servicio: las acciones de apagado e hibernación de Windows están bloqueadas.</div>
+<section class="settings-card card" aria-labelledby="settings-heading">
+        <button class="settings-toggle" id="settings-toggle" type="button" aria-expanded="true" aria-controls="settings-panel"><span class="settings-symbol" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="m12 3 8 3v6c0 5-8 9-8 9s-8-4-8-9V6Z"/><path d="m8 12 3 3 5-6"/></svg></span><span class="settings-heading"><strong id="settings-heading">Protege tu trabajo</strong><span>Configura el apagado automático de Windows ante un corte prolongado.</span></span><span id="policy-state" class="subtle-tag">Desactivado</span><span class="disclosure-arrow" aria-hidden="true">⌄</span></button>
+        <div id="settings-panel" class="settings-panel">
+          <form id="policy-form">
+            <div class="policy-intro"><div><h3>Protección automática</h3><p>La acción se ejecutará en esta PC local. Guarda tu trabajo antes de activarla.</p></div><label class="switch-label"><input id="policy-enabled" type="checkbox" role="switch"><span class="switch" aria-hidden="true"></span><span id="enabled-label">Desactivada</span></label></div>
+            <p class="rule-description"><span id="policy-trigger-description">Durante un corte, inicia una cuenta atrás cuando se alcance alguno de estos límites o el UPS avise batería baja.</span> El retorno de energía o la pérdida de lecturas cancela la cuenta atrás. Una cancelación manual suspende la acción hasta el próximo corte. Mantén el monitor ejecutándose. Los avisos de Windows y el sonido se configuran por separado.<span id="bridge-policy-note" hidden> ForzaTracker sigue activo: revisa también su política de apagado antes de habilitar esta.</span></p>
+            <div id="policy-fields" class="policy-fields"><label>Tiempo máximo con batería<div class="input-with-unit"><input id="policy-on-battery" type="number" min="0" max="1440" step="0.5" required><span>min</span></div></label><label id="policy-battery-field">Batería mínima<div class="input-with-unit"><input id="policy-low-battery" type="number" min="0" max="100" step="1" required><span>%</span></div></label><label id="policy-runtime-field">Autonomía mínima<div class="input-with-unit"><input id="policy-runtime" type="number" min="0" max="86400" step="1" required><span>s</span></div></label><label>Tiempo para cancelar<div class="input-with-unit"><input id="policy-countdown" type="number" min="10" max="3600" step="1" required><span>s</span></div></label><label>Acción en Windows<select id="policy-action"><option value="shutdown">Apagar Windows</option><option value="hibernate">Hibernar Windows</option></select></label></div>
+            <div class="settings-footer"><div class="test-action"><button id="test-shutdown" type="button" class="button button-secondary" disabled>Simular cuenta atrás</button><span id="test-description">Esperando al monitor.</span></div><div class="save-action"><span id="settings-feedback" role="status"></span><button id="save-policy" type="submit" class="button button-primary" disabled>Guardar configuración</button></div></div>
+          </form>
+        </div>
+      </section>
+      </section>
+
+      <section id="page-notifications" class="page-view" data-page="notifications" aria-label="Avisos de Windows y sonido" hidden>
+<section class="notifications-card card" aria-labelledby="notifications-heading">
+        <div class="section-header"><div><div class="eyebrow">AVISOS LOCALES</div><h2 id="notifications-heading">Entérate aunque cierres el panel</h2></div><span id="notifications-state" class="subtle-tag" role="status">Conectando</span></div>
+        <p class="notifications-intro">El monitor envía avisos de escritorio y sonido ante cortes, regreso de energía, problemas de conexión y alertas del UPS. Si Windows no muestra el aviso, Elipro puede abrir una ventana de respaldo cuando la sesión lo permita. El monitor debe seguir ejecutándose aunque cierres esta pestaña.</p>
+        <form id="notifications-form">
+          <div class="notification-options">
+            <label class="notification-option"><span><strong>Avisos de escritorio</strong><small>Al desactivar, también se detiene el sonido automático.</small></span><span class="switch-label"><input id="notifications-enabled" type="checkbox" role="switch" aria-label="Avisos de escritorio" disabled><span class="switch" aria-hidden="true"></span></span></label>
+            <label class="notification-option"><span><strong>Sonido</strong><small>Alerta audible desde el monitor local.</small></span><span class="switch-label"><input id="notifications-sound" type="checkbox" role="switch" aria-label="Sonido de los avisos" disabled><span class="switch" aria-hidden="true"></span></span></label>
+            <label id="notifications-persistent-option" class="notification-option" hidden><span><strong>Mantener visibles los avisos críticos</strong><small>La ventana de Elipro permanece hasta cerrarla o recuperarse la condición.</small></span><span class="switch-label"><input id="notifications-persistent" type="checkbox" role="switch" aria-label="Mantener visibles los avisos críticos" disabled><span class="switch" aria-hidden="true"></span></span></label>
+          </div>
+          <details class="notification-advanced"><summary>Repetición de alertas críticas</summary><div><label for="notifications-repeat">Repetir cada</label><div class="input-with-unit"><input id="notifications-repeat" type="number" min="10" max="300" step="1" value="30" required aria-describedby="notifications-repeat-note" disabled><span>s</span></div><p id="notifications-repeat-note">Solo mientras persistan batería baja, sobrecarga, falla del UPS o una cuenta atrás de protección.</p></div></details>
+          <div class="notification-delivery"><p id="notifications-delivery" role="status">Esperando al monitor local.</p><p id="notifications-error" class="error" role="status" hidden></p><p id="notifications-sound-error" class="error" role="status" hidden></p><p id="notifications-popup-error" class="error" role="status" hidden></p></div>
+          <div class="settings-footer"><div class="test-action"><button id="test-notifications" type="button" class="button button-secondary" disabled>Probar aviso y sonido</button><span>Prueba independiente, sin apagado ni hibernación.<br>Usa los ajustes de sonido guardados.</span></div><div class="save-action"><span id="notifications-feedback" role="status"></span><button id="save-notifications" type="submit" class="button button-primary" disabled>Guardar avisos</button></div></div>
+        </form>
+        <p class="notifications-note">No molestar puede ocultar los avisos de Windows. La ventana de Elipro se usa cuando la sesión permite mostrarla. El volumen de Windows puede silenciar el sonido.</p>
+      </section>
+      </section>
+
+      <section id="page-system" class="page-view" data-page="system" aria-label="Salud, diagnóstico y respaldo del sistema" hidden>
+<section class="health-card card" aria-labelledby="health-heading">
+        <div class="section-header"><div><div class="eyebrow">FUNCIONAMIENTO</div><h2 id="health-heading">El monitor también se supervisa</h2></div><span id="health-state" class="subtle-tag" role="status">Esperando datos</span></div>
+        <p id="health-message" class="section-intro" role="status">Esperando el estado del lector y su supervisor.</p>
+        <dl class="health-grid">
+          <div><dt>Tiempo activo</dt><dd id="health-uptime">—</dd></div>
+          <div><dt>Lector / supervisor</dt><dd id="health-workers">—</dd></div>
+          <div><dt>Lecturas válidas / fallidas</dt><dd id="health-reads">—</dd></div>
+          <div><dt>Recuperaciones</dt><dd id="health-recoveries">—</dd></div>
+          <div><dt>Última lectura válida</dt><dd id="health-last-reading">—</dd></div>
+          <div><dt>Último error de lectura</dt><dd id="health-last-error">—</dd></div>
+          <div><dt>Memoria / CPU del proceso</dt><dd id="health-resources">—</dd></div>
+          <div><dt>Guardado del historial</dt><dd id="health-storage">—</dd></div>
+        </dl>
+        <p class="section-note">El supervisor comprueba el lector con el panel cerrado. El lanzador puede recuperar un cierre inesperado del programa; «Salir de Elipro» detiene la vigilancia. El servicio de Windows llegará con el instalador.</p>
+        <details class="monitor-checks" open><summary>Pruebas seguras y observación prolongada</summary>
+          <div class="monitor-check-block"><h3>Comprobar las reglas sin apagar la PC</h3><p class="section-intro">Ejecuta casos simulados de corte, recuperación y cancelación. No corta la electricidad, no modifica tus ajustes y no envía acciones a Windows.</p><div class="maintenance-actions"><button id="run-validation" type="button" class="button button-secondary" disabled>Comprobar reglas sin apagar</button><button id="review-physical-tests" type="button" class="button button-quiet" disabled>Ver pruebas físicas registradas</button></div><p id="validation-summary" class="section-note" role="status">Estas comprobaciones complementan las pruebas físicas del UPS.</p><div id="validation-results" class="validation-results"></div><p id="physical-test-summary" class="section-note" role="status" hidden></p></div>
+          <div class="monitor-check-block"><h3>Observar el uso diario</h3><p class="section-intro">Registra continuidad de lecturas, errores y consumo de recursos durante 48 horas. Continúa con el panel cerrado mientras Elipro esté funcionando.</p><div class="maintenance-actions"><button id="refresh-stability" type="button" class="button button-secondary" disabled>Revisar observación</button><button id="start-stability" type="button" class="button button-secondary" disabled>Iniciar observación de 48 h</button><button id="stop-stability" type="button" class="button button-quiet" hidden>Finalizar observación</button><button id="download-stability" type="button" class="button button-quiet" hidden>Descargar informe JSON</button></div><p id="stability-summary" class="section-note" role="status">Aún no se ha consultado el estado de la observación.</p><p id="stability-error" class="section-error" role="status" hidden></p></div>
+        </details>
+      </section>
+<section class="maintenance-card card" aria-labelledby="maintenance-heading">
+        <div class="section-header"><div><div class="eyebrow">MANTENIMIENTO LOCAL</div><h2 id="maintenance-heading">Diagnóstico y respaldo a mano</h2></div></div>
+        <p class="section-intro">Descarga un informe del funcionamiento o una copia de la configuración y el historial. Los archivos se guardan donde indique tu navegador.</p>
+        <div class="maintenance-actions"><button id="download-diagnostics" type="button" class="button button-secondary" disabled>Descargar diagnóstico JSON</button><button id="download-backup" type="button" class="button button-secondary" disabled>Descargar respaldo ZIP</button></div>
+        <p id="maintenance-feedback" class="section-note" role="status">El respaldo contiene información local de tu UPS. Conserva el ZIP; descargarlo no restaura datos ni activa ninguna política automáticamente.</p>
+        <div class="stop-monitor"><div><strong>Cerrar el panel mantiene Elipro funcionando.</strong><p>«Salir de Elipro» detiene el monitor completo: dejará de leer el UPS, registrar eventos y enviar avisos.</p></div><button id="stop-monitor" type="button" class="button button-quiet" disabled>Salir de Elipro</button></div>
+        <div id="stop-confirmation" class="stop-confirmation" hidden><p>¿Quieres detener el monitor? La PC seguirá encendida. Para volver a vigilar el UPS tendrás que abrir Elipro de nuevo.</p><div><button id="confirm-stop-monitor" type="button" class="button button-warning">Sí, detener Elipro</button><button id="cancel-stop-monitor" type="button" class="button button-secondary">Seguir monitoreando</button></div></div>
+      </section>
+      </section>
+
+      <footer class="footer"><span><i aria-hidden="true"></i> Tus datos se quedan en esta PC</span><span>Elipro UPS <span class="footer-slash">/</span> Monitor local</span></footer>
+    </main>
+  </div>
+  <div id="toast" class="toast" role="status" hidden></div>
+</body>
+</html>

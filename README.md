@@ -1,0 +1,161 @@
+# Elipro UPS
+
+Monitor local para Windows con panel web, avisos de escritorio, historial y reglas de apagado o hibernación. Su lector USB está diseñado para el **Forza NT-2402PRO** y utiliza consultas de estado; no envía órdenes para apagar el UPS, iniciar descargas ni modificar sus parámetros.
+
+Elipro es un proyecto independiente en desarrollo. No es software oficial de Forza ni tiene certificación del fabricante. La compatibilidad con otros modelos o revisiones de firmware no está comprobada.
+
+**El apagado automático está desactivado por defecto.** Windows debe permanecer despierto para vigilar el UPS. La distribución inicial del servicio conserva además el bloqueo `--dry-run`: las acciones reales de energía están bloqueadas, incluso si se activa una regla en el panel.
+
+## Funciones
+
+- Lectura de alimentación de red/batería, voltajes de entrada y salida, frecuencia, carga del UPS, voltaje de batería y señales de batería baja o falla.
+- Seis secciones: **Resumen, Incidentes, Historial, Protección, Avisos y Sistema**; temas claro y oscuro.
+- Avisos de Windows, sonido e icono de bandeja aunque se cierre el navegador.
+- Historial local SQLite, gráficas, incidentes, filtros, exportación CSV, diagnóstico y respaldo ZIP.
+- Reglas deterministas con cuenta atrás cancelable; simulación de la cuenta sin ejecutar acciones de energía.
+- Separación del historial, la lectura, los avisos y la protección; exclusión de instancias y recuperación supervisada del lector.
+- Observación prolongada de recursos y errores con informe local para revisión.
+
+No requiere cuentas ni servicios de nube para funcionar. El servidor escucha únicamente en `127.0.0.1`; no está diseñado para exponerlo a una red.
+
+## Instalador de Windows x64
+
+El mismo instalador admite procesadores AMD e Intel x64. Incluye el runtime de Python; no requiere que el usuario instale Python por separado. La instalación necesita permisos de administrador.
+
+El diseño separa dos procesos:
+
+- **Servicio `EliproUPS`:** arranca con Windows, ejecuta el monitor sin escritorio y es el único que abre el USB. Usa `Program Files\Elipro UPS` para el programa y `ProgramData\Elipro UPS\data` para los datos. Se registra bajo la cuenta LocalSystem, con recuperación ante fallos.
+- **Agente de sesión:** muestra la bandeja y los avisos al iniciar sesión. `Elipro.exe agent --open-panel` abre también el panel. No abre otro lector USB; se comunica con el servicio por la interfaz local.
+
+El servicio está destinado a vigilar aunque no haya una sesión iniciada; los avisos visuales necesitan una sesión interactiva. La distribución inicial mantiene las acciones reales bloqueadas. Las pruebas del instalador en una máquina virtual no validan el USB físico, la autonomía, la suspensión ni un apagado real. Antes de usar la protección, hay que completar esas comprobaciones en el equipo de destino.
+
+La desinstalación detiene y elimina el servicio y el inicio del agente, pero conserva los datos locales. No se importan historiales ni ajustes personales dentro del instalador.
+
+### GitHub Actions
+
+El workflow **Windows x64 installer** ejecuta las pruebas, empaqueta el programa, genera el instalador y comprueba una instalación/desinstalación en el runner desechable de Windows. Su modo de comprobación del servicio no utiliza USB ni ejecuta acciones de energía.
+
+Se ejecuta al subir cambios a `main`, en etiquetas `v*`, en pull requests y desde **Actions → Windows x64 installer → Run workflow**. Al finalizar correctamente, el artefacto `Elipro-Windows-x64-<número>` contiene:
+
+- `Elipro-Setup-x64.exe`
+- `Elipro-Setup-x64.exe.sha256`
+
+Los artefactos se conservan 14 días. El workflow no publica automáticamente una GitHub Release.
+
+### Compilar localmente
+
+Requisitos de compilación: Windows x64, Python 3.12 x64, Node.js para las pruebas e Inno Setup 6. Desde la raíz del proyecto:
+
+```powershell
+python -m pip install --require-hashes --only-binary=:all: -r requirements-build.txt
+python -m unittest discover -s tests -v
+node --test tests/test_notifications_ui.js
+powershell -NoProfile -ExecutionPolicy Bypass -File packaging/windows/Build-Windows.ps1
+```
+
+El resultado queda en `dist/installer/`. El ejecutable incluye las licencias del runtime y las herramientas incorporadas, separadas de la licencia pendiente del código de Elipro.
+
+## Ejecutar desde el código
+
+Requisitos: Windows x64, Python 3.10 o posterior y el cable USB de datos del UPS. La aplicación usa la biblioteca estándar de Python y las API de Windows; no necesita instalar dependencias Python para ejecutarse desde el código.
+
+Antes de usar USB directo, cierra el lector original de ForzaTracker para que un solo programa acceda al UPS. Elipro no sustituye el controlador HID de Windows.
+
+Desde PowerShell, en la carpeta del proyecto:
+
+```powershell
+.\Start-Elipro.ps1 -Source native -DryRun
+```
+
+Abre <http://127.0.0.1:8765>. `-DryRun` bloquea las acciones reales de apagado e hibernación, incluso si se activa una regla en el panel. Es el modo recomendado para comenzar y verificar la lectura, las alertas y las simulaciones.
+
+Cerrar la pestaña mantiene el monitor y sus avisos en ejecución. Para detenerlos:
+
+```powershell
+.\Stop-Elipro.ps1
+```
+
+El lanzador incluye un supervisor de proceso durante la sesión actual: intenta recuperar un cierre inesperado con pausas limitadas. Una salida solicitada desde el panel, la bandeja o el script no provoca un reinicio. No crea servicios ni tareas de inicio.
+
+Este modo desde el código depende de la sesión en la que se inició; no ofrece la cobertura del servicio antes de iniciar sesión o tras cerrarla. La opción `-StopForza` del script está reservada a una instalación local concreta del lanzador original y no es un mecanismo universal para detener ForzaTracker.
+
+También se puede ejecutar en una consola, sin el supervisor externo:
+
+```powershell
+python -m ups_monitor --source native --dry-run
+```
+
+`--source bridge` es un modo alternativo que obtiene telemetría del servidor local de ForzaTracker y requiere que este esté en ejecución. No debe confundirse con la lectura USB propia. La selección `auto` se resuelve al iniciar y no cambia de fuente durante un corte.
+
+## Lecturas y límites del hardware
+
+El lector nativo acepta el dispositivo HID `0665:5161` con el formato de reporte y la respuesta binaria QS/T compatibles con la implementación. Solo envía `QS` seguido de retorno de carro; cualquier otro comando se rechaza.
+
+Esta respuesta proporciona **voltaje de batería, pero no porcentaje de batería, minutos restantes, temperatura ni watts**. Elipro no inventa esos datos ni convierte el porcentaje de carga en consumo eléctrico. El voltaje por sí solo no demuestra la autonomía restante.
+
+Los porcentajes disponibles en el modo puente son los que informa ForzaTracker; no son una medición independiente de salud de la batería. Los valores que ese servidor no proporciona de forma válida se muestran como no disponibles.
+
+## Protección automática
+
+Se mantiene desactivada hasta que el usuario la configura y activa expresamente. Los ajustes guardados se conservan al reiniciar; `--dry-run` añade un bloqueo de acciones reales para toda esa ejecución.
+
+La evaluación exige datos recientes, alimentación por batería confirmada y un lector/supervisor sanos. En USB directo se utilizan el tiempo continuo en batería y la señal real de batería baja; los umbrales de porcentaje y autonomía solo participan cuando existe una lectura compatible.
+
+Volver a la red, perder la comunicación o recibir datos inválidos cancela una cuenta pendiente. Cancelarla manualmente suprime la acción hasta que vuelva la red y ocurra otro corte. La cuenta se mantiene visible en todas las secciones.
+
+Al vencer una cuenta real, Elipro solicita el apagado o la hibernación de Windows. El apagado no fuerza el cierre de aplicaciones: estas pueden bloquearlo y Elipro no guarda documentos. La hibernación necesita estar disponible en Windows. No se cambia automáticamente esa configuración.
+
+Antes de activar acciones reales, hay que validar la autonomía con la carga habitual, el tiempo de cierre de Windows, los avisos y la cancelación. Una prueba breve de batería no permite extrapolar varios minutos de respaldo. Las pruebas automatizadas no certifican la seguridad del equipo ni sustituyen esas comprobaciones.
+
+## Historial y diagnóstico
+
+Al ejecutar desde el código, los datos se guardan en `data/`; el servicio instalado utiliza la carpeta de ProgramData indicada arriba. La retención predeterminada es de 30 días. Las exportaciones incluyen lo que todavía se conserva; no recuperan información ya eliminada por retención.
+
+Los errores de SQLite se muestran por separado y no deben interrumpir una lectura válida ni los avisos. Una cola limitada conserva registros mientras la escritura falla; si se llena, puede descartar muestras y lo informa. Los datos pendientes en memoria se pierden al finalizar el proceso.
+
+El diagnóstico usa una lista explícita de campos y omite tokens, variables de entorno y rutas del dispositivo. El respaldo contiene la base y los ajustes locales: revísalo antes de compartirlo. No reemplaces una base mientras Elipro la está utilizando.
+
+Para iniciar una observación de estabilidad con acciones reales bloqueadas:
+
+```powershell
+.\Start-Elipro.ps1 -Source native -DryRun -ObserveHours 48
+```
+
+También se puede gestionar desde **Sistema**. Completar el tiempo no equivale a aprobarla: el informe debe revisarse. El tiempo sin monitor o con Windows suspendido no cuenta como protección verificada.
+
+## Desarrollo y pruebas
+
+Las pruebas usan API de Windows y notificadores simulados, bases temporales y callbacks de acciones de energía; no necesitan un UPS conectado ni deben apagar o hibernar la PC.
+
+```powershell
+python -m unittest discover -s tests -v
+node --check static/app.js
+node --test tests/test_notifications_ui.js
+```
+
+Node.js solo se necesita para las pruebas de interfaz. Las comprobaciones aisladas del motor también pueden ejecutarse con:
+
+```powershell
+python -m ups_monitor.validation --output .test-data/controlled-validation.json
+```
+
+Para consultar metadatos HID sin enviar una consulta QS:
+
+```powershell
+python -m ups_monitor --usb-info
+```
+
+`--diagnose` realiza una lectura real y termina; requiere el bloqueo exclusivo, por lo que no puede ejecutarse junto con el monitor habitual.
+
+## Publicación y datos locales
+
+El repositorio contiene código y pruebas. Se excluyen el historial, los ajustes, informes, registros, respaldos, credenciales y capturas locales con telemetría. No publiques el contenido de `data/` ni archivos de diagnóstico o respaldo sin revisarlos.
+
+Todavía no se ha elegido una licencia de distribución para el código del proyecto. Que el repositorio sea público no concede por sí solo los permisos de una licencia open source. Las marcas mencionadas pertenecen a sus respectivos titulares.
+
+## Referencias técnicas
+
+- [Ficha del NT-2402PRO](https://forza-ups-frontend.s3.amazonaws.com/media/docs/NT-2402PRO_DS_ENG.pdf) y [manual del fabricante](https://forza-ups-frontend.s3.amazonaws.com/media/docs/NT-2402PRO_MANUAL.pdf).
+- [NUT: formato QS-Hex](https://github.com/networkupstools/nut/blob/master/drivers/nutdrv_qx_voltronic-qs-hex.c) y [transporte Cypress](https://github.com/networkupstools/nut/blob/master/drivers/nutdrv_qx.c). Se consultaron como referencias de protocolo; el lector y el decodificador Python son implementaciones independientes y no incluyen sus binarios ni código fuente.
+- [Microsoft: reportes HID](https://learn.microsoft.com/en-us/windows-hardware/drivers/hid/obtaining-hid-reports) y [HIDP_CAPS](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/hidpi/ns-hidpi-_hidp_caps).
+- [Microsoft: shutdown](https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/shutdown) y [estados de suspensión](https://learn.microsoft.com/en-us/windows-hardware/drivers/kernel/system-sleeping-states).
