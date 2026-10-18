@@ -4,7 +4,7 @@ Monitor local para Windows con panel web, avisos de escritorio, historial y regl
 
 Elipro es un proyecto independiente en desarrollo. No es software oficial de Forza ni tiene certificación del fabricante. La compatibilidad con otros modelos o revisiones de firmware no está comprobada.
 
-**El apagado automático está desactivado por defecto.** Windows debe permanecer despierto para vigilar el UPS. La distribución inicial del servicio conserva además el bloqueo `--dry-run`: las acciones reales de energía están bloqueadas, incluso si se activa una regla en el panel.
+**El apagado automático está desactivado por defecto.** Windows debe permanecer despierto para vigilar el UPS. El instalador registra el servicio con el bloqueo `--dry-run`: las acciones reales de energía están bloqueadas, incluso si se activa una regla en el panel. La capacidad de ejecutar acciones requiere una modificación administrativa explícita del registro del servicio; es independiente de activar una regla.
 
 ## Funciones
 
@@ -27,7 +27,7 @@ El diseño separa dos procesos:
 - **Servicio `EliproUPS`:** arranca con Windows, ejecuta el monitor sin escritorio y es el único que abre el USB. Usa `Program Files\Elipro UPS` para el programa y `ProgramData\Elipro UPS\data` para los datos. Se registra bajo la cuenta LocalSystem, con recuperación ante fallos.
 - **Agente de sesión:** muestra la bandeja y los avisos al iniciar sesión. `Elipro.exe agent --open-panel` abre también el panel. No abre otro lector USB; se comunica con el servicio por la interfaz local.
 
-El servicio está destinado a vigilar aunque no haya una sesión iniciada; los avisos visuales necesitan una sesión interactiva. La distribución inicial mantiene las acciones reales bloqueadas. Las pruebas del instalador en una máquina virtual no validan el USB físico, la autonomía, la suspensión ni un apagado real. Antes de usar la protección, hay que completar esas comprobaciones en el equipo de destino.
+El servicio vigila aunque no haya una sesión iniciada; los avisos visuales necesitan una sesión interactiva. La protección se evalúa dentro del servicio, en Sesión 0, y no depende del agente ni del navegador. Las pruebas del instalador en una máquina virtual no validan el USB físico, la autonomía, la suspensión ni un apagado real. Antes de usar la protección, hay que completar esas comprobaciones en el equipo de destino.
 
 La desinstalación detiene y elimina el servicio y el inicio del agente, pero conserva los datos locales. No se importan historiales ni ajustes personales dentro del instalador.
 
@@ -99,6 +99,8 @@ Los porcentajes disponibles en el modo puente son los que informa ForzaTracker; 
 
 Se mantiene desactivada hasta que el usuario la configura y activa expresamente. Los ajustes guardados se conservan al reiniciar; `--dry-run` añade un bloqueo de acciones reales para toda esa ejecución.
 
+El servicio instalado conserva ese bloqueo salvo que un administrador lo registre expresamente mediante `Elipro.exe service install --allow-power-actions`, con el servicio detenido y después de validar el equipo. Esta operación no activa la política guardada. Volver a registrarlo sin esa opción restaura el bloqueo; `service status` informa la capacidad configurada. No debe usarse la opción durante pruebas ni combinarse con `--self-test`.
+
 La evaluación exige datos recientes, alimentación por batería confirmada y un lector/supervisor sanos. En USB directo se utilizan el tiempo continuo en batería y la señal real de batería baja; los umbrales de porcentaje y autonomía solo participan cuando existe una lectura compatible.
 
 Volver a la red, perder la comunicación o recibir datos inválidos cancela una cuenta pendiente. Cancelarla manualmente suprime la acción hasta que vuelva la red y ocurra otro corte. La cuenta se mantiene visible en todas las secciones.
@@ -111,7 +113,9 @@ Antes de activar acciones reales, hay que validar la autonomía con la carga hab
 
 Al ejecutar desde el código, los datos se guardan en `data/`; el servicio instalado utiliza la carpeta de ProgramData indicada arriba. La retención predeterminada es de 30 días. Las exportaciones incluyen lo que todavía se conserva; no recuperan información ya eliminada por retención.
 
-Los errores de SQLite se muestran por separado y no deben interrumpir una lectura válida ni los avisos. Una cola limitada conserva registros mientras la escritura falla; si se llena, puede descartar muestras y lo informa. Los datos pendientes en memoria se pierden al finalizar el proceso.
+Los errores de SQLite se muestran por separado y no deben interrumpir una lectura válida ni los avisos. Las muestras normales se guardan por lotes de hasta 32 registros o 30 segundos; los eventos críticos solicitan volcado inmediato. Una cola limitada conserva registros mientras la escritura falla; si se llena, puede descartar muestras y lo informa. Los datos pendientes en memoria se pierden al finalizar el proceso.
+
+La adquisición y el procesamiento usan hilos separados y un ring buffer limitado. Los retrasos invalidan la continuidad de la protección y nunca autorizan una acción con una lectura antigua. Los límites y garantías se detallan en [la arquitectura de confiabilidad](docs/reliability-architecture.md).
 
 El diagnóstico usa una lista explícita de campos y omite tokens, variables de entorno y rutas del dispositivo. El respaldo contiene la base y los ajustes locales: revísalo antes de compartirlo. No reemplaces una base mientras Elipro la está utilizando.
 

@@ -93,6 +93,7 @@ class AlertManager:
         self._last_attempt = {}
         self._active = {}
         self._last_notification = self._last_error = None
+        self._context_power = self._context_connection = "unknown"
         try:
             self._settings = validate_notification_settings(
                 store.get_setting("notification_settings", DEFAULT_NOTIFICATION_SETTINGS))
@@ -143,8 +144,10 @@ class AlertManager:
             options = {"severity": severity, "sound": sound}
             if self._settings["persistent_critical"] and kind in _PERSISTENT:
                 options.update(persistent=True, key=kind)
-            accepted = self.notifier.notify(title, message, **options) is True
-            self._last_error = None if accepted else "Windows no aceptó el aviso en la cola de entrega. Revisa el estado de los avisos."
+            publisher = getattr(type(self.notifier), "publish_event", None)
+            accepted = (self.notifier.publish_event(kind, title, message, repeat=repeat, **options)
+                        if callable(publisher) else self.notifier.notify(title, message, **options)) is True
+            self._last_error = None if accepted else "El canal de avisos no aceptó el aviso en la cola de entrega. Revisa el estado de los avisos."
         except Exception as exc:
             accepted = False
             self._last_error = "No se pudo enviar el aviso de Windows: " + str(exc)[:300]
@@ -157,6 +160,16 @@ class AlertManager:
         return accepted
 
     def _sync_persistent(self):
+        synchronize_conditions = getattr(type(self.notifier), "sync_conditions", None)
+        if callable(synchronize_conditions):
+            # Session-zero delivery needs semantic state even when users do
+            # not want sticky popups. Queued countdowns must never imply that
+            # an expired/cancelled power action is still pending after unlock.
+            current = ({kind: {"title": _EVENTS[kind][0], "message": value["message"]}
+                        for kind, value in self._active.items()} if self._settings["enabled"] else {})
+            self.notifier.sync_conditions(current, power_state=self._context_power,
+                                          connection_state=self._context_connection,
+                                          enabled=self._settings["enabled"])
         synchronize = getattr(self.notifier, "sync_persistent", None)
         if not callable(synchronize):
             return
@@ -171,6 +184,15 @@ class AlertManager:
 
     def on_event(self, kind, message, data=None):
         """Consume newly observed events; loading stored event history is forbidden."""
+        if kind in ("policy_action_started", "policy_unknown", "policy_disabled", "policy_online", "policy_on_battery"):
+            with self._lock:
+                if kind == "policy_unknown":
+                    self._active.clear()
+                    self._context_power = self._context_connection = "unknown"
+                else:
+                    self._active.pop("policy_countdown", None)
+                self._sync_persistent()
+            return
         if kind not in _EVENTS:
             return
         data = data if isinstance(data, dict) else {}
@@ -184,10 +206,12 @@ class AlertManager:
                            "No se apagará ni hibernará tu PC.")
                 return
             if kind in ("connection_lost", "monitor_error"):
+                self._context_power = self._context_connection = "unknown"
                 self._connection_was_lost = True
                 self._active.clear()
                 self._last_attempt.pop("connection_restored", None)
             elif kind == "connection_restored":
+                self._context_connection = "connected"
                 if not self._connection_was_lost:
                     return
                 self._connection_was_lost = False
@@ -197,8 +221,10 @@ class AlertManager:
                 self._active.pop("policy_countdown", None)
                 self._last_attempt.pop("policy_countdown", None)
             if kind == "power_lost":
+                self._context_power = "battery"
                 self._last_attempt.pop("power_restored", None)
             elif kind == "power_restored":
+                self._context_power = "online"
                 self._last_attempt.pop("power_lost", None)
             if kind == "policy_countdown":
                 message = (self._countdown_message(data) if self._number(data.get("countdown_remaining")) else
@@ -244,7 +270,10 @@ class AlertManager:
                 return
             protection = protection if isinstance(protection, dict) else {}
             fresh = self._fresh(sample, connection)
-            conditions = {}
+            self._context_connection = "connected" if fresh else "unknown"
+            self._context_power = ("battery" if sample.get("on_battery") is True else
+                                   "online" if sample.get("on_battery") is False else "unknown") if fresh else "unknown"
+            conditions = {"battery_low": False, "overload": False, "ups_fault": False}
             if fresh:
                 battery, load = sample.get("battery_percent"), sample.get("load_percent")
                 conditions = {

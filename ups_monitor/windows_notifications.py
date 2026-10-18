@@ -15,6 +15,7 @@ https://learn.microsoft.com/windows/win32/api/shellapi/nf-shellapi-shqueryuserno
 from __future__ import annotations
 
 import ctypes
+from collections import OrderedDict, deque
 from ctypes import wintypes
 from datetime import datetime, timezone
 import os
@@ -30,6 +31,8 @@ from .runtime import resource_root
 WM_CLOSE = 0x0010
 WM_DESTROY = 0x0002
 WM_SETTINGCHANGE = 0x001A
+WM_DPICHANGED = 0x02E0
+WM_SETFONT = 0x0030
 WM_COMMAND = 0x0111
 WM_TIMER = 0x0113
 WM_CONTEXTMENU = 0x007B
@@ -59,6 +62,7 @@ DEFAULT_EXIT_MESSAGE = (
     "Salir detendrá la lectura del UPS, los avisos y la protección de Elipro. "
     "Windows seguirá encendido. ¿Quieres salir de Elipro?"
 )
+DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = -4
 
 # Fixed-width Windows scalar types also permit import on Unix for test discovery.
 DWORD = ctypes.c_uint32
@@ -159,6 +163,15 @@ def _load_apis():
     _bind(user, "SystemParametersInfoW", [UINT, UINT, ptr, UINT], wintypes.BOOL)
     _bind(user, "SetTimer", [ptr, ctypes.c_size_t, UINT, ptr], ctypes.c_size_t)
     _bind(user, "KillTimer", [ptr, ctypes.c_size_t], wintypes.BOOL)
+    _bind(user, "SendMessageW", [ptr, UINT, WPARAM, LPARAM], LRESULT)
+    for name, args, result in (
+            ("SetProcessDpiAwarenessContext", [ptr], wintypes.BOOL),
+            ("SetProcessDPIAware", [], wintypes.BOOL),
+            ("GetDpiForWindow", [ptr], UINT), ("GetDpiForSystem", [], UINT)):
+        try:
+            _bind(user, name, args, result)
+        except AttributeError:
+            pass
     _bind(shell, "Shell_NotifyIconW", [DWORD, ctypes.POINTER(NOTIFYICONDATAW)], wintypes.BOOL)
     try:
         _bind(shell, "SHQueryUserNotificationState", [ctypes.POINTER(ctypes.c_int)], LONG)
@@ -167,15 +180,47 @@ def _load_apis():
     return user, shell, kernel
 
 
+def enable_per_monitor_dpi(user):
+    """Request PMv2 before creating any HWND; tolerate manifest/older OS state."""
+    try:
+        if user.SetProcessDpiAwarenessContext(ctypes.c_void_p(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)):
+            return {"mode": "per_monitor_v2", "error": None}
+        error = ctypes.get_last_error()
+        if error == 5:  # Manifest or an earlier host initialization already set it.
+            return {"mode": "already_configured", "error": None}
+    except (AttributeError, OSError):
+        pass
+    try:
+        if user.SetProcessDPIAware():
+            return {"mode": "system_aware_fallback", "error": None}
+    except (AttributeError, OSError):
+        pass
+    return {"mode": "unchanged", "error": "Windows no permitió configurar la escala DPI"}
+
+
+def _load_font_apis():
+    try:
+        gdi = ctypes.WinDLL("gdi32", use_last_error=True)
+        _bind(gdi, "CreateFontW", [ctypes.c_int] * 5 + [DWORD] * 8 + [ctypes.c_wchar_p], ctypes.c_void_p)
+        _bind(gdi, "DeleteObject", [ctypes.c_void_p], wintypes.BOOL)
+        return gdi
+    except (AttributeError, OSError):
+        return None
+
+
 def _utf16_clip(value, units):
     """Clip for WCHAR arrays without cutting a surrogate pair or retaining NULs."""
     return str(value).replace("\0", "").encode("utf-16-le")[:units * 2].decode("utf-16-le", errors="ignore")
 
 
 class _Win32Backend:
+    supports_delivery_validation = True
+
     def __init__(self, owner):
         self.owner = owner
         self.user, self.shell, self.kernel = _load_apis()
+        self.owner._set_dpi_status(enable_per_monitor_dpi(self.user))
+        self.gdi = _load_font_apis()
         self.hwnd = None
         self.icon_added = False
         self.icon_handle = None
@@ -184,6 +229,9 @@ class _Win32Backend:
         self.popup_hwnd = None
         self.popup_title = None
         self.popup_body = None
+        self.popup_buttons = ()
+        self.popup_dpi = 96
+        self.popup_font = None
         self.popup_persistent_key = None
         self.last_notice = None
         self.user_notification_code = None
@@ -302,9 +350,15 @@ class _Win32Backend:
             self.user.TranslateMessage(ctypes.byref(msg))
             self.user.DispatchMessageW(ctypes.byref(msg))
 
-    def deliver(self, title, message, severity, sound, persistent=False, key=None, generation=None):
+    def deliver(self, title, message, severity, sound, persistent=False, key=None, generation=None,
+                *, validity_callback=None):
         if not self.icon_added:
             raise OSError("El icono de avisos no está disponible")
+        def current():
+            return (self.owner._session_currently_available() is not False and
+                    (validity_callback is None or validity_callback() is True))
+        if not current():
+            return False
         if persistent and not self.owner._persistent_active(key, generation):
             return False
         self._query_user_notification_state()
@@ -315,19 +369,28 @@ class _Win32Backend:
         data.dwInfoFlags = SEVERITIES[severity][0] | NIIF_NOSOUND
         self.last_notice = {"title": title, "message": message, "requested_at": time.monotonic(),
                             "clicked": False, "popup_handled": bool(persistent), "shell_shown": False,
-                            "persistent_key": key if persistent else None}
+                            "persistent_key": key if persistent else None,
+                            "validity_callback": validity_callback}
+        accepted = False
+        if not current():
+            return False
         if persistent and self.user_notification_code == 5:
             # An explicitly requested persistent warning uses our single native
             # window. No balloon is added alongside it, and no second sound is
             # emitted when its current text is refreshed.
             self.user.KillTimer(self.hwnd, 2)
             if not self.owner._persistent_acknowledged(key):
-                current = self.owner._persistent_message(key)
-                if current is not None:
-                    self._show_popup(current["title"], current["message"], persistent=True, key=key)
+                current_notice = self.owner._persistent_message(key)
+                if current_notice is not None:
+                    accepted = self._show_popup(current_notice["title"], current_notice["message"], persistent=True, key=key,
+                                                validity_callback=validity_callback) is True
         elif not self.shell.Shell_NotifyIconW(NIM_MODIFY, ctypes.byref(data)):
             self.last_notice = None
             raise OSError("Windows no aceptó el aviso de Elipro")
+        else:
+            accepted = True
+        if not accepted or not current():
+            return False
         if not persistent and self.user_notification_code == 5 and not self.owner._stop.is_set():
             self.user.KillTimer(self.hwnd, 2)
             if not self.user.SetTimer(self.hwnd, 2, 1000, None):
@@ -340,49 +403,96 @@ class _Win32Backend:
                 self.owner._set_sound_error(None)
             except Exception as exc:
                 self.owner._set_sound_error(str(exc))
+        return True
+
+    def _window_dpi(self, hwnd):
+        for name, args in (("GetDpiForWindow", (hwnd,)), ("GetDpiForSystem", ())):
+            try:
+                value = getattr(self.user, name)(*args)
+                if type(value) is int and 48 <= value <= 768:
+                    return value
+            except (OSError, AttributeError):
+                pass
+        return 96
+
+    def _scale(self, value):
+        return max(1, round(value * self.popup_dpi / 96))
+
+    def _set_popup_font(self):
+        if self.gdi is None:
+            return
+        font = self.gdi.CreateFontW(-self._scale(13), 0, 0, 0, 400, 0, 0, 0, 1, 0, 0, 5, 0, "Segoe UI")
+        if not isinstance(font, int) or not font:
+            return
+        previous, self.popup_font = self.popup_font, font
+        for hwnd in (self.popup_title, self.popup_body, *self.popup_buttons):
+            if hwnd:
+                self.user.SendMessageW(hwnd, WM_SETFONT, font, 1)
+        if previous:
+            self.gdi.DeleteObject(previous)
+
+    def _layout_popup(self, dpi):
+        self.popup_dpi = dpi
+        controls = ((self.popup_title, 16, 14, 386, 32), (self.popup_body, 16, 49, 386, 78))
+        if len(self.popup_buttons) == 2:
+            controls += ((self.popup_buttons[0], 16, 142, 180, 30),
+                         (self.popup_buttons[1], 212, 142, 190, 30))
+        for hwnd, x, y, width, height in controls:
+            if hwnd and not self.user.SetWindowPos(hwnd, None, self._scale(x), self._scale(y),
+                                                  self._scale(width), self._scale(height), 0x0010 | 0x0004):
+                raise OSError("Windows no pudo ajustar la escala del aviso")
+        self._set_popup_font()
 
     def _create_popup(self):
         # A tool window stays out of the taskbar; NOACTIVATE preserves whichever
-        # application the user is working in. No custom fonts/brushes to release.
+        # application the user is working in. The DPI-specific font is owned.
+        self.popup_dpi = self._window_dpi(self.hwnd)
         self.popup_hwnd = self.user.CreateWindowExW(
             0x08000000 | 0x00000080 | 0x00000008, self.class_name, "Aviso de Elipro UPS",
-            0x80000000 | 0x00800000, 0, 0, 420, 190, None, None, self.instance, None)
+            0x80000000 | 0x00800000, 0, 0, self._scale(420), self._scale(190), None, None, self.instance, None)
         if not self.popup_hwnd:
             raise OSError("No se pudo crear el aviso de escritorio de Elipro")
         child_style = 0x40000000 | 0x10000000
         self.popup_title = self.user.CreateWindowExW(0, "STATIC", "Elipro UPS",
-            child_style | 0x80, 16, 14, 386, 32, self.popup_hwnd, None, self.instance, None)
+            child_style | 0x80, self._scale(16), self._scale(14), self._scale(386), self._scale(32), self.popup_hwnd, None, self.instance, None)
         self.popup_body = self.user.CreateWindowExW(0, "STATIC", "",
-            child_style | 0x80, 16, 49, 386, 78, self.popup_hwnd, None, self.instance, None)
+            child_style | 0x80, self._scale(16), self._scale(49), self._scale(386), self._scale(78), self.popup_hwnd, None, self.instance, None)
         open_button = self.user.CreateWindowExW(0, "BUTTON", "Abrir Elipro",
-            child_style, 16, 142, 180, 30, self.popup_hwnd, ctypes.c_void_p(101), self.instance, None)
+            child_style, self._scale(16), self._scale(142), self._scale(180), self._scale(30), self.popup_hwnd, ctypes.c_void_p(101), self.instance, None)
         close_button = self.user.CreateWindowExW(0, "BUTTON", "Cerrar aviso",
-            child_style, 212, 142, 190, 30, self.popup_hwnd, ctypes.c_void_p(102), self.instance, None)
+            child_style, self._scale(212), self._scale(142), self._scale(190), self._scale(30), self.popup_hwnd, ctypes.c_void_p(102), self.instance, None)
+        self.popup_buttons = (open_button, close_button)
         if not all((self.popup_title, self.popup_body, open_button, close_button)):
             self._destroy_popup()
             raise OSError("No se pudieron crear los controles del aviso de Elipro")
+        self._set_popup_font()
 
-    def _show_popup(self, title, message, persistent=False, key=None):
-        if self.owner._stop.is_set():
-            return
+    def _show_popup(self, title, message, persistent=False, key=None, *, validity_callback=None):
+        if self.owner._stop.is_set() or self.owner._session_currently_available() is False:
+            return False
         if not persistent and self.popup_persistent_key is not None:
             # An informational fallback must not replace an active critical
             # window. There is always at most one custom window.
-            return
+            return False
         if not self.popup_hwnd:
             self._create_popup()
+        dpi = self._window_dpi(self.popup_hwnd)
+        if dpi != self.popup_dpi:
+            self._layout_popup(dpi)
         work = RECT()
         if not self.user.SystemParametersInfoW(0x0030, 0, ctypes.byref(work), 0):  # SPI_GETWORKAREA
             raise OSError("No se pudo localizar el área de trabajo para el aviso")
-        width, height = min(420, work.right - work.left), min(190, work.bottom - work.top)
+        width, height = min(self._scale(420), work.right - work.left), min(self._scale(190), work.bottom - work.top)
         if width <= 0 or height <= 0:
             raise OSError("El área de trabajo para avisos no está disponible")
         self.user.SetWindowTextW(self.popup_title, "Elipro UPS · " + _utf16_clip(title, 80))
         self.user.SetWindowTextW(self.popup_body, _utf16_clip(message, 400))
+        if validity_callback is not None and validity_callback() is not True:
+            return False
         # HWND_TOPMOST=-1; SHOWWINDOW | NOACTIVATE. A new warning replaces the
         # previous one and refreshes the same timer rather than stacking windows.
         if not self.user.SetWindowPos(self.popup_hwnd, ctypes.c_void_p(-1),
-                max(work.left, work.right - width - 16), max(work.top, work.bottom - height - 16),
+                max(work.left, work.right - width - self._scale(16)), max(work.top, work.bottom - height - self._scale(16)),
                 width, height, 0x0010 | 0x0040):
             raise OSError("Windows no pudo mostrar el aviso de Elipro")
         self.popup_persistent_key = key if persistent else None
@@ -392,6 +502,7 @@ class _Win32Backend:
                 self._hide_popup()
                 raise OSError("No se pudo programar el cierre del aviso de Elipro")
         self.owner._record_popup_event("shown")
+        return True
 
     def _hide_popup(self):
         if self.popup_hwnd:
@@ -401,6 +512,14 @@ class _Win32Backend:
         self.popup_persistent_key = None
 
     def sync_persistent(self):
+        if self.last_notice is not None:
+            validator = self.last_notice.get("validity_callback")
+            if validator is not None and validator() is not True:
+                key = self.last_notice.get("persistent_key")
+                self.last_notice = None
+                self.user.KillTimer(self.hwnd, 2)
+                if self.popup_persistent_key == key:
+                    self._hide_popup()
         key = self.popup_persistent_key
         if key is None:
             return
@@ -423,25 +542,43 @@ class _Win32Backend:
             self.user.DestroyWindow(hwnd)
             self.popup_hwnd = None
             self.popup_title = self.popup_body = None
+            self.popup_buttons = ()
+        if self.popup_font and self.gdi is not None:
+            self.gdi.DeleteObject(self.popup_font)
+            self.popup_font = None
         self.popup_persistent_key = None
+
+    def suspend_session(self):
+        self.user.KillTimer(self.hwnd, 2)
+        self.last_notice = None
+        self._hide_popup()
 
     def _maybe_fallback_popup(self):
         notice = self.last_notice
         if (not notice or notice["clicked"] or notice["popup_handled"]
                 or self.owner._stop.is_set() or self.user_notification_code != 5):
             return
+        validator = notice.get("validity_callback")
+        if validator is not None and validator() is not True:
+            notice["popup_handled"] = True
+            self.user.KillTimer(self.hwnd, 2)
+            return
         age = time.monotonic() - notice["requested_at"]
         if not 0 <= age < 1:
             return
         notice["popup_handled"] = True
         self.user.KillTimer(self.hwnd, 2)
-        self._show_popup(notice["title"], notice["message"])
+        self._show_popup(notice["title"], notice["message"], validity_callback=validator)
 
     def _check_unconfirmed_popup(self):
         self.user.KillTimer(self.hwnd, 2)
         notice = self.last_notice
         if (not notice or notice["shell_shown"] or notice["clicked"]
                 or notice["popup_handled"] or self.owner._stop.is_set()):
+            return
+        validator = notice.get("validity_callback")
+        if validator is not None and validator() is not True:
+            notice["popup_handled"] = True
             return
         elapsed = time.monotonic() - notice["requested_at"]
         if elapsed < 1:
@@ -453,7 +590,7 @@ class _Win32Backend:
         if self.user_notification_code != 5:
             return
         notice["popup_handled"] = True
-        self._show_popup(notice["title"], notice["message"])
+        self._show_popup(notice["title"], notice["message"], validity_callback=validator)
 
     def _menu(self):
         menu = self.user.CreatePopupMenu()
@@ -493,6 +630,19 @@ class _Win32Backend:
     def _window_proc(self, hwnd, message, wparam, lparam):
         try:
             if self.popup_hwnd and hwnd == self.popup_hwnd:
+                if message == WM_DPICHANGED:
+                    dpi = wparam & 0xFFFF
+                    if not 48 <= dpi <= 768 or not lparam:
+                        return 0
+                    suggested = ctypes.cast(lparam, ctypes.POINTER(RECT)).contents
+                    width, height = suggested.right - suggested.left, suggested.bottom - suggested.top
+                    if width <= 0 or height <= 0:
+                        return 0
+                    self._layout_popup(dpi)
+                    if not self.user.SetWindowPos(hwnd, ctypes.c_void_p(-1), suggested.left,
+                                                  suggested.top, width, height, 0x0010 | 0x0004):
+                        raise OSError("Windows no pudo aplicar el cambio de DPI del aviso")
+                    return 0
                 if message == WM_COMMAND:
                     command = wparam & 0xFFFF
                     if command == 101:
@@ -634,6 +784,14 @@ class WindowsNotifier:
         self._persistent_dismissed = set()
         self._persistent_versions = {}
         self._persistent_serial = 0
+        self._dpi_status = None
+        self._session_available = True
+        self._session_generation = 0
+        self._session_probe = None
+        self._pending_deliveries = {}
+        self._delivery_serial = 0
+        self._completed_deliveries = OrderedDict()
+        self._delivery_receipts = deque(maxlen=256)
 
     def start(self):
         with self._lock:
@@ -653,6 +811,89 @@ class WindowsNotifier:
     def _set_error(self, message):
         with self._lock:
             self._last_error = message
+
+    def _set_dpi_status(self, value):
+        with self._lock:
+            self._dpi_status = dict(value)
+
+    def set_session_probe(self, probe):
+        """Install the agent's fresh WTS/desktop probe, called at delivery time."""
+        if probe is not None and not callable(probe):
+            raise ValueError("La comprobación de sesión debe ser una función")
+        with self._lock:
+            self._session_probe = probe
+
+    def _session_currently_available(self):
+        with self._lock:
+            available, probe = self._session_available, self._session_probe
+        if not available:
+            return False
+        try:
+            return probe() is True if probe is not None else True
+        except Exception:
+            return False
+
+    def _receipt_locked(self, delivery_id, outcome, error=None):
+        receipt = {"delivery_id": delivery_id, "outcome": outcome,
+                   "timestamp": datetime.now(timezone.utc).isoformat()}
+        if error is not None:
+            receipt["error"] = str(error)[:300]
+        self._delivery_receipts.append(receipt)
+
+    def drain_receipts(self):
+        """ACK means native acceptance, never queue admission or human reading."""
+        with self._lock:
+            result = [dict(item) for item in self._delivery_receipts]
+            self._delivery_receipts.clear()
+            return result
+
+    def cancel_delivery(self, delivery_id):
+        """Invalidate a queued payload before the agent replaces its context."""
+        with self._lock:
+            pending = self._pending_deliveries.pop(delivery_id, None)
+            completed = self._completed_deliveries.pop(delivery_id, None)
+            self._delivery_receipts = deque((item for item in self._delivery_receipts
+                                            if item["delivery_id"] != delivery_id), maxlen=256)
+            if pending is not None or completed is not None:
+                self._receipt_locked(delivery_id, "cancelled")
+            backend = self._backend
+        if backend is not None:
+            backend.wake()
+
+    def _delivery_is_current(self, delivery_id, ticket, session_generation):
+        if not self._session_currently_available():
+            return False
+        with self._lock:
+            completed = self._completed_deliveries.get(delivery_id)
+            return (not self._stop.is_set() and self._session_generation == session_generation and
+                    (self._pending_deliveries.get(delivery_id) == (session_generation, ticket) or
+                     (completed is not None and completed[1:] == (session_generation, ticket))))
+
+    def set_session_available(self, available):
+        if type(available) is not bool:
+            raise ValueError("La disponibilidad de sesión debe ser booleana")
+        with self._lock:
+            if available != self._session_available:
+                self._session_generation += 1
+            self._session_available = available
+            if not available:
+                # The broker owns deferred alerts and will rebuild their text
+                # on resume. Never replay an old local countdown after unlock.
+                for delivery_id in self._pending_deliveries:
+                    self._receipt_locked(delivery_id, "cancelled")
+                self._pending_deliveries.clear()
+                # Any unacknowledged accepted request must be rebuilt by the
+                # broker after resume rather than deduplicated as already seen.
+                self._completed_deliveries.clear()
+                while True:
+                    try:
+                        self._queue.get_nowait()
+                        self._queue.task_done()
+                    except queue.Empty:
+                        break
+            backend = self._backend
+        if backend is not None:
+            backend.wake()
 
     def _set_sound_error(self, message):
         with self._lock:
@@ -713,24 +954,43 @@ class WindowsNotifier:
             with self._lock:
                 self._backend = None
 
-    def notify(self, title, message, severity="info", sound=True, *, persistent=False, key=None):
+    def notify(self, title, message, severity="info", sound=True, *, persistent=False, key=None,
+               delivery_id=None):
         if severity not in SEVERITIES:
             raise ValueError("Nivel de aviso inválido")
         if not isinstance(title, str) or not isinstance(message, str) or not title or not message:
             raise ValueError("El aviso necesita título y mensaje")
         if type(persistent) is not bool or (persistent and (not isinstance(key, str) or not key)):
             raise ValueError("El aviso persistente necesita una clave válida")
+        if delivery_id is not None and (not isinstance(delivery_id, str) or not 1 <= len(delivery_id) <= 128):
+            raise ValueError("El identificador de entrega debe tener entre 1 y 128 caracteres")
         with self._lock:
-            if self._stop.is_set() or not self._ready:
+            if self._stop.is_set() or not self._ready or not self._session_available:
                 return False
             backend = self._backend
             generation = self._persistent_versions.get(key)
-        try:
             item = (title, message, severity, bool(sound))
-            self._queue.put_nowait((*item, True, key, generation) if persistent else item)
-        except queue.Full:
-            self._set_error("La cola de avisos está llena")
-            return False
+            item = (*item, True, key, generation) if persistent else item
+            duplicate_pending = False
+            if delivery_id is not None:
+                now = time.monotonic()
+                while self._completed_deliveries and next(iter(self._completed_deliveries.values()))[0] < now - 300:
+                    self._completed_deliveries.popitem(last=False)
+                if delivery_id in self._completed_deliveries:
+                    self._receipt_locked(delivery_id, "accepted")
+                    return True
+                duplicate_pending = delivery_id in self._pending_deliveries
+                self._delivery_serial += 1
+                item = {"notification": item, "delivery_id": delivery_id,
+                        "session_generation": self._session_generation, "ticket": self._delivery_serial}
+            if not duplicate_pending:
+                try:
+                    self._queue.put_nowait(item)
+                except queue.Full:
+                    self._last_error = "La cola de avisos está llena"
+                    return False
+                if delivery_id is not None:
+                    self._pending_deliveries[delivery_id] = (self._session_generation, item["ticket"])
         if backend is not None and not backend.wake():
             self._set_error("No se pudo despertar el hilo de avisos")
             return False
@@ -787,8 +1047,15 @@ class WindowsNotifier:
 
     def _drain(self, backend):
         while not self._stop.is_set():
+            if not self._session_currently_available():
+                self.set_session_available(False)
+                suspend = getattr(backend, "suspend_session", None)
+                if callable(suspend):
+                    suspend()
+                return
             try:
-                item = self._queue.get_nowait()
+                with self._lock:
+                    item = self._queue.get_nowait()
             except queue.Empty:
                 synchronize = getattr(backend, "sync_persistent", None)
                 if callable(synchronize):
@@ -797,15 +1064,43 @@ class WindowsNotifier:
                     except Exception as exc:
                         self._set_error(str(exc))
                 return
+            delivery_id = item.get("delivery_id") if isinstance(item, dict) else None
+            notification = item["notification"] if isinstance(item, dict) else item
+            session_generation = item.get("session_generation") if isinstance(item, dict) else None
+            ticket = item.get("ticket") if isinstance(item, dict) else None
+            error = None
             try:
-                result = backend.deliver(*item)
-                if result is False:
-                    continue
+                validator = None
+                if delivery_id is not None:
+                    validator = lambda delivery_id=delivery_id, ticket=ticket, session_generation=session_generation: self._delivery_is_current(delivery_id, ticket, session_generation)
+                    if not validator():
+                        continue
+                if validator is not None and getattr(backend, "supports_delivery_validation", False) is True:
+                    result = backend.deliver(*notification, validity_callback=validator)
+                else:
+                    result = backend.deliver(*notification)
+                available = self._session_currently_available()
                 with self._lock:
-                    self._last_delivered_at = datetime.now(timezone.utc).isoformat()
-                    self._last_error = None
+                    if result is not False and available:
+                        self._last_delivered_at = datetime.now(timezone.utc).isoformat()
+                        self._last_error = None
+                    if delivery_id is not None and self._pending_deliveries.get(delivery_id) == (session_generation, ticket):
+                        self._pending_deliveries.pop(delivery_id, None)
+                        if result is True and available and self._session_generation == session_generation:
+                            self._completed_deliveries[delivery_id] = (time.monotonic(), session_generation, ticket)
+                            while len(self._completed_deliveries) > 256:
+                                self._completed_deliveries.popitem(last=False)
+                            self._receipt_locked(delivery_id, "accepted")
+                        else:
+                            self._receipt_locked(delivery_id, "cancelled" if not available or result is False else "failed")
             except Exception as exc:
-                self._set_error(str(exc))
+                error = str(exc)
+                self._set_error(error)
+                if delivery_id is not None:
+                    with self._lock:
+                        if self._pending_deliveries.get(delivery_id) == (session_generation, ticket):
+                            self._pending_deliveries.pop(delivery_id, None)
+                            self._receipt_locked(delivery_id, "failed", error)
             finally:
                 self._queue.task_done()
 
@@ -826,6 +1121,10 @@ class WindowsNotifier:
                     "last_popup_hidden_at": self._last_popup_hidden_at,
                     "persistent_active": len(self._persistent_messages),
                     "persistent_dismissed": len(self._persistent_dismissed),
+                    "dpi_awareness": dict(self._dpi_status) if self._dpi_status else None,
+                    "session_available": self._session_available,
+                    "pending_deliveries": len(self._pending_deliveries),
+                    "delivery_receipts": len(self._delivery_receipts),
                     "platform": "windows" if os.name == "nt" else os.name,
                     "channel": "windows-tray"}
 
@@ -836,6 +1135,9 @@ class WindowsNotifier:
             self._persistent_messages.clear()
             self._persistent_dismissed.clear()
             self._persistent_versions.clear()
+            for delivery_id in self._pending_deliveries:
+                self._receipt_locked(delivery_id, "cancelled")
+            self._pending_deliveries.clear()
         if backend is not None:
             backend.request_stop()
         if thread is not None and thread is not threading.current_thread():
