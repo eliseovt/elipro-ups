@@ -1,9 +1,10 @@
-"""Windows HID discovery and an explicit, isolated QS-only diagnostic transport.
+"""Windows HID discovery and isolated, explicitly allowlisted read-only queries.
 
 SetupAPI locates the HID collection. CreateFile uses desiredAccess=0 and shared
 read/write solely to inspect attributes, strings and cached report capabilities.
-Enumeration sends no UPS commands. Explicit query_status sends only QS/CR and
-does not control the UPS. It runs in a disposable process with a 3-second limit.
+Enumeration sends no UPS commands. Normal query_status sends only QS/CR.
+The separate battery diagnostic permits only BT?/CR and BL?/CR; it is never
+used by native polling. Each query runs in a disposable process with a deadline.
 
 Microsoft references:
 https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-createfilew
@@ -28,6 +29,7 @@ from .runtime import child_command, resource_root
 VENDOR_ID = 0x0665
 PRODUCT_ID = 0x5161
 STATUS_QUERY = b"QS\r"
+BATTERY_DIAGNOSTIC_QUERIES = {"BT": b"BT?\r", "BL": b"BL?\r"}
 _cooldown_until = {}
 _cooldown_lock = threading.Lock()
 _active_workers = {}
@@ -261,7 +263,20 @@ def _read_report(kernel, handle, event, deadline):
 
 
 def _query_status_once(path):
-    """Worker only: exactly one status query, without any control commands."""
+    """Normal status worker: the command cannot be selected by its caller."""
+    return _query_read_only_once(path, STATUS_QUERY)
+
+
+def _query_battery_diagnostic_once(path, command):
+    if type(command) is not bytes or command not in BATTERY_DIAGNOSTIC_QUERIES.values():
+        raise ValueError("El diagnóstico solo admite BT? o BL? seguidos de CR")
+    return _query_read_only_once(path, command)
+
+
+def _query_read_only_once(path, command):
+    """Worker only: one fixed query using the same mutex, framing and deadline."""
+    if type(command) is not bytes or command not in (STATUS_QUERY, *BATTERY_DIAGNOSTIC_QUERIES.values()):
+        raise ValueError("Consulta HID no admitida")
     _validate_path(path)
     setup, hid, kernel = _apis()
     deadline = time.monotonic() + 2.5
@@ -306,9 +321,9 @@ def _query_status_once(path):
         if not hid.HidD_FlushQueue(handle):
             raise ctypes.WinError(ctypes.get_last_error())
         if time.monotonic() >= deadline:
-            raise TimeoutError("El plazo HID terminó antes de enviar QS")
-        # Output report 0, eight payload bytes; no alternate commands/framing.
-        output = ctypes.create_string_buffer(b"\x00QS\r\x00\x00\x00\x00\x00", 9)
+            raise TimeoutError("El plazo HID terminó antes de enviar la consulta")
+        # Report ID 0 and eight payload bytes. The allowlist is checked above.
+        output = ctypes.create_string_buffer(b"\x00" + command.ljust(8, b"\x00"), 9)
         if not hid.HidD_SetOutputReport(handle, output, 9):
             raise ctypes.WinError(ctypes.get_last_error())
         response = bytearray()
@@ -316,7 +331,7 @@ def _query_status_once(path):
             response.extend(_read_report(kernel, handle, event, deadline))
             if b"\r" in response:
                 return bytes(response[:response.index(13) + 1])
-        raise TimeoutError("Respuesta QS incompleta o demasiado larga")
+        raise TimeoutError("Respuesta HID incompleta o demasiado larga")
     finally:
         if event:
             kernel.CloseHandle(event)
@@ -399,10 +414,12 @@ def enumerate_ups_bounded():
 
 
 class StatusTransport:
-    """QS-only transport validated against this NT-2402PRO while online.
+    """QS polling with a separate, explicitly invoked battery diagnostic.
 
-    Direct readings have been compared with the OEM collector. Real outages and
-    automatic OS shutdown have not been exercised on the physical UPS.
+    Direct readings have been compared with the OEM collector, including a
+    manual outage and return to mains. Automatic OS shutdown was not exercised.
+    The observed device replies N/CR to BT?/BL?; these explicit diagnostics are
+    never part of native polling and are not interpreted as battery capacity.
 
     HidD_SetOutputReport is synchronous; Windows cancellation may also wait for a
     driver. A child process contains both operations so a hung driver cannot block
@@ -416,23 +433,43 @@ class StatusTransport:
     def query_status(self, command=STATUS_QUERY):
         if type(command) is not bytes or command != STATUS_QUERY:
             raise ValueError("Solo se permite la consulta de estado QS seguida de CR")
+        return self._query_worker(child_command("qs-worker", self.path))
+
+    def query_battery_diagnostic(self, command):
+        """Explicit diagnostic only; normal polling remains strictly QS-only."""
+        if type(command) is not bytes or command not in BATTERY_DIAGNOSTIC_QUERIES.values():
+            raise ValueError("El diagnóstico solo admite BT? o BL? seguidos de CR")
+        selector = next(name for name, value in BATTERY_DIAGNOSTIC_QUERIES.items() if value == command)
+        return self._query_worker(child_command("battery-worker", self.path, selector))
+
+    def _query_worker(self, args):
         key = self.path.casefold()
         with _cooldown_lock:
             if time.monotonic() < _cooldown_until.get(key, 0):
                 raise TimeoutError("USB en espera de seguridad tras una respuesta fallida (5 segundos)")
-        args = child_command("qs-worker", self.path)
         try:
             result = _run_bounded_worker(args, key)
             if result.returncode:
                 raise OSError(result.stderr.decode("utf-8", "replace").strip()[:500] or "Falló el diagnóstico HID")
             if not result.stdout or len(result.stdout) > 256 or not result.stdout.endswith(b"\r"):
-                raise OSError("El proceso devolvió una respuesta QS incompleta")
+                raise OSError("El proceso devolvió una respuesta HID incompleta")
         except OSError:
             # Per-path state survives NativeHidAdapter recreating its transport.
             with _cooldown_lock:
                 _cooldown_until[key] = time.monotonic() + 5
             raise
         return result.stdout
+
+
+def battery_worker_main(argv):
+    if len(argv) != 2 or argv[1] not in BATTERY_DIAGNOSTIC_QUERIES:
+        raise SystemExit("Uso interno: diagnóstico de batería aislado BT/BL")
+    try:
+        sys.stdout.buffer.write(_query_battery_diagnostic_once(argv[0], BATTERY_DIAGNOSTIC_QUERIES[argv[1]]))
+        return 0
+    except Exception as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
 
 
 def worker_main(argv):
@@ -453,6 +490,8 @@ def worker_main(argv):
 
 
 if __name__ == "__main__":
-    if len(sys.argv) != 3 or sys.argv[1] != "--qs-worker":
-        raise SystemExit("Uso interno: diagnóstico QS aislado")
-    raise SystemExit(worker_main(sys.argv[2:]))
+    if len(sys.argv) >= 2 and sys.argv[1] == "--qs-worker":
+        raise SystemExit(worker_main(sys.argv[2:]))
+    if len(sys.argv) >= 2 and sys.argv[1] == "--battery-worker":
+        raise SystemExit(battery_worker_main(sys.argv[2:]))
+    raise SystemExit("Uso interno: diagnóstico HID aislado")

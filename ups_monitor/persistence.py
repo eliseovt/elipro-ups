@@ -16,7 +16,7 @@ from collections import deque
 from dataclasses import dataclass
 
 from .alerts import CRITICAL_HISTORY_EVENTS, DEFAULT_NOTIFICATION_SETTINGS, validate_notification_settings
-from .core import DEFAULT_POLICY, SAMPLE_FIELDS, Store, _timestamp, iso_utc, validate_policy
+from .core import DEFAULT_POLICY, SAMPLE_FIELDS, Store, _timestamp, battery_estimate_fields, iso_utc, validate_policy
 
 
 class HistoryUnavailable(RuntimeError):
@@ -209,6 +209,7 @@ class ResilientStore:
 
     def add_sample(self, sample, *, urgent=False):
         value = {field: sample.get(field) for field in SAMPLE_FIELDS}
+        value.update(battery_estimate_fields(sample))
         value["timestamp"] = iso_utc(_timestamp(sample["timestamp"]))
         value["watts_is_estimate"] = sample.get("watts_is_estimate") is True
         json.dumps(value, allow_nan=False)

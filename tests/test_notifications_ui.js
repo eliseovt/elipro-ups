@@ -95,6 +95,7 @@ function harness(historyOptions = {}) {
   const nav = historyOptions.navigation ? views.map((view) => Object.assign(new Element(), { dataset: { view } })) : [];
   const pages = historyOptions.navigation ? views.map((view) => Object.assign(get(`page-${view}`), { dataset: { page: view } })) : [];
   const shortcuts = historyOptions.navigation ? views.map((view) => Object.assign(new Element(), { dataset: { goView: view } })) : [];
+  const metrics = ["voltage", "battery", "load"].map((metric) => Object.assign(new Element(), { dataset: { metric } }));
   const windowListeners = {};
   const navigationScrolls = [];
   const location = { hash: historyOptions.hash || "" };
@@ -109,7 +110,7 @@ function harness(historyOptions = {}) {
         if (!selectors.has(selector)) selectors.set(selector, new Element());
         return selectors.get(selector);
       },
-      querySelectorAll: (selector) => selector === "[data-view]" ? nav : selector === "[data-page]" ? pages : selector === "[data-go-view]" ? shortcuts : [],
+      querySelectorAll: (selector) => selector === ".sidebar-nav [data-view]" ? nav : selector === "[data-page]" ? pages : selector === "[data-go-view]" ? shortcuts : selector === "[data-metric]" ? metrics : [],
       createElement: () => new Element(), createElementNS: () => new Element(),
       createTextNode: (text) => Object.assign(new Element(), { textContent: text }),
     },
@@ -157,7 +158,7 @@ function harness(historyOptions = {}) {
   vm.runInContext(source, context, { filename: "static/app.js" });
   const poll = () => intervals.find((item) => item.ms === 2000).callback();
   const pollHistory = () => intervals.find((item) => item.ms === 30000).callback();
-  return { get, calls, historyCalls, pendingHistory, poll, pollHistory, downloads, body, rootElement, nav, pages, shortcuts, location, intervals, navigationScrolls, storedPreferences, storageWrites,
+  return { get, calls, historyCalls, pendingHistory, poll, pollHistory, downloads, body, rootElement, nav, pages, shortcuts, metrics, location, intervals, navigationScrolls, storedPreferences, storageWrites,
     ready: () => { domReady = true; context.document.readyState = "interactive"; documentListeners.DOMContentLoaded?.(); delete documentListeners.DOMContentLoaded; },
     open: (view) => nav[views.indexOf(view)].emit("click"),
     hashChange: (hash) => { location.hash = hash; windowListeners.hashchange?.(); },
@@ -864,8 +865,8 @@ test("sidebar monitoring and critical protection controls remain accurate across
     assert.equal(ui.get("connection-badge").lastElementChild.textContent, "UPS conectado");
     assert.equal(ui.get("last-updated").textContent, lastReading);
   }
-  assert.equal(ui.get("summary-health").textContent, "Monitor supervisado");
-  assert.match(ui.get("summary-observation").textContent, /1 h 0 min de 48 h/);
+  assert.equal(ui.get("health-state").textContent, "Supervisado");
+  assert.match(ui.get("stability-summary").textContent, /1 h 0 min de 48 h/);
   ui.poll();
   ui.calls.at(-1).reject(new TypeError("offline"));
   await flush();
@@ -975,13 +976,16 @@ test("Resumen voltage chart respects collection gaps and omits unsupported batte
   data.sample = { runtime_seconds: null, battery_voltage: 27.4 };
   ui.calls[0].respond(data);
   await flush();
-  const chart = ui.get("summary-history-spark");
+  const chart = ui.get("history-chart");
   const lines = chart.children.filter((item) => item.getAttribute("d"));
   assert.equal(lines.length, 2);
   assert.equal((lines[0].getAttribute("d").match(/M/g) || []).length, 2);
   assert.equal((lines[0].getAttribute("d").match(/L/g) || []).length, 1);
   assert.equal(ui.get("battery-runtime").hidden, true);
-  assert.equal(ui.get("battery-unit").textContent, "V");
+  assert.equal(ui.get("battery-unit").textContent, "%");
+  assert.equal(ui.get("battery-percent").textContent, "—");
+  assert.equal(ui.get("battery-note").textContent, "No disponible");
+  assert.equal(ui.get("battery-voltage").textContent, "27.4");
 });
 
 test("a saved theme is applied in the head before the dashboard starts", async () => {
@@ -1075,83 +1079,198 @@ test("unavailable browser storage cannot stop the theme toggle or UPS monitoring
   assert.equal(invalid.rootElement.dataset.theme, "dark");
 });
 
-test("Resumen loads its full hour independently of a decimated seven-day history", async () => {
-  const now = Date.now();
-  const sample = (seconds, voltage) => ({ timestamp: new Date(now - seconds * 1000).toISOString(), input_voltage: voltage, output_voltage: 220 });
-  const ui = harness({ navigation: true, storage: { "elipro-history": JSON.stringify({ hours: 168, metric: "voltage" }) }, samplesByHours: {
-    "1": [sample(30, 220), sample(20, 180), sample(10, 220)],
-    "168": [sample(30, 220), sample(10, 220)],
-  } });
-  ui.calls[0].respond(snapshot());
-  await flush();
-  assert.ok(ui.historyCalls.includes("/api/history?hours=1"));
-  assert.ok(ui.historyCalls.includes("/api/history?hours=168"));
-  const overview = ui.get("summary-history-spark").children.find((element) => element.getAttribute("d"));
-  assert.equal((overview.getAttribute("d").match(/[ML]/g) || []).length, 3, "the last-hour voltage dip must remain visible");
-  const chart = ui.get("history-chart").children.find((element) => element.getAttribute("d"));
-  assert.equal((chart.getAttribute("d").match(/[ML]/g) || []).length, 2);
-  assert.equal(overview.getAttribute("stroke"), "var(--teal)");
-  const queries = ui.historyCalls.length;
-  ui.get("theme-toggle").emit("click");
-  assert.equal(ui.historyCalls.length, queries, "theme colors must update through CSS without re-fetching telemetry");
-});
-
-test("the latest event summary includes critical UPS events and links to their archive", async () => {
-  const ui = harness({ navigation: true });
+test("Resumen and Historial share one chart and recent-event filter without extra queries", async () => {
+  const ui = harness({ navigation: true, storage: { "elipro-history": JSON.stringify({ hours: 168, metric: "load" }) } });
   const data = snapshot();
   data.events = [
-    { id: 2, kind: "ups_fault", timestamp: "2026-10-17T20:00:10Z", message: "Falla del UPS" },
-    { id: 1, kind: "connection_restored", timestamp: "2026-10-17T20:00:00Z", message: "USB recuperado" },
+    { id: 2, kind: "ups_fault", timestamp: new Date().toISOString(), message: "Falla del UPS" },
+    { id: 1, kind: "connection_restored", timestamp: new Date().toISOString(), message: "USB recuperado" },
   ];
   ui.calls[0].respond(data);
   await flush();
-  assert.equal(ui.get("summary-last-incident").textContent, "Falla del UPS");
-  assert.match(html, /data-go-view="history">Ver eventos/);
-  assert.equal(ui.get("policy-enabled").checked, false);
+  assert.deepEqual(ui.historyCalls, ["/api/history?hours=168"]);
+  assert.equal(ui.get("shared-history").hidden, false);
+  assert.equal(ui.get("shared-history").inert, false);
+  assert.equal(ui.get("page-history").hidden, true);
+  ui.get("events-filter").value = "power";
+  ui.get("events-filter").emit("change");
+  assert.equal(ui.get("event-count").textContent, "1 / 2");
+  assert.equal(ui.get("events-list").children[0].children[1].children[0].textContent, "Falla del UPS");
+  const chart = ui.get("history-chart");
+  ui.open("history");
+  assert.equal(ui.get("page-history").hidden, false);
+  assert.equal(ui.get("shared-history").hidden, false);
+  assert.match(ui.calls.at(-1).url, /^\/api\/events\/search\?/);
+  ui.open("overview");
+  assert.equal(ui.get("history-chart"), chart);
+  assert.equal(ui.get("events-filter").value, "power");
+  assert.equal(ui.get("event-count").textContent, "1 / 2");
+  assert.equal(ui.get("history-period").value, "168");
+  assert.equal(ui.metrics[2].getAttribute("aria-pressed"), "true");
+  for (const view of ["incidents", "protection", "notifications", "system"]) {
+    ui.open(view);
+    assert.equal(ui.get("shared-history").hidden, true);
+    assert.equal(ui.get("shared-history").inert, true);
+    assert.equal(ui.get("shared-history").getAttribute("aria-hidden"), "true");
+  }
+  ui.get("theme-toggle").emit("click");
+  assert.deepEqual(ui.historyCalls, ["/api/history?hours=168"]);
+  assert.equal(ui.intervals.filter((item) => item.ms === 30000).length, 1);
+  const ids = [...html.matchAll(/\bid="([^"]+)"/g)].map((match) => match[1]);
+  assert.equal(new Set(ids).size, ids.length, "the shared surface must not duplicate any IDs");
+  assert.doesNotMatch(html, /summary-history-spark|summary-health|summary-last-incident|details-row|battery-art/);
 });
 
 for (const outcome of ["failure", "success"]) {
-  test(`an obsolete last-hour ${outcome} cannot overwrite the valid overview while ranges change`, async () => {
-    const now = Date.now();
-    const samples = (low, high) => [
-      { timestamp: new Date(now - 20000).toISOString(), input_voltage: low, output_voltage: 220 },
-      { timestamp: new Date(now - 10000).toISOString(), input_voltage: high, output_voltage: 220 },
-    ];
+  test(`an obsolete history ${outcome} cannot replace the newly selected period`, async () => {
     const ui = harness({ navigation: true, deferredHistory: true });
     ui.calls[0].respond(snapshot());
-    ui.pendingHistory[0].respond({ samples: samples(220, 221) });
-    await flush();
-    const chart = ui.get("summary-history-spark");
-    const paths = () => chart.children.filter((element) => element.getAttribute("d"));
-    assert.equal(paths().length, 2);
-    ui.get("history-period").value = "168";
+    const obsolete = ui.pendingHistory[0];
+    ui.get("history-period").value = "0.25";
     ui.get("history-period").emit("change");
-    const longRange = ui.pendingHistory.at(-1);
-    assert.equal(longRange.url, "/api/history?hours=168");
-    assert.equal(ui.pendingHistory.filter((request) => !request.settled).length, 1, "no overview query may compete with the long-range SQL reader");
-    longRange.respond({ samples: samples(220, 221) });
-    await flush();
-    const obsolete = ui.pendingHistory.at(-1);
-    assert.equal(obsolete.url, "/api/history?hours=1");
-    assert.equal(obsolete.settled, false);
-    ui.get("history-period").value = "1";
-    ui.get("history-period").emit("change");
-    assert.equal(ui.pendingHistory.at(-1), obsolete, "the new shared query waits for the old reader to finish");
+    assert.equal(ui.pendingHistory.length, 1, "one history reader at a time");
+    const samples = (voltage) => [{ timestamp: new Date(Date.now() - 10000).toISOString(), input_voltage: voltage }];
     if (outcome === "failure") obsolete.reject(new TypeError("old query failed"));
-    else obsolete.respond({ samples: samples(180, 220) });
+    else obsolete.respond({ samples: samples(100) });
     await flush();
-    assert.equal(paths().length, 2, "an obsolete failure must not erase the last valid overview");
-    assert.equal(chart.children.some((element) => element.textContent === "170"), false, "an obsolete success must not inject an old voltage dip");
     const current = ui.pendingHistory.at(-1);
     assert.notEqual(current, obsolete);
-    assert.equal(current.url, "/api/history?hours=1");
-    assert.equal(ui.pendingHistory.filter((request) => !request.settled).length, 1);
+    assert.equal(current.url, "/api/history?hours=0.25");
     assert.equal(ui.get("history-notice").hidden, true);
-    assert.equal(ui.get("service-notice").hidden, true);
-    assert.equal(ui.get("policy-enabled").checked, false);
-    current.respond({ samples: samples(180, 220) });
+    assert.equal(ui.get("history-chart").children.some((element) => element.getAttribute("d")), false);
+    current.respond({ samples: samples(220) });
     await flush();
-    assert.equal(chart.children.some((element) => element.textContent === "170"), true, "the current shared query may update the last-hour overview");
+    assert.equal(ui.get("history-chart").children.some((element) => element.getAttribute("d")), true);
+    assert.equal(ui.pendingHistory.filter((request) => !request.settled).length, 0);
+    assert.equal(ui.historyCalls.length, 2, "no mini chart requests follow a response");
     assert.equal(ui.calls.some((call) => call.options.method === "POST"), false);
   });
 }
+
+test("connection point keeps an accessible state for fresh, stale and disconnected UPS data", async () => {
+  const ui = harness({ navigation: true });
+  const data = snapshot();
+  for (const [state, label] of [["connected", "UPS conectado"], ["stale", "Datos desactualizados"], ["disconnected", "Sin conexión al UPS"]]) {
+    if (state !== "connected") ui.poll();
+    data.connection.state = state;
+    ui.calls.at(-1).respond(data);
+    await flush();
+    assert.equal(ui.get("connection-badge").className, `connection-indicator ${state}`);
+    assert.equal(ui.get("connection-badge").title, label);
+    assert.equal(ui.get("connection-badge").lastElementChild.textContent, label);
+  }
+  assert.match(html, /class="sidebar-equipment"><span id="connection-badge"[^>]*role="status"/);
+  assert.match(html, /class="sr-only">Conectando/);
+});
+
+test("battery charge is primary, estimates are labelled and voltage stays secondary", async () => {
+  const ui = harness();
+  const data = snapshot();
+  data.sample = { battery_percent: 83, battery_percent_estimate: 40, battery_estimate_method: "fixture_v1", battery_voltage: 27.41, low_battery: false, on_battery: false };
+  ui.calls[0].respond(data);
+  await flush();
+  assert.equal(ui.get("battery-percent").textContent, "83");
+  assert.equal(ui.get("battery-unit").textContent, "%");
+  assert.equal(ui.get("battery-voltage").textContent, "27.41");
+  assert.equal(ui.get("battery-note").textContent, "Carga reportada");
+  assert.equal(ui.get("battery-tag").textContent, "Sin alerta");
+  data.sample.battery_percent = null;
+  data.sample.on_battery = true;
+  ui.poll(); ui.calls.at(-1).respond(data); await flush();
+  assert.equal(ui.get("battery-percent").textContent, "40");
+  assert.equal(ui.get("battery-note").textContent, "Carga estimada");
+  assert.match(ui.get("battery-note").title, /fixture_v1/);
+  assert.equal(ui.get("battery-tag").textContent, "En uso");
+  assert.equal(ui.get("battery-bar").style.width, "40%");
+  data.sample.low_battery = true;
+  ui.poll(); ui.calls.at(-1).respond(data); await flush();
+  assert.equal(ui.get("battery-tag").textContent, "Batería baja");
+  assert.equal(ui.get("battery-tag").classList.contains("warning"), true);
+});
+
+test("invalid or unproven percentages stay unavailable and an estimate cannot fabricate an alarm", async () => {
+  const ui = harness();
+  const data = snapshot();
+  const cases = [
+    { battery_percent: -1, battery_percent_estimate: 60 },
+    { battery_percent: 101, battery_percent_estimate: NaN, battery_estimate_method: "fixture_v1" },
+    { battery_percent: true, battery_percent_estimate: 70, battery_estimate_method: "" },
+    { battery_percent: null, battery_percent_estimate: 0, battery_estimate_method: "fixture_v1" },
+    { battery_percent: 0 },
+  ];
+  for (const [index, value] of cases.entries()) {
+    if (index) ui.poll();
+    data.sample = { battery_voltage: 25, low_battery: false, on_battery: false, ...value };
+    ui.calls.at(-1).respond(data); await flush();
+    assert.equal(ui.get("battery-percent").textContent, index < 3 ? "—" : "0");
+    assert.equal(ui.get("battery-note").textContent, index < 3 ? "No disponible" : index === 3 ? "Carga estimada" : "Carga reportada");
+    assert.equal(ui.get("battery-track").hidden, index < 3);
+    assert.equal(ui.get("battery-tag").textContent, index === 4 ? "Batería baja" : "Sin alerta");
+  }
+  data.sample = { battery_voltage: 25, battery_percent_estimate: 5, battery_estimate_method: "fixture_v1" };
+  ui.poll(); ui.calls.at(-1).respond(data); await flush();
+  assert.equal(ui.get("battery-tag").textContent, "Sin estado");
+  assert.equal(ui.get("policy-battery-field").hidden, true, "an estimate does not enable the native power-policy threshold");
+  assert.equal(ui.get("protection-alert").hidden, true);
+});
+
+test("battery history separates reported and estimated charge, breaks method changes and never backfills volts", async () => {
+  const now = Date.now();
+  const sample = (seconds, values) => ({ timestamp: new Date(now - seconds * 1000).toISOString(), ...values });
+  const ui = harness({ navigation: true, storage: { "elipro-history": JSON.stringify({ hours: 1, metric: "battery" }) }, samples: [
+    sample(70, { battery_voltage: 27.4 }),
+    sample(60, { battery_percent: 90 }),
+    sample(50, { battery_percent: 89 }),
+    sample(40, { battery_percent_estimate: 80, battery_estimate_method: "fixture_v1" }),
+    sample(30, { battery_percent_estimate: 79, battery_estimate_method: "fixture_v1" }),
+    sample(20, { battery_percent_estimate: 78, battery_estimate_method: "fixture_v2" }),
+    sample(10, { battery_percent_estimate: 77, battery_estimate_method: "fixture_v2", gap_before: true }),
+  ] });
+  ui.calls[0].respond(snapshot()); await flush();
+  const paths = ui.get("history-chart").children.filter((item) => item.getAttribute("d"));
+  assert.equal(paths.length, 2);
+  assert.equal(paths[0].getAttribute("stroke-dasharray"), null);
+  assert.equal((paths[0].getAttribute("d").match(/M/g) || []).length, 1);
+  assert.equal((paths[0].getAttribute("d").match(/L/g) || []).length, 1);
+  assert.equal(paths[1].getAttribute("stroke-dasharray"), "6 4");
+  assert.equal((paths[1].getAttribute("d").match(/M/g) || []).length, 3);
+  assert.equal((paths[1].getAttribute("d").match(/L/g) || []).length, 1);
+  const legend = ui.get("chart-legend").children;
+  assert.equal(legend[0].children[1].textContent, "Carga reportada");
+  assert.equal(legend[1].children[1].textContent, "Carga estimada");
+  assert.equal(legend[2].textContent, "PORCENTAJE");
+});
+
+test("battery voltage fallback is selected only from the visible period", async () => {
+  const now = Date.now();
+  const ui = harness({ navigation: true, storage: { "elipro-history": JSON.stringify({ hours: 0.25, metric: "battery" }) }, samples: [
+    { timestamp: new Date(now - 3600000).toISOString(), battery_percent: 90 },
+    { timestamp: new Date(now - 20000).toISOString(), battery_voltage: 27.4 },
+    { timestamp: new Date(now - 10000).toISOString(), battery_voltage: 27.3 },
+  ] });
+  ui.calls[0].respond(snapshot()); await flush();
+  assert.equal(ui.get("chart-legend").children[0].children[1].textContent, "Voltaje de batería");
+  assert.equal(ui.get("chart-legend").children.at(-1).textContent, "VOLTIOS");
+  assert.match(ui.get("history-chart").getAttribute("aria-label"), /voltaje de batería/);
+  assert.ok(ui.historyCalls.every((url) => url === "/api/history?hours=0.25"));
+  ui.metrics[2].emit("click");
+  assert.equal(ui.metrics[2].getAttribute("aria-pressed"), "true");
+  assert.equal(JSON.parse(ui.storedPreferences.get("elipro-history")).metric, "load");
+});
+
+test("the shared chart uses its mobile width for readable axes and correctly positioned tooltips", async () => {
+  const ui = harness({ navigation: true, samples: [{ timestamp: new Date(Date.now() - 10000).toISOString(), input_voltage: 220 }] });
+  ui.calls[0].respond(snapshot()); await flush();
+  const chart = ui.get("history-chart");
+  chart.clientWidth = 320;
+  chart.getBoundingClientRect = () => ({ left: 0, width: 320 });
+  ui.get("chart-tooltip").offsetWidth = 100;
+  ui.metrics[0].emit("click");
+  assert.equal(chart.getAttribute("viewBox"), "0 0 320 230");
+  chart.emit("pointermove", { clientX: 305 });
+  assert.equal(ui.get("chart-tooltip").hidden, false);
+  assert.match(ui.get("chart-tooltip").textContent, /Entrada: 220 V/);
+  assert.doesNotMatch(ui.get("chart-tooltip").style.left, /NaN/);
+  chart.emit("pointerleave");
+  assert.equal(ui.get("chart-tooltip").hidden, true);
+});

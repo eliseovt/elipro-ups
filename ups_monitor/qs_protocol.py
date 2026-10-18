@@ -42,7 +42,7 @@ def _bounded(name: str, value: float, lower: float, upper: float) -> float:
     return value
 
 
-def parse_qs(frame: bytes) -> dict:
+def parse_qs(frame: bytes, *, preserve_battery_precision=False) -> dict:
     """Return a standard sample after validating one complete binary QS/T frame.
 
     The caller supplies bytes through the terminating CR, with transport padding
@@ -50,6 +50,8 @@ def parse_qs(frame: bytes) -> dict:
     unescaping. A literal 0x28 is an escape only before a recognized escape code.
     The timestamp records reception/decoding time, not device uptime.
     Test, fault and UPS shutdown states retain metrics but inhibit OS protection.
+    The native estimator can request full battery precision before applying its
+    own one-decimal curve. The default two-decimal measurement stays compatible.
     """
     received_at = datetime.now(timezone.utc).isoformat()
     if not isinstance(frame, bytes):
@@ -104,7 +106,7 @@ def parse_qs(frame: bytes) -> dict:
         "frequency_hz": round(frequency, 1),
         "load_percent": load,
         "battery_percent": None,
-        "battery_voltage": round(battery_voltage, 2),
+        "battery_voltage": battery_voltage if preserve_battery_precision else round(battery_voltage, 2),
         "runtime_seconds": None,
         "temperature_c": None,
         "on_battery": None if inhibited else utility_failed,

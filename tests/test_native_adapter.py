@@ -3,6 +3,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from ups_monitor.adapters import ForzaBridge, TelemetryError
+from ups_monitor.battery_estimation import BATTERY_ESTIMATE_METHOD
 from ups_monitor.native_adapter import NativeHidAdapter, forza_monitor_running, make_adapter
 
 PATH = r"\\?\hid#vid_0665&pid_5161#unit#{4d1e55b2-f16f-11cf-88cb-001111000030}"
@@ -62,7 +63,27 @@ class NativeAdapterTests(unittest.TestCase):
         self.assertEqual(sample["battery_voltage"], 27.41)
         self.assertIs(sample["on_battery"], False)
         self.assertIsNone(sample["battery_percent"])
+        self.assertEqual(sample["battery_percent_estimate"], 100)
+        self.assertEqual(sample["battery_estimate_method"], BATTERY_ESTIMATE_METHOD)
         self.assertIsNone(sample["runtime_seconds"])
+        transport.query_status.assert_called_once_with()
+
+    def test_estimate_uses_raw_qs_precision_before_public_voltage_rounding(self):
+        fields = FRAME[1:-1].split(b" ")
+        fields[7], fields[8], fields[9] = b"\xDA", b"\x3C", b"\x89"
+        transport = Mock()
+        transport.query_status.return_value = b"#" + b" ".join(fields) + b"\r"
+        with patch("ups_monitor.native_adapter.forza_monitor_running", return_value=False), \
+             patch("ups_monitor.native_adapter.enumerate_ups", return_value=[metadata()]), \
+             patch("ups_monitor.native_adapter.StatusTransport", return_value=transport):
+            sample = NativeHidAdapter().read()
+        self.assertIs(sample["on_battery"], True)
+        self.assertEqual(sample["load_percent"], 8)
+        self.assertEqual(sample["battery_voltage"], 25.65)
+        self.assertEqual(sample["battery_percent_estimate"], 86)
+        self.assertEqual(sample["battery_estimate_method"], BATTERY_ESTIMATE_METHOD)
+        self.assertIsNone(sample["battery_percent"])
+        self.assertFalse(any(key.startswith("_") for key in sample))
         transport.query_status.assert_called_once_with()
 
     def test_inexact_attributes_never_construct_transport(self):
@@ -100,6 +121,43 @@ class NativeAdapterTests(unittest.TestCase):
             with self.assertRaises(TelemetryError):
                 adapter.read()
         self.assertIsNone(adapter.transport)
+
+    def test_estimator_is_per_adapter_and_resets_on_failure_oem_conflict_and_long_gap(self):
+        clock = Mock(return_value=100)
+        adapter = NativeHidAdapter(clock=clock)
+        transport = Mock()
+        base_sample = {"timestamp": "unused", "battery_voltage": 27.4, "load_percent": 10,
+                       "on_battery": False, "fault": False, "raw_status": "Line mode",
+                       "battery_percent": None}
+        battery_sample = {**base_sample, "battery_voltage": 25.3, "on_battery": True, "raw_status": "Battery mode"}
+        with patch("ups_monitor.native_adapter.forza_monitor_running", return_value=False) as forza_active, \
+             patch("ups_monitor.native_adapter.enumerate_ups", return_value=[metadata()]), \
+             patch("ups_monitor.native_adapter.StatusTransport", return_value=transport), \
+             patch("ups_monitor.native_adapter.parse_qs", return_value=base_sample.copy()) as decode:
+            self.assertEqual(adapter.read()["battery_percent_estimate"], 100)
+            decode.return_value = battery_sample.copy()
+            self.assertEqual(NativeHidAdapter(clock=clock).read()["battery_percent_estimate"], 81)
+            self.assertEqual(adapter.read()["battery_percent_estimate"], 100)
+            clock.return_value += 4
+            self.assertEqual(adapter.read()["battery_percent_estimate"], 98)
+            transport.query_status.side_effect = OSError("lost connection")
+            with self.assertRaises(TelemetryError):
+                adapter.read()
+            clock.return_value += 2
+            transport.query_status.side_effect = None
+            self.assertEqual(adapter.read()["battery_percent_estimate"], 81)
+            decode.return_value = base_sample.copy()
+            clock.return_value += 16
+            self.assertEqual(adapter.read()["battery_percent_estimate"], 100)
+            forza_active.return_value = True
+            with self.assertRaises(TelemetryError):
+                adapter.read()
+            self.assertIsNone(adapter.transport)
+            forza_active.return_value = False
+            decode.return_value = battery_sample.copy()
+            self.assertEqual(adapter.read()["battery_percent_estimate"], 81)
+            self.assertIsNone(adapter.read()["battery_percent"])
+            self.assertTrue(all(call.args == () for call in transport.query_status.call_args_list))
 
     def test_auto_selects_once_and_never_falls_back_on_usb_failure(self):
         with patch("ups_monitor.native_adapter.forza_monitor_running", side_effect=[False, True]), patch("ups_monitor.native_adapter.enumerate_ups") as enumerate_hid:

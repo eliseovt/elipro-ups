@@ -1,0 +1,925 @@
+{
+  "schema_version": 1,
+  "profile": "nt2402pro-pmv-qs-v1",
+  "reference_application": "Forza V3.00-21021",
+  "capture": {
+    "kind": "manual_physical_cut_and_recovery",
+    "manual_cycle": 2,
+    "voltage_source": "vendor_reported_voltage_one_decimal",
+    "time_reference": "elapsed_ms_since_first_retained_evaluation",
+    "anonymized": true,
+    "state_of_charge_calibrated": false,
+    "remaining_runtime_validated": false,
+    "os_power_actions_tested": false
+  },
+  "reconciliation": {
+    "completed_vendor_timestamp_groups": 76,
+    "evaluation_points": 74,
+    "collapsed_zero_based_group_pairs": [
+      [
+        54,
+        55
+      ],
+      [
+        69,
+        70
+      ]
+    ],
+    "final_incomplete_group_excluded": true,
+    "method": "Within each identified pair, retain the first timestamp and the final observation. RecordHandler updates the live WorkInfo Date without evaluating battery capacity; its extra timestamps occurred less than the monitor minimum three-second sleep after the same evaluation start.",
+    "intervening_record_timestamp_delays_ms": [
+      1631,
+      1965
+    ]
+  },
+  "observations": [
+    {
+      "elapsed_ms": 0,
+      "capture_label": "network",
+      "sample": {
+        "battery_voltage": 27.4,
+        "load_percent": 6.0,
+        "raw_status": "Line mode",
+        "on_battery": false,
+        "fault": false
+      },
+      "expected_vendor_percent": 100
+    },
+    {
+      "elapsed_ms": 4236,
+      "capture_label": "network",
+      "sample": {
+        "battery_voltage": 27.4,
+        "load_percent": 8.0,
+        "raw_status": "Line mode",
+        "on_battery": false,
+        "fault": false
+      },
+      "expected_vendor_percent": 100
+    },
+    {
+      "elapsed_ms": 8451,
+      "capture_label": "network",
+      "sample": {
+        "battery_voltage": 27.4,
+        "load_percent": 9.0,
+        "raw_status": "Line mode",
+        "on_battery": false,
+        "fault": false
+      },
+      "expected_vendor_percent": 100
+    },
+    {
+      "elapsed_ms": 12695,
+      "capture_label": "network",
+      "sample": {
+        "battery_voltage": 27.4,
+        "load_percent": 6.0,
+        "raw_status": "Line mode",
+        "on_battery": false,
+        "fault": false
+      },
+      "expected_vendor_percent": 100
+    },
+    {
+      "elapsed_ms": 16924,
+      "capture_label": "network",
+      "sample": {
+        "battery_voltage": 27.4,
+        "load_percent": 6.0,
+        "raw_status": "Line mode",
+        "on_battery": false,
+        "fault": false
+      },
+      "expected_vendor_percent": 100
+    },
+    {
+      "elapsed_ms": 21146,
+      "capture_label": "network",
+      "sample": {
+        "battery_voltage": 27.4,
+        "load_percent": 6.0,
+        "raw_status": "Line mode",
+        "on_battery": false,
+        "fault": false
+      },
+      "expected_vendor_percent": 100
+    },
+    {
+      "elapsed_ms": 25366,
+      "capture_label": "network",
+      "sample": {
+        "battery_voltage": 27.4,
+        "load_percent": 6.0,
+        "raw_status": "Line mode",
+        "on_battery": false,
+        "fault": false
+      },
+      "expected_vendor_percent": 100
+    },
+    {
+      "elapsed_ms": 29595,
+      "capture_label": "network",
+      "sample": {
+        "battery_voltage": 27.4,
+        "load_percent": 6.0,
+        "raw_status": "Line mode",
+        "on_battery": false,
+        "fault": false
+      },
+      "expected_vendor_percent": 100
+    },
+    {
+      "elapsed_ms": 33820,
+      "capture_label": "network",
+      "sample": {
+        "battery_voltage": 27.4,
+        "load_percent": 6.0,
+        "raw_status": "Line mode",
+        "on_battery": false,
+        "fault": false
+      },
+      "expected_vendor_percent": 100
+    },
+    {
+      "elapsed_ms": 38054,
+      "capture_label": "network",
+      "sample": {
+        "battery_voltage": 27.4,
+        "load_percent": 6.0,
+        "raw_status": "Line mode",
+        "on_battery": false,
+        "fault": false
+      },
+      "expected_vendor_percent": 100
+    },
+    {
+      "elapsed_ms": 38735,
+      "capture_label": "network",
+      "sample": {
+        "battery_voltage": 27.4,
+        "load_percent": 6.0,
+        "raw_status": "Line mode",
+        "on_battery": false,
+        "fault": false
+      },
+      "expected_vendor_percent": 100
+    },
+    {
+      "elapsed_ms": 42279,
+      "capture_label": "network",
+      "sample": {
+        "battery_voltage": 27.4,
+        "load_percent": 6.0,
+        "raw_status": "Line mode",
+        "on_battery": false,
+        "fault": false
+      },
+      "expected_vendor_percent": 100
+    },
+    {
+      "elapsed_ms": 46500,
+      "capture_label": "network",
+      "sample": {
+        "battery_voltage": 27.4,
+        "load_percent": 6.0,
+        "raw_status": "Line mode",
+        "on_battery": false,
+        "fault": false
+      },
+      "expected_vendor_percent": 100
+    },
+    {
+      "elapsed_ms": 50724,
+      "capture_label": "network",
+      "sample": {
+        "battery_voltage": 27.4,
+        "load_percent": 6.0,
+        "raw_status": "Line mode",
+        "on_battery": false,
+        "fault": false
+      },
+      "expected_vendor_percent": 100
+    },
+    {
+      "elapsed_ms": 54947,
+      "capture_label": "network",
+      "sample": {
+        "battery_voltage": 27.4,
+        "load_percent": 6.0,
+        "raw_status": "Line mode",
+        "on_battery": false,
+        "fault": false
+      },
+      "expected_vendor_percent": 100
+    },
+    {
+      "elapsed_ms": 59181,
+      "capture_label": "network",
+      "sample": {
+        "battery_voltage": 27.4,
+        "load_percent": 6.0,
+        "raw_status": "Line mode",
+        "on_battery": false,
+        "fault": false
+      },
+      "expected_vendor_percent": 100
+    },
+    {
+      "elapsed_ms": 63405,
+      "capture_label": "network",
+      "sample": {
+        "battery_voltage": 27.4,
+        "load_percent": 7.0,
+        "raw_status": "Line mode",
+        "on_battery": false,
+        "fault": false
+      },
+      "expected_vendor_percent": 100
+    },
+    {
+      "elapsed_ms": 67625,
+      "capture_label": "network",
+      "sample": {
+        "battery_voltage": 27.4,
+        "load_percent": 8.0,
+        "raw_status": "Line mode",
+        "on_battery": false,
+        "fault": false
+      },
+      "expected_vendor_percent": 100
+    },
+    {
+      "elapsed_ms": 71857,
+      "capture_label": "network",
+      "sample": {
+        "battery_voltage": 27.4,
+        "load_percent": 6.0,
+        "raw_status": "Line mode",
+        "on_battery": false,
+        "fault": false
+      },
+      "expected_vendor_percent": 100
+    },
+    {
+      "elapsed_ms": 76080,
+      "capture_label": "network",
+      "sample": {
+        "battery_voltage": 27.4,
+        "load_percent": 6.0,
+        "raw_status": "Line mode",
+        "on_battery": false,
+        "fault": false
+      },
+      "expected_vendor_percent": 100
+    },
+    {
+      "elapsed_ms": 80310,
+      "capture_label": "network",
+      "sample": {
+        "battery_voltage": 27.4,
+        "load_percent": 6.0,
+        "raw_status": "Line mode",
+        "on_battery": false,
+        "fault": false
+      },
+      "expected_vendor_percent": 100
+    },
+    {
+      "elapsed_ms": 84543,
+      "capture_label": "network",
+      "sample": {
+        "battery_voltage": 27.4,
+        "load_percent": 7.0,
+        "raw_status": "Line mode",
+        "on_battery": false,
+        "fault": false
+      },
+      "expected_vendor_percent": 100
+    },
+    {
+      "elapsed_ms": 88763,
+      "capture_label": "network",
+      "sample": {
+        "battery_voltage": 27.4,
+        "load_percent": 8.0,
+        "raw_status": "Line mode",
+        "on_battery": false,
+        "fault": false
+      },
+      "expected_vendor_percent": 100
+    },
+    {
+      "elapsed_ms": 92994,
+      "capture_label": "network",
+      "sample": {
+        "battery_voltage": 27.4,
+        "load_percent": 8.0,
+        "raw_status": "Line mode",
+        "on_battery": false,
+        "fault": false
+      },
+      "expected_vendor_percent": 100
+    },
+    {
+      "elapsed_ms": 97229,
+      "capture_label": "network",
+      "sample": {
+        "battery_voltage": 27.4,
+        "load_percent": 8.0,
+        "raw_status": "Line mode",
+        "on_battery": false,
+        "fault": false
+      },
+      "expected_vendor_percent": 100
+    },
+    {
+      "elapsed_ms": 98272,
+      "capture_label": "network",
+      "sample": {
+        "battery_voltage": 27.4,
+        "load_percent": 6.0,
+        "raw_status": "Line mode",
+        "on_battery": false,
+        "fault": false
+      },
+      "expected_vendor_percent": 100
+    },
+    {
+      "elapsed_ms": 101476,
+      "capture_label": "network",
+      "sample": {
+        "battery_voltage": 27.4,
+        "load_percent": 6.0,
+        "raw_status": "Line mode",
+        "on_battery": false,
+        "fault": false
+      },
+      "expected_vendor_percent": 100
+    },
+    {
+      "elapsed_ms": 105721,
+      "capture_label": "network",
+      "sample": {
+        "battery_voltage": 27.4,
+        "load_percent": 7.0,
+        "raw_status": "Line mode",
+        "on_battery": false,
+        "fault": false
+      },
+      "expected_vendor_percent": 100
+    },
+    {
+      "elapsed_ms": 109953,
+      "capture_label": "network",
+      "sample": {
+        "battery_voltage": 27.4,
+        "load_percent": 6.0,
+        "raw_status": "Line mode",
+        "on_battery": false,
+        "fault": false
+      },
+      "expected_vendor_percent": 100
+    },
+    {
+      "elapsed_ms": 114182,
+      "capture_label": "network",
+      "sample": {
+        "battery_voltage": 27.4,
+        "load_percent": 6.0,
+        "raw_status": "Line mode",
+        "on_battery": false,
+        "fault": false
+      },
+      "expected_vendor_percent": 100
+    },
+    {
+      "elapsed_ms": 118416,
+      "capture_label": "network",
+      "sample": {
+        "battery_voltage": 27.4,
+        "load_percent": 6.0,
+        "raw_status": "Line mode",
+        "on_battery": false,
+        "fault": false
+      },
+      "expected_vendor_percent": 100
+    },
+    {
+      "elapsed_ms": 122644,
+      "capture_label": "network",
+      "sample": {
+        "battery_voltage": 27.4,
+        "load_percent": 6.0,
+        "raw_status": "Line mode",
+        "on_battery": false,
+        "fault": false
+      },
+      "expected_vendor_percent": 100
+    },
+    {
+      "elapsed_ms": 126880,
+      "capture_label": "network",
+      "sample": {
+        "battery_voltage": 27.4,
+        "load_percent": 6.0,
+        "raw_status": "Line mode",
+        "on_battery": false,
+        "fault": false
+      },
+      "expected_vendor_percent": 100
+    },
+    {
+      "elapsed_ms": 131108,
+      "capture_label": "network",
+      "sample": {
+        "battery_voltage": 27.4,
+        "load_percent": 6.0,
+        "raw_status": "Line mode",
+        "on_battery": false,
+        "fault": false
+      },
+      "expected_vendor_percent": 100
+    },
+    {
+      "elapsed_ms": 135336,
+      "capture_label": "network",
+      "sample": {
+        "battery_voltage": 27.4,
+        "load_percent": 6.0,
+        "raw_status": "Line mode",
+        "on_battery": false,
+        "fault": false
+      },
+      "expected_vendor_percent": 100
+    },
+    {
+      "elapsed_ms": 139563,
+      "capture_label": "network",
+      "sample": {
+        "battery_voltage": 27.4,
+        "load_percent": 6.0,
+        "raw_status": "Line mode",
+        "on_battery": false,
+        "fault": false
+      },
+      "expected_vendor_percent": 100
+    },
+    {
+      "elapsed_ms": 143798,
+      "capture_label": "network",
+      "sample": {
+        "battery_voltage": 27.4,
+        "load_percent": 6.0,
+        "raw_status": "Line mode",
+        "on_battery": false,
+        "fault": false
+      },
+      "expected_vendor_percent": 100
+    },
+    {
+      "elapsed_ms": 148026,
+      "capture_label": "network",
+      "sample": {
+        "battery_voltage": 27.4,
+        "load_percent": 6.0,
+        "raw_status": "Line mode",
+        "on_battery": false,
+        "fault": false
+      },
+      "expected_vendor_percent": 100
+    },
+    {
+      "elapsed_ms": 152263,
+      "capture_label": "network",
+      "sample": {
+        "battery_voltage": 27.4,
+        "load_percent": 6.0,
+        "raw_status": "Line mode",
+        "on_battery": false,
+        "fault": false
+      },
+      "expected_vendor_percent": 100
+    },
+    {
+      "elapsed_ms": 156473,
+      "capture_label": "network",
+      "sample": {
+        "battery_voltage": 27.4,
+        "load_percent": 6.0,
+        "raw_status": "Line mode",
+        "on_battery": false,
+        "fault": false
+      },
+      "expected_vendor_percent": 100
+    },
+    {
+      "elapsed_ms": 157803,
+      "capture_label": "network",
+      "sample": {
+        "battery_voltage": 27.4,
+        "load_percent": 6.0,
+        "raw_status": "Line mode",
+        "on_battery": false,
+        "fault": false
+      },
+      "expected_vendor_percent": 100
+    },
+    {
+      "elapsed_ms": 160691,
+      "capture_label": "network",
+      "sample": {
+        "battery_voltage": 27.4,
+        "load_percent": 6.0,
+        "raw_status": "Line mode",
+        "on_battery": false,
+        "fault": false
+      },
+      "expected_vendor_percent": 100
+    },
+    {
+      "elapsed_ms": 164930,
+      "capture_label": "battery",
+      "sample": {
+        "battery_voltage": 26.1,
+        "load_percent": 11.0,
+        "raw_status": "Battery mode",
+        "on_battery": true,
+        "fault": false
+      },
+      "expected_vendor_percent": 100
+    },
+    {
+      "elapsed_ms": 169186,
+      "capture_label": "battery",
+      "sample": {
+        "battery_voltage": 25.6,
+        "load_percent": 10.0,
+        "raw_status": "Battery mode",
+        "on_battery": true,
+        "fault": false
+      },
+      "expected_vendor_percent": 99
+    },
+    {
+      "elapsed_ms": 173421,
+      "capture_label": "battery",
+      "sample": {
+        "battery_voltage": 25.5,
+        "load_percent": 11.0,
+        "raw_status": "Battery mode",
+        "on_battery": true,
+        "fault": false
+      },
+      "expected_vendor_percent": 98
+    },
+    {
+      "elapsed_ms": 177648,
+      "capture_label": "battery",
+      "sample": {
+        "battery_voltage": 25.4,
+        "load_percent": 11.0,
+        "raw_status": "Battery mode",
+        "on_battery": true,
+        "fault": false
+      },
+      "expected_vendor_percent": 96
+    },
+    {
+      "elapsed_ms": 181882,
+      "capture_label": "battery",
+      "sample": {
+        "battery_voltage": 25.4,
+        "load_percent": 9.0,
+        "raw_status": "Battery mode",
+        "on_battery": true,
+        "fault": false
+      },
+      "expected_vendor_percent": 94
+    },
+    {
+      "elapsed_ms": 186106,
+      "capture_label": "battery",
+      "sample": {
+        "battery_voltage": 25.3,
+        "load_percent": 11.0,
+        "raw_status": "Battery mode",
+        "on_battery": true,
+        "fault": false
+      },
+      "expected_vendor_percent": 93
+    },
+    {
+      "elapsed_ms": 190337,
+      "capture_label": "battery",
+      "sample": {
+        "battery_voltage": 25.3,
+        "load_percent": 9.0,
+        "raw_status": "Battery mode",
+        "on_battery": true,
+        "fault": false
+      },
+      "expected_vendor_percent": 91
+    },
+    {
+      "elapsed_ms": 194546,
+      "capture_label": "battery",
+      "sample": {
+        "battery_voltage": 25.3,
+        "load_percent": 11.0,
+        "raw_status": "Battery mode",
+        "on_battery": true,
+        "fault": false
+      },
+      "expected_vendor_percent": 89
+    },
+    {
+      "elapsed_ms": 198763,
+      "capture_label": "battery",
+      "sample": {
+        "battery_voltage": 25.3,
+        "load_percent": 10.0,
+        "raw_status": "Battery mode",
+        "on_battery": true,
+        "fault": false
+      },
+      "expected_vendor_percent": 87
+    },
+    {
+      "elapsed_ms": 202985,
+      "capture_label": "battery",
+      "sample": {
+        "battery_voltage": 25.3,
+        "load_percent": 9.0,
+        "raw_status": "Battery mode",
+        "on_battery": true,
+        "fault": false
+      },
+      "expected_vendor_percent": 85
+    },
+    {
+      "elapsed_ms": 207202,
+      "capture_label": "battery",
+      "sample": {
+        "battery_voltage": 25.3,
+        "load_percent": 9.0,
+        "raw_status": "Battery mode",
+        "on_battery": true,
+        "fault": false
+      },
+      "expected_vendor_percent": 83
+    },
+    {
+      "elapsed_ms": 211424,
+      "capture_label": "recovery",
+      "sample": {
+        "battery_voltage": 25.9,
+        "load_percent": 5.0,
+        "raw_status": "Line mode",
+        "on_battery": false,
+        "fault": false
+      },
+      "expected_vendor_percent": 82
+    },
+    {
+      "elapsed_ms": 215659,
+      "capture_label": "recovery",
+      "sample": {
+        "battery_voltage": 26.2,
+        "load_percent": 8.0,
+        "raw_status": "Line mode",
+        "on_battery": false,
+        "fault": false
+      },
+      "expected_vendor_percent": 80
+    },
+    {
+      "elapsed_ms": 219889,
+      "capture_label": "recovery",
+      "sample": {
+        "battery_voltage": 26.5,
+        "load_percent": 6.0,
+        "raw_status": "Line mode",
+        "on_battery": false,
+        "fault": false
+      },
+      "expected_vendor_percent": 80
+    },
+    {
+      "elapsed_ms": 224106,
+      "capture_label": "recovery",
+      "sample": {
+        "battery_voltage": 26.6,
+        "load_percent": 7.0,
+        "raw_status": "Line mode",
+        "on_battery": false,
+        "fault": false
+      },
+      "expected_vendor_percent": 80
+    },
+    {
+      "elapsed_ms": 228328,
+      "capture_label": "recovery",
+      "sample": {
+        "battery_voltage": 26.8,
+        "load_percent": 8.0,
+        "raw_status": "Line mode",
+        "on_battery": false,
+        "fault": false
+      },
+      "expected_vendor_percent": 81
+    },
+    {
+      "elapsed_ms": 232567,
+      "capture_label": "recovery",
+      "sample": {
+        "battery_voltage": 26.9,
+        "load_percent": 6.0,
+        "raw_status": "Line mode",
+        "on_battery": false,
+        "fault": false
+      },
+      "expected_vendor_percent": 82
+    },
+    {
+      "elapsed_ms": 236786,
+      "capture_label": "recovery",
+      "sample": {
+        "battery_voltage": 26.9,
+        "load_percent": 6.0,
+        "raw_status": "Line mode",
+        "on_battery": false,
+        "fault": false
+      },
+      "expected_vendor_percent": 83
+    },
+    {
+      "elapsed_ms": 241033,
+      "capture_label": "recovery",
+      "sample": {
+        "battery_voltage": 27.1,
+        "load_percent": 7.0,
+        "raw_status": "Line mode",
+        "on_battery": false,
+        "fault": false
+      },
+      "expected_vendor_percent": 84
+    },
+    {
+      "elapsed_ms": 245263,
+      "capture_label": "recovery",
+      "sample": {
+        "battery_voltage": 27.2,
+        "load_percent": 7.0,
+        "raw_status": "Line mode",
+        "on_battery": false,
+        "fault": false
+      },
+      "expected_vendor_percent": 85
+    },
+    {
+      "elapsed_ms": 249494,
+      "capture_label": "recovery",
+      "sample": {
+        "battery_voltage": 27.2,
+        "load_percent": 6.0,
+        "raw_status": "Line mode",
+        "on_battery": false,
+        "fault": false
+      },
+      "expected_vendor_percent": 87
+    },
+    {
+      "elapsed_ms": 253727,
+      "capture_label": "recovery",
+      "sample": {
+        "battery_voltage": 27.3,
+        "load_percent": 6.0,
+        "raw_status": "Line mode",
+        "on_battery": false,
+        "fault": false
+      },
+      "expected_vendor_percent": 89
+    },
+    {
+      "elapsed_ms": 257968,
+      "capture_label": "recovery",
+      "sample": {
+        "battery_voltage": 27.3,
+        "load_percent": 6.0,
+        "raw_status": "Line mode",
+        "on_battery": false,
+        "fault": false
+      },
+      "expected_vendor_percent": 92
+    },
+    {
+      "elapsed_ms": 262184,
+      "capture_label": "recovery",
+      "sample": {
+        "battery_voltage": 27.3,
+        "load_percent": 7.0,
+        "raw_status": "Line mode",
+        "on_battery": false,
+        "fault": false
+      },
+      "expected_vendor_percent": 94
+    },
+    {
+      "elapsed_ms": 266417,
+      "capture_label": "recovery",
+      "sample": {
+        "battery_voltage": 27.3,
+        "load_percent": 6.0,
+        "raw_status": "Line mode",
+        "on_battery": false,
+        "fault": false
+      },
+      "expected_vendor_percent": 96
+    },
+    {
+      "elapsed_ms": 270648,
+      "capture_label": "recovery",
+      "sample": {
+        "battery_voltage": 27.3,
+        "load_percent": 6.0,
+        "raw_status": "Line mode",
+        "on_battery": false,
+        "fault": false
+      },
+      "expected_vendor_percent": 97
+    },
+    {
+      "elapsed_ms": 274870,
+      "capture_label": "recovery",
+      "sample": {
+        "battery_voltage": 27.3,
+        "load_percent": 6.0,
+        "raw_status": "Line mode",
+        "on_battery": false,
+        "fault": false
+      },
+      "expected_vendor_percent": 98
+    },
+    {
+      "elapsed_ms": 279098,
+      "capture_label": "recovery",
+      "sample": {
+        "battery_voltage": 27.3,
+        "load_percent": 7.0,
+        "raw_status": "Line mode",
+        "on_battery": false,
+        "fault": false
+      },
+      "expected_vendor_percent": 99
+    },
+    {
+      "elapsed_ms": 283326,
+      "capture_label": "recovery",
+      "sample": {
+        "battery_voltage": 27.3,
+        "load_percent": 6.0,
+        "raw_status": "Line mode",
+        "on_battery": false,
+        "fault": false
+      },
+      "expected_vendor_percent": 100
+    },
+    {
+      "elapsed_ms": 287539,
+      "capture_label": "recovery",
+      "sample": {
+        "battery_voltage": 27.3,
+        "load_percent": 6.0,
+        "raw_status": "Line mode",
+        "on_battery": false,
+        "fault": false
+      },
+      "expected_vendor_percent": 100
+    },
+    {
+      "elapsed_ms": 291781,
+      "capture_label": "recovery",
+      "sample": {
+        "battery_voltage": 27.3,
+        "load_percent": 6.0,
+        "raw_status": "Line mode",
+        "on_battery": false,
+        "fault": false
+      },
+      "expected_vendor_percent": 100
+    },
+    {
+      "elapsed_ms": 296030,
+      "capture_label": "recovery",
+      "sample": {
+        "battery_voltage": 27.3,
+        "load_percent": 6.0,
+        "raw_status": "Line mode",
+        "on_battery": false,
+        "fault": false
+      },
+      "expected_vendor_percent": 100
+    }
+  ]
+}

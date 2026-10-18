@@ -22,6 +22,10 @@ class PackagedRuntimeTests(unittest.TestCase):
                              [sys.executable, "-m", "ups_monitor", "--dry-run"])
             self.assertEqual(runtime.child_command("qs-worker", HID_PATH),
                              [sys.executable, "-m", "ups_monitor.hid_windows", "--qs-worker", HID_PATH])
+            self.assertEqual(runtime.child_command("battery-worker", HID_PATH, "BL"),
+                             [sys.executable, "-m", "ups_monitor.hid_windows", "--battery-worker", HID_PATH, "BL"])
+            self.assertEqual(runtime.child_command("battery-diagnostic", "--help"),
+                             [sys.executable, "-m", "ups_monitor.battery_diagnostics", "--help"])
 
     def test_frozen_commands_cannot_recurse_through_python_m(self):
         with patch.object(sys, "frozen", True, create=True), patch.object(sys, "executable", r"C:\Apps\Elipro.exe"):
@@ -29,6 +33,10 @@ class PackagedRuntimeTests(unittest.TestCase):
                              [r"C:\Apps\Elipro.exe", "monitor", "--dry-run"])
             self.assertEqual(runtime.child_command("qs-worker", HID_PATH),
                              [r"C:\Apps\Elipro.exe", "qs-worker", HID_PATH])
+            self.assertEqual(runtime.child_command("battery-worker", HID_PATH, "BT"),
+                             [r"C:\Apps\Elipro.exe", "battery-worker", HID_PATH, "BT"])
+            self.assertEqual(runtime.child_command("battery-diagnostic", "--help"),
+                             [r"C:\Apps\Elipro.exe", "battery-diagnostic", "--help"])
             with self.assertRaises(ValueError):
                 runtime.child_command("arbitrary.module")
 
@@ -89,6 +97,14 @@ class PackagedRuntimeTests(unittest.TestCase):
         with patch("ups_monitor.hid_windows.worker_main", return_value=1) as worker:
             self.assertEqual(entrypoint.main(["qs-worker", HID_PATH]), 1)
             worker.assert_called_once_with([HID_PATH])
+        with patch("ups_monitor.battery_diagnostics.main", return_value=0) as diagnostic, \
+                patch("ups_monitor.hid_windows._apis") as apis:
+            self.assertEqual(entrypoint.main(["battery-diagnostic", "--help"]), 0)
+            diagnostic.assert_called_once_with(["--help"])
+            apis.assert_not_called()
+        with patch("ups_monitor.hid_windows.battery_worker_main", return_value=1) as worker:
+            self.assertEqual(entrypoint.main(["battery-worker", HID_PATH, "BL"]), 1)
+            worker.assert_called_once_with([HID_PATH, "BL"])
 
     def test_worker_rejects_missing_or_extra_arguments_before_hid_access(self):
         with patch("ups_monitor.hid_windows._query_status_once") as query:

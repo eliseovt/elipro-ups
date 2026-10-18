@@ -23,7 +23,8 @@ from urllib.parse import parse_qs, urlsplit
 from . import __version__
 from .adapters import TelemetryError
 from .native_adapter import make_adapter
-from .core import DEFAULT_POLICY, SAMPLE_FIELDS, PolicyEngine, TelemetryRingBuffer, iso_utc, validate_policy
+from .core import (BATTERY_ESTIMATE_FIELDS, DEFAULT_POLICY, SAMPLE_FIELDS, PolicyEngine,
+                   TelemetryRingBuffer, battery_estimate_fields, iso_utc, validate_policy)
 from .alerts import AlertManager, DEFAULT_NOTIFICATION_SETTINGS
 from .instance_guard import MonitorInstanceGuard, InstanceGuardError
 from .health import MonitorHealth
@@ -431,6 +432,7 @@ class Monitor:
                 self._event("connection_restored", "Telemetría del UPS conectada.")
             self.connection, self.error, self.error_kind = "connected", None, None
             previous_sample = self.sample
+            sample = {**sample, **battery_estimate_fields(sample)}
             self.sample, self.last_success = sample, sample["timestamp"]
             power = sample.get("on_battery")
             if power is True and self.last_power is not True:
@@ -617,7 +619,8 @@ class Monitor:
                 "csrf_token": self.csrf_token,
                 "connection": {"state": self.connection, "source": self.adapter.source,
                                "last_success": self.last_success, "error": self.error, "error_kind": self.error_kind},
-                "sample": self.sample,
+                "sample": ({**self.sample, **battery_estimate_fields(self.sample)}
+                           if self.sample is not None else None),
                 "events": self.events(),
                 "history": self.history_status(),
                 "health": self.health_status(),
@@ -744,7 +747,11 @@ class Handler(BaseHTTPRequestHandler):
         with tempfile.SpooledTemporaryFile(max_size=4_000_000, mode="w+b") as binary:
             text_output = io.TextIOWrapper(binary, encoding="utf-8-sig", newline="")
             try:
-                writer = csv.DictWriter(text_output, fieldnames=("timestamp",) + SAMPLE_FIELDS + ("watts_is_estimate",))
+                # Preserve all existing column positions for consumers of older
+                # exports; newly derived metadata is appended after watts.
+                fields = (("timestamp",) + tuple(field for field in SAMPLE_FIELDS if field not in BATTERY_ESTIMATE_FIELDS)
+                          + ("watts_is_estimate",) + BATTERY_ESTIMATE_FIELDS)
+                writer = csv.DictWriter(text_output, fieldnames=fields)
                 writer.writeheader()
                 for sample in self.monitor.store.iter_samples():
                     writer.writerow({key: csv_cell(value) for key, value in sample.items()})

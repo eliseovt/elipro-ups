@@ -85,6 +85,19 @@ class QsProtocolTests(unittest.TestCase):
         self.assertEqual(sample["battery_voltage"], 27.41)
         self.assertEqual(sample["frequency_hz"], 60.0)
 
+    def test_optional_battery_precision_preserves_curve_input_without_changing_default_measurement(self):
+        fields = LIVE_SAMPLE[1:-1].split(b" ")
+        fields[7], fields[8], fields[9] = b"\xDA", b"\x3C", b"\x89"
+        frame = b"#" + b" ".join(fields) + b"\r"
+        public = parse_qs(frame)
+        precise = parse_qs(frame, preserve_battery_precision=True)
+        self.assertEqual(public["battery_voltage"], 25.65)
+        self.assertEqual(precise["battery_voltage"], 218 * 60 / 510)
+        self.assertIs(precise["on_battery"], True)
+        self.assertEqual(set(public), set(precise))
+        self.assertEqual({key: value for key, value in public.items() if key not in ("timestamp", "battery_voltage")},
+                         {key: value for key, value in precise.items() if key not in ("timestamp", "battery_voltage")})
+
     def test_bad_or_unescaped_control_bytes_are_rejected(self):
         for encoded in (b"\x28\x05", b"\x28\x28", b"\x0d", b"\x0a", b"\x11", b"\x13"):
             with self.subTest(encoded=encoded), self.assertRaises(QsProtocolError):

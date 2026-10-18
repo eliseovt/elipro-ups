@@ -9,7 +9,7 @@ Elipro es un proyecto independiente en desarrollo. No es software oficial de For
 ## Funciones
 
 - Lectura de alimentación de red/batería, voltajes de entrada y salida, frecuencia, carga del UPS, voltaje de batería y señales de batería baja o falla.
-- Seis secciones: **Resumen, Incidentes, Historial, Protección, Avisos y Sistema**; temas claro y oscuro.
+- Seis secciones: **Resumen, Incidentes, Historial, Protección, Avisos y Sistema**; temas claro y oscuro con selector sol/luna. Resumen e Historial comparten el gráfico completo y los eventos recientes, conservando sus filtros al navegar.
 - Avisos de Windows, sonido e icono de bandeja aunque se cierre el navegador.
 - Avisos eléctricos retenidos durante bloqueo o desconexión de sesión, con acuse de aceptación nativa y recuperación del contexto al reanudar.
 - Historial local SQLite, gráficas, incidentes, filtros, exportación CSV, diagnóstico y respaldo ZIP.
@@ -107,11 +107,25 @@ python -m ups_monitor --source native --dry-run
 
 ## Lecturas y límites del hardware
 
-El lector nativo acepta el dispositivo HID `0665:5161` con el formato de reporte y la respuesta binaria QS/T compatibles con la implementación. Solo envía `QS` seguido de retorno de carro; cualquier otro comando se rechaza.
+El lector nativo acepta el dispositivo HID `0665:5161` con el formato de reporte y la respuesta binaria QS/T compatibles con la implementación. El sondeo habitual solo envía `QS` seguido de retorno de carro; el diagnóstico explícito añade únicamente las consultas `BT?` y `BL?`, con una lista permitida separada.
 
-Esta respuesta proporciona **voltaje de batería, pero no porcentaje de batería, minutos restantes, temperatura ni watts**. Elipro no inventa esos datos ni convierte el porcentaje de carga en consumo eléctrico. El voltaje por sí solo no demuestra la autonomía restante.
+Esta respuesta proporciona **voltaje de batería y señal de batería baja, pero no un porcentaje medido de batería, minutos restantes, temperatura ni watts**. La tarjeta separa el porcentaje de carga y el voltaje; no convierte el porcentaje de carga del UPS en consumo eléctrico.
+
+El porcentaje nativo derivado se identifica como **Carga estimada** y utiliza un perfil versionado para el NT-2402PRO. Su cálculo y filtrado se contrastan con observaciones del programa del fabricante; no equivalen a una medición de salud ni garantizan autonomía restante. Los datos incompatibles o no disponibles se muestran como tales, nunca como 0% por defecto. La procedencia, las capturas y los límites se documentan en [la investigación de batería](docs/battery-percentage-research.md).
+
+Las estimaciones usan los campos aditivos `battery_percent_estimate` y `battery_estimate_method`; `battery_percent` conserva su significado de porcentaje reportado por una fuente compatible. Se guardan únicamente desde su incorporación: no se recalcula el historial previo. El CSV mantiene las columnas existentes en su orden y agrega los dos campos al final. Las estimaciones no disparan apagados, eventos de batería baja ni avisos basados en porcentaje medido.
 
 Los porcentajes disponibles en el modo puente son los que informa ForzaTracker; no son una medición independiente de salud de la batería. Los valores que ese servidor no proporciona de forma válida se muestran como no disponibles.
+
+El diagnóstico explícito de batería permite observar `QS`, `BT?` y `BL?`, sin crear un monitor ni ejecutar acciones de energía:
+
+```powershell
+python -m ups_monitor.battery_diagnostics --samples 3 --interval 1 --label network
+# Con el ejecutable instalado:
+Elipro.exe battery-diagnostic --samples 3 --interval 1 --label network
+```
+
+Este diagnóstico requiere que el servicio de Elipro y el lector de ForzaTracker estén detenidos; rechaza lectores simultáneos y no los detiene por su cuenta. Los comandos adicionales permanecen fuera del sondeo habitual: una respuesta no compatible no se interpreta como porcentaje. Las etiquetas `network`, `battery` y `recovery` describen observaciones con cambios eléctricos manuales; no cortan el suministro ni simulan estados.
 
 ## Protección automática
 

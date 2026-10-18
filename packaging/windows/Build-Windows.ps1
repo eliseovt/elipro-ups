@@ -88,6 +88,8 @@ print(json.dumps({"python": str(python_license), "pyinstaller": str(licenses[0])
 
     & (Join-Path $appOutput 'Elipro.exe') smoke-test
     if ($LASTEXITCODE -ne 0) { throw 'The bundled executable failed its non-invasive smoke test.' }
+    & (Join-Path $appOutput 'Elipro.exe') battery-diagnostic --help
+    if ($LASTEXITCODE -ne 0) { throw 'The bundled battery diagnostic failed its non-invasive help check.' }
 
     New-Item -ItemType Directory -Force -Path $installerOutput | Out-Null
     $preflightText = [IO.File]::ReadAllText((Join-Path $PSScriptRoot 'Protect-InstallPaths.ps1'))

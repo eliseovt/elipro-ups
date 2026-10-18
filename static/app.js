@@ -36,10 +36,6 @@
   const state = {
     status: null,
     history: [],
-    overviewHistory: [],
-    overviewHistoryBusy: false,
-    overviewHistoryError: null,
-    overviewGeneration: 0,
     metric: "voltage",
     hours: 1,
     token: null,
@@ -96,6 +92,8 @@
   const dateFormat = new Intl.DateTimeFormat("es-PE", { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit", hour12: false });
   const recordDateFormat = new Intl.DateTimeFormat("es-PE", { year: "numeric", day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false });
   const finite = (value) => typeof value === "number" && Number.isFinite(value);
+  const percentage = (value) => finite(value) && value >= 0 && value <= 100;
+  const estimatedBattery = (sample) => percentage(sample?.battery_percent_estimate) && typeof sample?.battery_estimate_method === "string" && sample.battery_estimate_method.trim().length > 0;
   const numeric = (value, decimals = 0) => finite(value) ? new Intl.NumberFormat("es-PE", { maximumFractionDigits: decimals }).format(value) : "—";
   const parseDate = (value) => {
     if (!value) return null;
@@ -127,7 +125,12 @@
       page.inert = !active;
       page.setAttribute("aria-hidden", String(!active));
     });
-    document.querySelectorAll("[data-view]").forEach((button) => {
+    const sharedHistory = $("shared-history");
+    const showHistory = selected === "overview" || selected === "history";
+    sharedHistory.hidden = !showHistory;
+    sharedHistory.inert = !showHistory;
+    sharedHistory.setAttribute("aria-hidden", String(!showHistory));
+    document.querySelectorAll(".sidebar-nav [data-view]").forEach((button) => {
       const active = button.dataset.view === selected;
       button.classList.toggle("active", active);
       button.setAttribute("aria-current", active ? "page" : "false");
@@ -137,8 +140,7 @@
     setText("view-description", view.description);
     document.title = `${view.title} · Elipro UPS`;
     if (writeHash && window.location && window.location.hash !== `#${view.hash}`) window.location.hash = view.hash;
-    if (selected === "history") renderChart();
-    if (selected === "overview") renderOverviewChart();
+    if (showHistory) renderChart();
     hideTooltip();
     loadViewData();
     if (focus || selected !== previousView) window.scrollTo?.({ top: 0, left: 0, behavior: "instant" });
@@ -151,7 +153,7 @@
   }
 
   function setupNavigation() {
-    const buttons = [...document.querySelectorAll("[data-view]")];
+    const buttons = [...document.querySelectorAll(".sidebar-nav [data-view]")];
     const pages = [...document.querySelectorAll("[data-page]")];
     if (!buttons.length || !pages.length) return;
     state.navigationReady = true;
@@ -177,8 +179,7 @@
       window.history?.replaceState?.(null, "", "#resumen");
     }
     window.addEventListener?.("resize", () => {
-      if (state.activeView === "history") renderChart();
-      if (state.activeView === "overview") renderOverviewChart();
+      if (state.activeView === "history" || state.activeView === "overview") renderChart();
     });
   }
 
@@ -295,7 +296,6 @@
     renderHistoryStatus();
     renderHealth(state.status?.health);
     renderObservation();
-    renderOverview();
   }
 
   function renderHistoryStatus() {
@@ -340,10 +340,14 @@
   }
 
   function renderConnection(connection, sample) {
+    const badge = $("connection-badge");
+    const showConnection = (status, label) => {
+      badge.className = `connection-indicator ${status}`;
+      badge.lastElementChild.textContent = label;
+      badge.title = label;
+    };
     if (!state.serviceAvailable) {
-      const badge = $("connection-badge");
-      badge.className = "connection-badge disconnected";
-      badge.lastElementChild.textContent = state.stopAcknowledged ? "Elipro detenido" : "Monitor sin conexión";
+      showConnection("disconnected", state.stopAcknowledged ? "Elipro detenido" : "Monitor sin conexión");
       $("connection-notice").hidden = true;
       const card = document.querySelector(".power-card");
       card.classList.remove("is-online", "is-battery", "has-fault");
@@ -353,9 +357,7 @@
       return;
     }
     const status = ["connected", "stale", "disconnected"].includes(connection.state) ? connection.state : "disconnected";
-    const badge = $("connection-badge");
-    badge.className = `connection-badge ${status}`;
-    badge.lastElementChild.textContent = { connected: "UPS conectado", stale: "Datos desactualizados", disconnected: "Sin conexión al UPS" }[status];
+    showConnection(status, { connected: "UPS conectado", stale: "Datos desactualizados", disconnected: "Sin conexión al UPS" }[status]);
     const notice = $("connection-notice");
     notice.hidden = status === "connected";
     if (status !== "connected") {
@@ -392,39 +394,34 @@
 
   function renderSample(sample) {
     const data = sample || {};
-    const native = state.status?.meta?.source === "native";
-    const bridge = state.status?.meta?.bridge_required === true;
-    const voltageMode = native || (!finite(data.battery_percent) && finite(data.battery_voltage));
-    document.querySelector(".battery-card").classList.toggle("voltage-mode", voltageMode);
+    const reported = percentage(data.battery_percent);
+    const estimated = !reported && estimatedBattery(data);
+    const battery = reported ? data.battery_percent : estimated ? data.battery_percent_estimate : null;
     setText("input-voltage", numeric(data.input_voltage, 1));
     setText("output-voltage", numeric(data.output_voltage, 1));
-    setText("battery-percent", voltageMode ? numeric(data.battery_voltage, 2) : numeric(data.battery_percent));
-    setText("battery-unit", voltageMode ? "V" : "%");
-    $("battery-track").hidden = voltageMode || !finite(data.battery_percent);
-    $("battery-note").hidden = !voltageMode && !(bridge && finite(data.battery_percent));
-    setText("battery-note", voltageMode ? "El UPS no reporta porcentaje de carga." : "Porcentaje reportado por ForzaTracker.");
-    $("detail-battery-voltage").hidden = voltageMode;
-    $("detail-temperature").hidden = !finite(data.temperature_c);
+    setText("battery-percent", numeric(battery));
+    setText("battery-unit", "%");
+    $("battery-track").hidden = !finite(battery);
+    $("battery-note").hidden = false;
+    setText("battery-note", reported ? "Carga reportada" : estimated ? "Carga estimada" : "No disponible");
+    $("battery-note").title = estimated ? `Estimación informativa · ${data.battery_estimate_method}. La protección usa la alerta real del UPS y los límites configurados.` : "";
     setText("load-percent", numeric(data.load_percent));
     setText("frequency", numeric(data.frequency_hz, 1));
-    setText("battery-voltage", numeric(data.battery_voltage, 1));
-    setText("temperature", numeric(data.temperature_c, 1));
+    setText("battery-voltage", numeric(data.battery_voltage, 2));
     setText("runtime", runtimeLabel(data.runtime_seconds));
-    if (state.navigationReady && $("battery-runtime")) $("battery-runtime").hidden = !finite(data.runtime_seconds) || data.runtime_seconds <= 0;
-    $("battery-bar").style.width = finite(data.battery_percent) ? `${Math.max(0, Math.min(100, data.battery_percent))}%` : "0%";
-    $("battery-bar").classList.toggle("low", !!data.low_battery || (finite(data.battery_percent) && data.battery_percent <= 20));
+    $("battery-runtime").hidden = !finite(data.runtime_seconds) || data.runtime_seconds <= 0;
+    $("battery-bar").style.width = finite(battery) ? `${battery}%` : "0%";
+    $("battery-bar").classList.toggle("low", data.low_battery === true || (reported && battery <= 20));
     $("load-bar").style.width = finite(data.load_percent) ? `${Math.max(0, Math.min(100, data.load_percent))}%` : "0%";
     $("load-bar").classList.toggle("high", finite(data.load_percent) && data.load_percent >= 80);
     const batteryTag = $("battery-tag");
-    batteryTag.className = "subtle-tag";
+    batteryTag.className = "battery-status";
     if (!sample) {
       batteryTag.textContent = "Sin lectura";
-    } else if (data.low_battery === true || (finite(data.battery_percent) && data.battery_percent <= 20)) {
+    } else if (data.low_battery === true || (reported && battery <= 20)) {
       batteryTag.textContent = "Batería baja";
       batteryTag.classList.add("warning");
-    } else if (voltageMode && data.low_battery === false) {
-      batteryTag.textContent = "Sin alerta";
-    } else if (data.on_battery) {
+    } else if (data.on_battery === true) {
       batteryTag.textContent = "En uso";
       batteryTag.classList.add("warning");
     } else if (data.low_battery === false) {
@@ -561,9 +558,6 @@
       ? "Durante un corte, inicia una cuenta atrás al alcanzar el tiempo máximo con batería o cuando el UPS reporte la alerta real de batería baja."
       : "Durante un corte, inicia una cuenta atrás cuando se alcance alguno de estos límites o el UPS avise batería baja.");
     const enabled = !!policy.enabled;
-    const summary = $("protection-summary");
-    summary.textContent = enabled ? state.status?.meta?.dry_run ? "Simulada · sin acción real" : "Activada" : "Desactivada";
-    summary.classList.toggle("enabled", enabled);
     const tag = $("policy-state");
     tag.textContent = enabled ? "Activado" : "Desactivado";
     tag.classList.toggle("good", enabled);
@@ -642,62 +636,6 @@
     return date ? recordDateFormat.format(date) : "Sin registro";
   }
 
-  function renderOverview() {
-    if (!state.navigationReady) return;
-    const data = state.status;
-    const confirmed = state.serviceAvailable && data;
-    const health = data?.health;
-    const healthy = confirmed && health?.reader_alive === true && health?.supervisor_alive === true && ["healthy", "ok", "running"].includes(health.state);
-    setText("summary-health", !confirmed ? "Sin confirmar" : healthy ? "Monitor supervisado" : "Revisar monitor");
-    const observation = state.observation || health?.observation;
-    setText("summary-observation", !confirmed ? "Observación sin confirmar" : observation?.state === "running"
-      ? `Observación · ${runtimeLabel(observation.elapsed_seconds)}${finite(observation.target_seconds) ? ` de ${runtimeLabel(observation.target_seconds)}` : ""}`
-      : observation?.state === "completed_pending_review" ? "Observación completada · revisar informe"
-      : observation?.state === "interrupted" ? "Observación interrumpida" : "Sin observación activa");
-    const recent = state.events[0];
-    setText("summary-last-incident", recent ? eventLabel(recent.kind) : "Sin eventos recientes");
-    setText("summary-incident-time", recent ? formatMoment(recent.timestamp) : "Los cortes y las desconexiones aparecerán aquí.");
-  }
-
-  function renderOverviewChart() {
-    if (!state.navigationReady) return;
-    const chart = $("summary-history-spark");
-    if (!chart) return;
-    chart.replaceChildren();
-    const hours = 1;
-    const end = Date.now(), start = end - hours * 3600000;
-    const samples = state.overviewHistory.filter((sample) => sample._time >= start && sample._time <= end);
-    const values = samples.flatMap((sample) => [sample.input_voltage, sample.output_voltage]).filter(finite);
-    chart.setAttribute("viewBox", "0 0 800 170");
-    chart.setAttribute("aria-label", values.length ? `Voltaje de entrada y salida, últimos ${hours === 1 ? "60" : "15"} minutos. Los huecos representan falta de lecturas.` : "Sin mediciones de voltaje en este período.");
-    if (!values.length) {
-      chart.append(svgElement("text", { x: 400, y: 85, class: "chart-axis", "text-anchor": "middle" }, state.overviewHistoryError ? "No se pudo consultar el voltaje de la última hora" : "Esperando mediciones de voltaje"));
-      return;
-    }
-    const minimum = values.reduce((result, value) => Math.min(result, value), Infinity);
-    const maximum = values.reduce((result, value) => Math.max(result, value), -Infinity);
-    const low = Math.max(0, Math.floor((minimum - 5) / 10) * 10), high = Math.ceil((maximum + 5) / 10) * 10;
-    const x = (time) => 42 + (time - start) / (end - start) * 742;
-    const y = (value) => 140 - (value - low) / (high - low) * 124;
-    for (let index = 0; index <= 2; index++) {
-      const value = low + (high - low) * index / 2;
-      chart.append(svgElement("line", { x1: 42, x2: 784, y1: y(value), y2: y(value), class: "chart-grid" }));
-      chart.append(svgElement("text", { x: 32, y: y(value) + 4, class: "chart-axis", "text-anchor": "end" }, numeric(value)));
-    }
-    for (const [key, color] of [["input_voltage", "var(--teal)"], ["output_voltage", "var(--blue)"]]) {
-      let path = "", previous = null;
-      for (const sample of samples) {
-        if (!finite(sample[key])) { previous = null; continue; }
-        const continuous = previous !== null && (typeof sample.gap_before === "boolean" ? !sample.gap_before : sample._time - previous <= state.historyInterval * 3);
-        path += `${continuous ? "L" : "M"}${x(sample._time).toFixed(2)},${y(sample[key]).toFixed(2)} `;
-        previous = sample._time;
-      }
-      if (path) chart.append(svgElement("path", { d: path.trim(), class: "chart-line", stroke: color }));
-    }
-    chart.append(svgElement("text", { x: 42, y: 164, class: "chart-axis", "text-anchor": "start" }, shortClockFormat.format(new Date(start))));
-    chart.append(svgElement("text", { x: 784, y: 164, class: "chart-axis", "text-anchor": "end" }, shortClockFormat.format(new Date(end))));
-  }
-
   function renderHealth(health) {
     const tag = $("health-state");
     const confirmed = state.serviceAvailable && health && typeof health === "object";
@@ -741,7 +679,6 @@
       const age = finite(observation.max_read_age_seconds) ? ` · mayor antigüedad de lectura ${numeric(observation.max_read_age_seconds, 1)} s` : "";
       setText("stability-summary", `${label}${elapsed}${samples}${failures}${dropped}${memory}${cpu}${age}.`);
     }
-    renderOverview();
     updateMutationControls();
   }
 
@@ -893,7 +830,6 @@
       $("more-incidents").hidden = !state.incidentCursor;
       renderIncidents();
       setText(state.navigationReady ? "incidents-feedback" : "records-feedback", `Consulta actualizada a las ${clockFormat.format(new Date())}. Las fechas usan la zona horaria de esta PC; puede haber huecos si faltaron lecturas o registros.`);
-      renderOverview();
     } catch (error) {
       if (version === currentVersion()) sectionError("incidents-error", new Error(`No se pudieron consultar los incidentes. ${error.message}`));
     } finally {
@@ -1025,7 +961,6 @@
 
   function applyStatus(data) {
     if (!data || typeof data !== "object" || !data.connection || !data.policy || !data.protection) throw new Error("El monitor devolvió un estado incompleto.");
-    const previousBatteryKey = state.metric === "battery" ? chartSeries()[0].key : null;
     const recovered = !state.serviceAvailable;
     const historyRecovered = state.status?.history?.available === false && data.history?.available === true;
     state.status = data;
@@ -1049,10 +984,7 @@
     renderHealth(data.health);
     if (data.health?.observation) renderObservation(data.health.observation);
     else renderObservation();
-    renderOverview();
     loadViewData();
-    // Status and history requests may arrive in either order, especially on first load.
-    if (state.metric === "battery" && previousBatteryKey !== chartSeries()[0].key) renderChart();
     if (recovered || historyRecovered) loadHistory();
   }
 
@@ -1074,60 +1006,29 @@
 
   function normalizeHistory(samples) {
     return (Array.isArray(samples) ? samples : [])
-      .map((sample) => ({ ...sample, _time: parseDate(sample.timestamp)?.getTime() }))
+      .map((sample) => ({ ...sample,
+        battery_percent: percentage(sample.battery_percent) ? sample.battery_percent : null,
+        battery_percent_estimate: estimatedBattery(sample) ? sample.battery_percent_estimate : null,
+        _time: parseDate(sample.timestamp)?.getTime() }))
       .filter((sample) => Number.isFinite(sample._time))
       .sort((a, b) => a._time - b._time);
-  }
-
-  async function loadOverviewHistory() {
-    if (!state.navigationReady || state.overviewHistoryBusy) return;
-    state.overviewHistoryBusy = true;
-    const generation = ++state.overviewGeneration;
-    try {
-      const data = await request("/api/history?hours=1");
-      if (generation !== state.overviewGeneration) return;
-      state.overviewHistory = normalizeHistory(data.samples);
-      state.overviewHistoryError = null;
-    } catch (error) {
-      if (generation !== state.overviewGeneration) return;
-      state.overviewHistory = [];
-      state.overviewHistoryError = error.message;
-    } finally {
-      state.overviewHistoryBusy = false;
-      renderOverviewChart();
-    }
   }
 
   async function loadHistory() {
     if (state.historyBusy) return;
     state.historyBusy = true;
     const requestedHours = state.hours;
-    const queryHours = state.navigationReady ? Math.max(1, requestedHours) : requestedHours;
-    const overviewGeneration = queryHours === 1 ? ++state.overviewGeneration : null;
     try {
-      const data = await request(`/api/history?hours=${queryHours}`);
+      const data = await request(`/api/history?hours=${requestedHours}`);
       if (requestedHours !== state.hours) return;
       state.historyQueryError = null;
       state.history = normalizeHistory(data.samples);
-      if (queryHours === 1 && overviewGeneration === state.overviewGeneration) {
-        state.overviewHistory = state.history;
-        state.overviewHistoryError = null;
-      }
       renderChart();
-      renderOverviewChart();
     } catch (error) {
       if (requestedHours !== state.hours) return;
       state.historyQueryError = error.message;
-      if (queryHours === 1 && overviewGeneration === state.overviewGeneration) {
-        state.overviewHistory = [];
-        state.overviewHistoryError = error.message;
-        renderOverviewChart();
-      }
       renderHistoryStatus();
     } finally {
-      // The history reader has a bounded concurrency limit. Query the full last hour
-      // after a long-range response, and finish it before starting another range.
-      if (state.navigationReady && queryHours > 1 && requestedHours === state.hours) await loadOverviewHistory();
       state.historyBusy = false;
       if (requestedHours !== state.hours) loadHistory();
     }
@@ -1140,10 +1041,17 @@
     return el;
   }
 
-  function chartSeries() {
+  function chartSeries(samples) {
     if (state.metric === "battery") {
-      const voltage = state.status?.meta?.source === "native" || (!state.history.some((sample) => finite(sample.battery_percent)) && state.history.some((sample) => finite(sample.battery_voltage)));
-      return [{ key: voltage ? "battery_voltage" : "battery_percent", label: voltage ? "Voltaje de batería" : "Batería", color: "var(--teal)" }];
+      const reported = samples.some((sample) => percentage(sample.battery_percent));
+      const estimated = samples.some(estimatedBattery);
+      if (!reported && !estimated && samples.some((sample) => finite(sample.battery_voltage))) {
+        return [{ key: "battery_voltage", label: "Voltaje de batería", color: "var(--teal)" }];
+      }
+      const series = [];
+      if (reported || !estimated) series.push({ key: "battery_percent", label: "Carga reportada", color: "var(--teal)" });
+      if (estimated) series.push({ key: "battery_percent_estimate", label: "Carga estimada", color: "var(--blue)", estimated: true });
+      return series;
     }
     if (state.metric === "load") return [{ key: "load_percent", label: "Carga", color: "var(--blue)" }];
     return [{ key: "input_voltage", label: "Entrada", color: "var(--teal)" }, { key: "output_voltage", label: "Salida", color: "var(--blue)" }];
@@ -1152,7 +1060,12 @@
   function renderChart() {
     const chart = $("history-chart");
     chart.replaceChildren();
-    const series = chartSeries();
+    const width = Math.min(800, Math.max(280, chart.clientWidth || 800));
+    chart.setAttribute("viewBox", `0 0 ${width} 230`);
+    const end = Date.now();
+    const start = end - state.hours * 3600000;
+    const samples = state.history.filter((sample) => sample._time >= start && sample._time <= end);
+    const series = chartSeries(samples);
     const unit = state.metric === "voltage" || series[0].key === "battery_voltage" ? "V" : "%";
     const legend = $("chart-legend");
     legend.replaceChildren();
@@ -1160,6 +1073,7 @@
       const label = document.createElement("span");
       const mark = document.createElement("i");
       mark.style.background = line.color;
+      if (line.estimated) mark.className = "legend-estimated";
       label.append(mark, document.createTextNode(line.label));
       legend.append(label);
     }
@@ -1167,9 +1081,6 @@
     legendUnit.className = "chart-unit";
     legendUnit.textContent = unit === "V" ? "VOLTIOS" : "PORCENTAJE";
     legend.append(legendUnit);
-    const end = Date.now();
-    const start = end - state.hours * 3600000;
-    const samples = state.history.filter((sample) => sample._time >= start && sample._time <= end);
     const values = samples.flatMap((sample) => series.map((line) => sample[line.key])).filter(finite);
     const available = values.length > 0;
     let yMin = 0;
@@ -1185,7 +1096,7 @@
         yMax = Math.ceil((largest + padding) / step) * step;
       } else { yMin = 0; yMax = series[0].key === "battery_voltage" ? 1 : 250; }
     } else if (available) yMax = Math.max(100, Math.ceil(values.reduce((maximum, value) => Math.max(maximum, value), 0) / 20) * 20);
-    const left = 38, right = 786, top = 14, bottom = 192;
+    const left = 38, right = width - 14, top = 14, bottom = 192;
     const x = (time) => left + (time - start) / (end - start) * (right - left);
     const y = (value) => bottom - (value - yMin) / (yMax - yMin) * (bottom - top);
     for (let index = 0; index <= 4; index++) {
@@ -1207,23 +1118,25 @@
     for (const line of series) {
       let path = "";
       let previous = null;
+      let previousMethod = null;
       const dots = [];
       for (const sample of samples) {
         const value = sample[line.key];
         if (!finite(value)) { previous = null; continue; }
         // The backend checks original measurements before decimating long ranges.
-        const continuing = previous !== null && (typeof sample.gap_before === "boolean" ? !sample.gap_before : sample._time - previous <= maxGap);
+        const continuing = previous !== null && (!line.estimated || previousMethod === sample.battery_estimate_method) && (typeof sample.gap_before === "boolean" ? !sample.gap_before : sample._time - previous <= maxGap);
         const px = x(sample._time), py = y(value);
         path += `${continuing ? "L" : "M"}${px.toFixed(2)},${py.toFixed(2)} `;
         if (!continuing) dots.push([px, py]);
         previous = sample._time;
+        previousMethod = sample.battery_estimate_method;
       }
-      if (path) chart.append(svgElement("path", { d: path.trim(), class: "chart-line", stroke: line.color }));
+      if (path) chart.append(svgElement("path", { d: path.trim(), class: "chart-line", stroke: line.color, ...(line.estimated ? { "stroke-dasharray": "6 4" } : {}) }));
       for (const [cx, cy] of dots) chart.append(svgElement("circle", { cx, cy, r: 2, fill: line.color }));
     }
     const cursor = svgElement("line", { x1: 0, x2: 0, y1: top, y2: bottom, class: "chart-cursor", visibility: "hidden" });
     chart.append(cursor);
-    state.chart = { samples, series, start, end, left, right, x, cursor, unit, maxGap };
+    state.chart = { samples, series, start, end, left, right, width, x, cursor, unit, maxGap };
     $("chart-empty").hidden = available;
     if (!available) {
       $("chart-empty").querySelector("strong").textContent = state.history.length ? "Sin lecturas para este período" : "El historial empieza aquí";
@@ -1239,7 +1152,7 @@
     const chart = state.chart;
     if (!chart || !chart.samples.length || !$("chart-empty").hidden) return;
     const bounds = $("history-chart").getBoundingClientRect();
-    const localX = (event.clientX - bounds.left) / bounds.width * 800;
+    const localX = (event.clientX - bounds.left) / bounds.width * chart.width;
     if (localX < chart.left || localX > chart.right) return hideTooltip();
     const targetTime = chart.start + (localX - chart.left) / (chart.right - chart.left) * (chart.end - chart.start);
     let closest = chart.samples[0];
@@ -1285,7 +1198,6 @@
   });
   $("history-period").addEventListener("change", () => {
     state.hours = Number($("history-period").value);
-    state.overviewGeneration += 1;
     savePreferences();
     state.history = [];
     renderChart();

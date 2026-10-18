@@ -5,6 +5,7 @@ import socket
 import time
 
 from .adapters import TelemetryError
+from .battery_estimation import Nt2402ProBatteryEstimator
 from .hid_windows import StatusTransport, enumerate_ups_bounded as enumerate_ups
 from .qs_protocol import parse_qs
 
@@ -33,6 +34,7 @@ class NativeHidAdapter:
     def __init__(self, *, clock=None):
         self.transport = None
         self._clock = clock or time.monotonic
+        self._battery_estimator = Nt2402ProBatteryEstimator(clock=self._clock)
         self._failures = 0
         self._retry_at = 0
 
@@ -44,6 +46,8 @@ class NativeHidAdapter:
         if self.retry_after_seconds:
             raise TelemetryError("USB en reconexión automática; próximo intento tras el plazo de espera.")
         if forza_monitor_running():
+            self._battery_estimator.reset()
+            self.transport = None
             raise TelemetryError("El colector ForzaTracker está activo. Detén ese lector antes de usar USB directo para evitar consultas simultáneas.")
         try:
             if self.transport is None:
@@ -59,11 +63,14 @@ class NativeHidAdapter:
                 if any(type(value) is not int for value in report_sizes) or report_sizes != (9, 9, 0):
                     raise TelemetryError("El descriptor HID no coincide con el validado para este UPS.")
                 self.transport = StatusTransport(device["path"])
-            sample = parse_qs(self.transport.query_status())
+            sample = parse_qs(self.transport.query_status(), preserve_battery_precision=True)
+            sample.update(self._battery_estimator.update(sample))
+            sample["battery_voltage"] = round(sample["battery_voltage"], 2)
             self._failures = 0
             self._retry_at = 0
             return sample
         except (OSError, ValueError, TelemetryError) as exc:
+            self._battery_estimator.reset()
             self.transport = None
             self._failures += 1
             self._retry_at = self._clock() + min(30, 2 ** min(self._failures, 5))

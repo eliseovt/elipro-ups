@@ -342,6 +342,60 @@ class ReportsApiTests(IsolatedMonitorTests):
         self.assertEqual(rows[0]["battery_voltage"], "27.4")
         self.assertEqual(rows[0]["raw_status"], "'=1+1")
 
+    def test_status_exposes_only_valid_estimates_and_history_does_not_backfill_legacy_rows(self):
+        for extra, expected in (({}, (None, None)),
+                                ({"battery_percent_estimate": 0, "battery_estimate_method": "pmv-v1"}, (0, "pmv-v1")),
+                                ({"battery_percent_estimate": True, "battery_estimate_method": "pmv-v1"}, (None, None)),
+                                ({"battery_percent_estimate": float("nan"), "battery_estimate_method": "pmv-v1"}, (None, None))):
+            with self.subTest(extra=extra):
+                self.monitor.sample = {"timestamp": iso_utc(), "on_battery": False,
+                                       "battery_voltage": 27.4, **extra}
+                self.monitor.connection = "connected"
+                handler = self.handler("/api/status")
+                handler.do_GET()
+                sample = self.response(handler)[0]["sample"]
+                self.assertEqual((sample["battery_percent_estimate"], sample["battery_estimate_method"]), expected)
+                self.assertEqual(sample["battery_voltage"], 27.4)
+        legacy = {"timestamp": iso_utc(), "on_battery": False, "battery_voltage": 27.4}
+        self.backend.add_sample(legacy)
+        with self.backend._db:
+            self.backend._db.execute("UPDATE samples SET payload=?", (json.dumps(legacy),))
+        self.backend.add_sample({"timestamp": iso_utc(), "on_battery": True,
+                                 "battery_percent_estimate": 45.5, "battery_estimate_method": "pmv-v1"})
+        handler = self.handler("/api/history")
+        handler.do_GET()
+        rows = self.response(handler)[0]["samples"]
+        self.assertNotIn("battery_percent_estimate", rows[0])
+        self.assertNotIn("battery_estimate_method", rows[0])
+        self.assertEqual(rows[1]["battery_percent_estimate"], 45.5)
+        self.assertEqual(rows[1]["battery_estimate_method"], "pmv-v1")
+
+    def test_measurements_csv_appends_estimate_columns_without_changing_existing_positions(self):
+        legacy = {"timestamp": iso_utc(), "battery_voltage": 27.4, "watts_is_estimate": False}
+        self.backend.add_sample(legacy)
+        with self.backend._db:
+            self.backend._db.execute("UPDATE samples SET payload=?", (json.dumps(legacy),))
+        self.backend.add_sample({"timestamp": iso_utc(), "battery_voltage": 26.1,
+                                 "battery_percent_estimate": 0, "battery_estimate_method": "pmv-v1"})
+        handler = self.handler("/api/export.csv")
+        def capture(source, mime, filename):
+            source.seek(0)
+            handler._send(source.read(), mime, extra={"Content-Disposition": filename})
+        handler._send_file = capture
+        handler.do_GET()
+        data = handler._send.call_args.args[0]
+        reader = csv.DictReader(io.StringIO(data.decode("utf-8-sig")))
+        legacy_fields = ["timestamp", "input_voltage", "output_voltage", "frequency_hz", "load_percent",
+                         "battery_percent", "battery_voltage", "runtime_seconds", "temperature_c",
+                         "on_battery", "low_battery", "fault", "estimated_watts", "raw_status", "watts_is_estimate"]
+        self.assertEqual(reader.fieldnames, legacy_fields + ["battery_percent_estimate", "battery_estimate_method"])
+        rows = list(reader)
+        self.assertEqual(rows[0]["battery_voltage"], "27.4")
+        self.assertEqual(rows[0]["battery_percent_estimate"], "")
+        self.assertEqual(rows[0]["battery_estimate_method"], "")
+        self.assertEqual(rows[1]["battery_percent_estimate"], "0")
+        self.assertEqual(rows[1]["battery_estimate_method"], "pmv-v1")
+
 
 if __name__ == "__main__":
     unittest.main()

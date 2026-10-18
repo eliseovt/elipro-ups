@@ -50,6 +50,39 @@ class PersistenceTests(unittest.TestCase):
         self.assertEqual(len(backend.history()), 1)
         self.assertTrue(store.close())
 
+    def test_estimate_metadata_survives_async_queue_and_invalid_metadata_is_ignored(self):
+        store, backend = self.memory(batch_latency_seconds=0.02)
+        valid = {"timestamp": iso_utc(), "on_battery": False, "battery_voltage": 27.4,
+                 "battery_percent_estimate": 0, "battery_estimate_method": "pmv-v1"}
+        stored = store.add_sample(valid)
+        self.assertEqual(stored["battery_percent_estimate"], 0)
+        self.assertEqual(stored["battery_estimate_method"], "pmv-v1")
+        valid["battery_percent_estimate"] = 90
+        invalid = store.add_sample({"timestamp": iso_utc(), "on_battery": False,
+                                    "battery_voltage": 27.4, "battery_percent_estimate": float("nan"),
+                                    "battery_estimate_method": "pmv-v1"})
+        self.assertIsNone(invalid["battery_percent_estimate"])
+        self.assertIsNone(invalid["battery_estimate_method"])
+        store.start()
+        eventually(lambda: store.status()["pending"] == 0)
+        history = store.history()
+        self.assertEqual([row["battery_percent_estimate"] for row in history], [0, None])
+        self.assertEqual([row["battery_estimate_method"] for row in store.iter_samples()], ["pmv-v1", None])
+        self.assertEqual([row["battery_voltage"] for row in backend.history()], [27.4, 27.4])
+        self.assertTrue(store.close(timeout=0.5))
+
+    def test_estimate_change_does_not_make_sample_an_urgent_battery_alarm(self):
+        store, backend = self.memory(batch_latency_seconds=2)
+        for percent in (80, 1):
+            store.add_sample({"timestamp": iso_utc(), "on_battery": False, "low_battery": False,
+                              "battery_percent_estimate": percent, "battery_estimate_method": "pmv-v1"})
+        self.assertFalse(any(entry.urgent for entry in store._queue))
+        self.assertEqual([entry.value["battery_percent_estimate"] for entry in store._queue], [80, 1])
+        store.add_sample({"timestamp": iso_utc(), "on_battery": False, "low_battery": False,
+                          "battery_percent": 1, "battery_percent_estimate": 80,
+                          "battery_estimate_method": "pmv-v1"})
+        self.assertTrue(store._queue[-1].urgent)
+
     def test_slow_worker_never_blocks_memory_events_or_telemetry(self):
         store, backend = self.memory()
         entered, release = threading.Event(), threading.Event()

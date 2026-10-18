@@ -28,11 +28,26 @@ DEFAULT_POLICY = {
     "countdown_seconds": 60,
     "action": "shutdown",
 }
+BATTERY_ESTIMATE_FIELDS = ("battery_percent_estimate", "battery_estimate_method")
 SAMPLE_FIELDS = (
     "input_voltage", "output_voltage", "frequency_hz", "load_percent",
     "battery_percent", "battery_voltage", "runtime_seconds", "temperature_c",
     "on_battery", "low_battery", "fault", "estimated_watts", "raw_status",
-)
+) + BATTERY_ESTIMATE_FIELDS
+
+
+def battery_estimate_fields(sample):
+    """Keep a derived percentage only with its bounded method provenance.
+
+    Estimates are optional display/history metadata, never a replacement for
+    reported battery_percent or low_battery telemetry. No value is inferred.
+    """
+    percent = sample.get("battery_percent_estimate")
+    method = sample.get("battery_estimate_method")
+    valid = (type(percent) in (int, float) and 0 <= percent <= 100 and math.isfinite(percent)
+             and isinstance(method, str) and 1 <= len(method) <= 80 and bool(method.strip()))
+    return {"battery_percent_estimate": percent if valid else None,
+            "battery_estimate_method": method if valid else None}
 
 
 def utc_now():
@@ -131,6 +146,7 @@ class Store:
 
     def add_sample(self, sample):
         normalized = {field: sample.get(field) for field in SAMPLE_FIELDS}
+        normalized.update(battery_estimate_fields(sample))
         normalized["timestamp"] = iso_utc(_timestamp(sample["timestamp"]))
         normalized["watts_is_estimate"] = sample.get("watts_is_estimate") is True
         ts = _timestamp(normalized["timestamp"]).timestamp()

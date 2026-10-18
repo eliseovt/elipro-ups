@@ -1,3 +1,4 @@
+import json
 import tempfile
 import threading
 import unittest
@@ -147,6 +148,53 @@ class PolicyTests(unittest.TestCase):
 
 
 class StoreTests(unittest.TestCase):
+    def test_derived_battery_percentage_requires_valid_provenance_and_keeps_real_data(self):
+        store = Store(":memory:")
+        self.addCleanup(store.close)
+        for percent, method in ((0, "pmv-v1"), (100, "m" * 80), (43.75, "pmv-v1")):
+            with self.subTest(percent=percent, method=method):
+                stored = store.add_sample({"timestamp": iso_utc(), "battery_percent": 80,
+                                           "low_battery": False, "battery_percent_estimate": percent,
+                                           "battery_estimate_method": method})
+                self.assertEqual(stored["battery_percent_estimate"], percent)
+                self.assertEqual(stored["battery_estimate_method"], method)
+                self.assertEqual(stored["battery_percent"], 80)
+                self.assertIs(stored["low_battery"], False)
+        self.assertEqual([row["battery_percent_estimate"] for row in store.history()], [0, 100, 43.75])
+        self.assertEqual([row["battery_estimate_method"] for row in store.iter_samples()],
+                         ["pmv-v1", "m" * 80, "pmv-v1"])
+
+    def test_invalid_or_absent_battery_estimate_does_not_discard_valid_telemetry(self):
+        store = Store(":memory:")
+        self.addCleanup(store.close)
+        invalid = ((None, None), (50, None), (None, "pmv-v1"), (False, "pmv-v1"),
+                   (float("nan"), "pmv-v1"), (float("inf"), "pmv-v1"),
+                   (-0.01, "pmv-v1"), (100.01, "pmv-v1"), (10 ** 1000, "pmv-v1"),
+                   ("50", "pmv-v1"), (50, ""), (50, "   "), (50, "m" * 81), (50, 1))
+        for percent, method in invalid:
+            with self.subTest(percent=percent, method=method):
+                stored = store.add_sample({"timestamp": iso_utc(), "battery_voltage": 27.4,
+                                           "battery_percent_estimate": percent,
+                                           "battery_estimate_method": method})
+                self.assertIsNone(stored["battery_percent_estimate"])
+                self.assertIsNone(stored["battery_estimate_method"])
+                self.assertEqual(stored["battery_voltage"], 27.4)
+                json.dumps(stored, allow_nan=False)
+
+    def test_legacy_json_history_remains_unchanged_without_estimate_backfill(self):
+        store = Store(":memory:")
+        self.addCleanup(store.close)
+        stamp = iso_utc()
+        legacy = {"timestamp": stamp, "battery_voltage": 27.4, "battery_percent": None}
+        payload = json.dumps(legacy)
+        with store._db:
+            store._db.execute("INSERT INTO samples(ts,timestamp,payload) VALUES(?,?,?)",
+                              (datetime.fromisoformat(stamp.replace("Z", "+00:00")).timestamp(), stamp, payload))
+        self.assertEqual(list(store.iter_samples()), [legacy])
+        history = store.history()[0]
+        self.assertEqual(history, {**legacy, "gap_before": False})
+        self.assertEqual(store._db.execute("SELECT payload FROM samples").fetchone()[0], payload)
+
     def test_persistence_bounded_history_events_and_export(self):
         with tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parent) as directory:
             path = Path(directory) / "data.sqlite"

@@ -36,7 +36,7 @@ def main(argv=None):
     command, remaining = arguments[0], arguments[1:]
     if command in ("--help", "-h"):
         parser = argparse.ArgumentParser(description="Elipro UPS para Windows x64")
-        parser.add_argument("command", nargs="?", choices=("monitor", "guardian", "qs-worker", "smoke-test", "service", "agent"),
+        parser.add_argument("command", nargs="?", choices=("monitor", "guardian", "qs-worker", "battery-diagnostic", "smoke-test", "service", "agent"),
                             help="Instalado: abre panel/agente; service gestiona el servicio; smoke-test no accede al UPS")
         parser.print_help()
         return 0
@@ -60,6 +60,12 @@ def main(argv=None):
     if command == "qs-worker":
         from .hid_windows import worker_main
         return worker_main(remaining)
+    if command == "battery-worker":
+        from .hid_windows import battery_worker_main
+        return battery_worker_main(remaining)
+    if command == "battery-diagnostic":
+        from .battery_diagnostics import main as battery_diagnostic_main
+        return battery_diagnostic_main(remaining)
     if command == "service":
         from .windows_service import main as service_main
         return service_main(remaining)

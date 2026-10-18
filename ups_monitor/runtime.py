@@ -2,7 +2,7 @@
 
 A frozen executable is the application itself, not a Python interpreter. Passing
 ``-m`` to it would recursively launch the application instead of the isolated
-reader. Keep the three internal roles explicit so packaging cannot weaken the
+reader. Keep internal roles explicit so packaging cannot weaken the
 existing process boundary around USB queries.
 """
 from __future__ import annotations
@@ -41,6 +41,8 @@ def child_command(role, *arguments):
         "monitor": ("ups_monitor",),
         "guardian": ("ups_monitor.guardian",),
         "qs-worker": ("ups_monitor.hid_windows", "--qs-worker"),
+        "battery-worker": ("ups_monitor.hid_windows", "--battery-worker"),
+        "battery-diagnostic": ("ups_monitor.battery_diagnostics",),
         "service": ("ups_monitor.windows_service",),
         "agent": ("ups_monitor.session_agent",),
     }

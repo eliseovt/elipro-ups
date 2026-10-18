@@ -5,7 +5,7 @@ import subprocess
 import unittest
 from unittest.mock import Mock, patch
 
-from ups_monitor.hid_windows import HIDD_ATTRIBUTES, HIDP_CAPS, StatusTransport, _cooldown_until, _active_workers, _query_status_once, _read_report, _run_bounded_worker, enumerate_ups_bounded
+from ups_monitor.hid_windows import HIDD_ATTRIBUTES, HIDP_CAPS, StatusTransport, _cooldown_until, _active_workers, _query_status_once, _query_battery_diagnostic_once, _read_report, _run_bounded_worker, battery_worker_main, enumerate_ups_bounded
 
 PATH = r"\\?\hid#vid_0665&pid_5161#unit#{4d1e55b2-f16f-11cf-88cb-001111000030}"
 
@@ -18,10 +18,34 @@ class HidTests(unittest.TestCase):
     def test_only_status_query_is_allowed_before_launching_worker(self):
         transport = StatusTransport(PATH)
         with patch("ups_monitor.hid_windows._run_bounded_worker") as run:
-            for command in [b"S01\r", b"Q1\r", b"QS\rS01\r", "QS\r", b"QS"]:
+            for command in [b"S01\r", b"Q1\r", b"QS\rS01\r", "QS\r", b"QS", b"BT?\r", b"BL?\r"]:
                 with self.assertRaises(ValueError):
                     transport.query_status(command)
             run.assert_not_called()
+
+    def test_battery_diagnostic_has_a_separate_exact_allowlist(self):
+        transport = StatusTransport(PATH)
+        with patch("ups_monitor.hid_windows._run_bounded_worker") as run, \
+             patch("ups_monitor.hid_windows._apis") as apis:
+            for command in (b"QS\r", b"BT?", b"BL?\rS01\r", b"S01\r", "BT?\r", b"bt?\r", b"BT?\r\x00"):
+                with self.assertRaises(ValueError):
+                    transport.query_battery_diagnostic(command)
+                with self.assertRaises(ValueError):
+                    _query_battery_diagnostic_once(PATH, command)
+            run.assert_not_called()
+            apis.assert_not_called()
+            run.return_value = Mock(returncode=0, stdout=b"99\r", stderr=b"")
+            for name in ("BT", "BL"):
+                self.assertEqual(transport.query_battery_diagnostic((name + "?\r").encode()), b"99\r")
+                self.assertEqual(run.call_args.args[0][-3:], ["--battery-worker", PATH, name])
+                self.assertEqual(run.call_args.args[1], PATH.casefold())
+
+    def test_battery_worker_rejects_arbitrary_roles_or_extra_arguments_before_hid(self):
+        with patch("ups_monitor.hid_windows._query_battery_diagnostic_once") as query:
+            for arguments in ([], [PATH], [PATH, "QS"], [PATH, "BT?\r"], [PATH, "BT", "extra"]):
+                with self.assertRaises(SystemExit):
+                    battery_worker_main(arguments)
+            query.assert_not_called()
 
     def test_worker_is_bounded_and_returns_raw_bytes(self):
         with patch("ups_monitor.hid_windows._run_bounded_worker") as run:
@@ -77,6 +101,36 @@ class HidTests(unittest.TestCase):
         apis[1].HidD_SetOutputReport.assert_not_called()
         self.assertEqual(apis[2].CloseHandle.call_count, 2)
         apis[2].ReleaseMutex.assert_called_once_with(30)
+
+    def test_battery_queries_keep_exact_framing_and_hardware_validation(self):
+        for command in (b"BT?\r", b"BL?\r"):
+            apis = self.fake_apis()
+            with patch("ups_monitor.hid_windows._apis", return_value=apis), \
+                 patch("ups_monitor.hid_windows._read_report", return_value=b"99\r\x00\x00\x00\x00\x00"):
+                self.assertEqual(_query_battery_diagnostic_once(PATH, command), b"99\r")
+            output = apis[1].HidD_SetOutputReport.call_args.args
+            self.assertEqual(bytes(output[1]), b"\x00" + command + b"\x00" * 4)
+            self.assertEqual(output[2], 9)
+            apis[2].ReleaseMutex.assert_called_once_with(30)
+            self.assertEqual(apis[2].CloseHandle.call_count, 3)
+            apis = self.fake_apis(invalid_caps=True)
+            with patch("ups_monitor.hid_windows._apis", return_value=apis):
+                with self.assertRaises(OSError):
+                    _query_battery_diagnostic_once(PATH, command)
+            apis[1].HidD_SetOutputReport.assert_not_called()
+
+    def test_failed_battery_query_uses_the_same_status_cooldown(self):
+        with patch("ups_monitor.hid_windows.time.monotonic", return_value=100), \
+             patch("ups_monitor.hid_windows._run_bounded_worker", side_effect=TimeoutError("deadline")):
+            with self.assertRaises(TimeoutError):
+                StatusTransport(PATH).query_battery_diagnostic(b"BT?\r")
+        with patch("ups_monitor.hid_windows.time.monotonic", return_value=101), \
+             patch("ups_monitor.hid_windows._run_bounded_worker") as run:
+            for operation in (lambda: StatusTransport(PATH).query_status(),
+                              lambda: StatusTransport(PATH).query_battery_diagnostic(b"BL?\r")):
+                with self.assertRaises(TimeoutError):
+                    operation()
+            run.assert_not_called()
 
     def test_mutex_contention_and_abandonment_never_send(self):
         for result in [258, 128]:
