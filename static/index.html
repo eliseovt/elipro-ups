@@ -29,13 +29,12 @@
           <div class="last-sync"><span class="sync-icon" aria-hidden="true">↻</span><div><span class="meta-label">ÚLTIMA LECTURA</span><strong id="last-updated">Esperando conexión</strong></div></div>
           <button id="theme-toggle" class="theme-toggle" type="button" aria-label="Cambiar a modo claro" title="Cambiar a modo claro" aria-pressed="false"><span class="theme-thumb" aria-hidden="true"></span><svg class="theme-sun" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M2 12h2m16 0h2M5 5l1.5 1.5m11 11L19 19M5 19l1.5-1.5m11-11L19 5"/></svg><svg class="theme-moon" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 15.4A8.8 8.8 0 0 1 8.6 4a8.8 8.8 0 1 0 11.4 11.4Z"/></svg></button>
         </div>
-        <div class="sidebar-footer"><div class="sidebar-equipment"><span id="connection-badge" class="connection-indicator" role="status" title="Conectando"><span class="status-dot" aria-hidden="true"></span><span class="sr-only">Conectando</span></span><span class="sidebar-model">FORZA NT-2402PRO</span></div><span class="sidebar-capacity">2400 VA · 1200 W nominales</span><span class="sidebar-local">Tus datos se quedan en esta PC</span></div>
       </div>
     </aside>
 
     <main class="workspace">
       <section class="page-heading" aria-labelledby="page-title">
-        <div><h1 id="page-title" tabindex="-1"><span id="view-title">Resumen</span><span class="heading-dot">.</span></h1><p id="view-description">Lo esencial de tu UPS, de un vistazo.</p></div>
+        <div><h1 id="page-title" tabindex="-1"><span id="view-title">Resumen</span></h1><p id="view-description">Lo esencial de tu UPS, de un vistazo.</p></div>
       </section>
 
       <div id="service-notice" class="notice service-notice" role="status" hidden></div>
@@ -46,30 +45,102 @@
       </section>
 
       <section id="page-overview" class="page-view" data-page="overview" aria-label="Resumen del UPS">
-<section class="overview" aria-label="Estado actual del UPS">
-        <article class="power-card card">
-          <div class="card-label"><span class="tiny-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M9 3v5m6-5v5M7 8h10v4a5 5 0 0 1-10 0Zm5 9v4"/></svg></span> SUMINISTRO ELÉCTRICO</div>
-          <div class="power-main"><div><span id="power-state" class="power-state">Esperando al UPS</span><p id="power-detail">Las lecturas aparecerán al conectar el equipo.</p></div><div class="power-indicator"><div id="power-orbit" class="power-orbit" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="m13.5 2-8 12h6L10.5 22l8-12h-6Z"/></svg></div><span class="power-frequency" aria-label="Frecuencia"><span id="frequency">—</span> <small>Hz</small></span></div></div>
-          <div class="voltage-row"><div><span class="metric-caption">ENTRADA</span><div class="voltage-value"><span id="input-voltage">—</span><span class="unit">V</span></div></div><span class="flow-line" aria-hidden="true"><span></span>→</span><div><span class="metric-caption">SALIDA</span><div class="voltage-value"><span id="output-voltage">—</span><span class="unit">V</span></div></div><span id="source-label" class="source-label">Lectura local</span></div>
-        </article>
+        <article id="energy-diagram" class="energy-diagram card" data-mode="unknown" data-quality="starting" aria-labelledby="energy-diagram-title" aria-describedby="power-detail">
+          <h2 id="energy-diagram-title" class="sr-only">Estado actual de tu energía</h2>
+          <div class="energy-status-row"><span id="power-state" class="power-state">Esperando al UPS</span></div>
+          <p id="power-detail" class="sr-only">Las lecturas aparecerán al conectar el equipo.</p>
+          <span id="source-label" class="sr-only">Lectura local</span>
 
-        <article class="battery-card card">
-          <div class="card-label"><span class="tiny-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><rect x="3" y="6" width="17" height="12" rx="2"/><path d="M22 10v4M7 10v4m4-4v4m4-4v4"/></svg></span> BATERÍA</div>
-          <div class="battery-reading" aria-describedby="battery-note"><span id="battery-percent">—</span><span id="battery-unit" class="reading-unit">%</span></div>
-          <p id="battery-note" class="battery-note">No disponible</p>
-          <div class="battery-voltage"><span class="metric-caption">VOLTAJE</span><strong><span id="battery-voltage">—</span> <small>V</small></strong></div>
-          <div id="battery-track" class="battery-track" aria-hidden="true"><span id="battery-bar"></span></div>
-          <div class="battery-footer"><span id="battery-tag" class="battery-status">Sin lectura</span><div id="battery-runtime" hidden><span class="metric-caption">AUTONOMÍA REPORTADA</span><strong id="runtime">No disponible</strong></div></div>
-        </article>
+          <div class="energy-layout">
+            <div class="energy-node energy-input">
+              <svg class="input-illustration" viewBox="0 0 112 112" aria-hidden="true">
+                <rect class="outlet-plate" x="9" y="9" width="94" height="94" rx="17"/>
+                <rect class="outlet-socket" x="32" y="31" width="48" height="51" rx="10"/>
+                <path class="outlet-contacts" d="M46 47v12m20-12v12m-10 7v5"/>
+              </svg>
+              <h3 class="energy-node-label">ENTRADA DE RED</h3>
+              <div class="energy-voltage"><span id="input-voltage">—</span><span class="energy-unit">V</span></div>
+            </div>
 
-        <article class="load-card card">
-          <div class="card-label"><span class="tiny-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M4 17a9 9 0 1 1 16 0M12 13l4-5M5 17h14"/><circle cx="12" cy="13" r="1"/></svg></span> CARGA DEL UPS <span class="info-tip" tabindex="0" role="note" aria-label="Porcentaje de la capacidad nominal del UPS. No es una medición precisa de consumo.">i<span>Porcentaje de la capacidad nominal. No equivale a una medición precisa de consumo.</span></span></div>
-          <div class="load-reading"><span id="load-percent">—</span><span class="reading-unit">%</span></div>
-          <div class="load-track" aria-hidden="true"><span id="load-bar"></span><i></i><i></i><i></i></div>
-          <div id="load-footer" class="load-footer" hidden><strong id="watts">— W</strong><span id="watts-label">Potencia no disponible</span></div>
-        </article>
-      </section>
+            <div class="energy-route route-input" aria-hidden="true">
+              <svg class="energy-link flow-input" viewBox="0 0 200 32" preserveAspectRatio="none">
+                <path class="flow-track" d="M0 16h200"/><path class="flow-active" d="M0 16h200"/><path class="flow-motion" d="M0 16h200"/>
+                <path class="flow-chevron" d="m62 10 6 6-6 6m67-12 6 6-6 6"/>
+              </svg>
+            </div>
 
+            <div class="energy-node energy-ups">
+              <div class="ups-tower">
+                <svg class="ups-illustration" viewBox="0 0 176 244" aria-hidden="true">
+                  <defs>
+                    <linearGradient id="ups-shell-gradient" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#233b4c"/><stop offset=".23" stop-color="#152a38"/><stop offset=".72" stop-color="#101f2a"/><stop offset="1" stop-color="#304a5b"/></linearGradient>
+                    <linearGradient id="ups-front-gradient" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#162633"/><stop offset=".5" stop-color="#1c3241"/><stop offset="1" stop-color="#11212d"/></linearGradient>
+                    <linearGradient id="ups-screen-gradient" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#536d7e"/><stop offset="1" stop-color="#284554"/></linearGradient>
+                  </defs>
+                  <ellipse class="ups-shadow" cx="88" cy="236" rx="70" ry="6"/>
+                  <path class="ups-foot" d="M29 224h24v11H29zm94 0h24v11h-24z"/>
+                  <path class="ups-shell" d="M40 8h96c11 0 20 7 25 18v199H15V26C21 15 29 8 40 8Z"/>
+                  <path class="ups-side-seam" d="M33 12v211m8-215v215m94-215v215m9-210v210"/>
+                  <path class="ups-front" d="M43 9h90v207H43Z"/>
+                  <path class="ups-upper-panel" d="M43 10h90v62c-25 13-63 13-90 0Z"/>
+                  <rect class="ups-screen-frame" x="58" y="20" width="61" height="28" rx="2"/>
+                  <rect class="ups-screen" x="65" y="26" width="47" height="15" rx="1"/>
+                  <circle class="ups-power-ring" cx="88" cy="64" r="10"/><path class="ups-power-mark" d="M88 57v7m-5-4a7 7 0 1 0 10 0"/>
+                  <rect class="ups-meter-recess" x="68" y="91" width="40" height="106" rx="7"/>
+                  <path class="ups-vents" d="M49 86v119m6-117v117m66-117v117m6-119v119"/>
+                  <path class="ups-base-edge" d="M19 222h138M22 26v190m132-190v190"/>
+                </svg>
+                <div id="load-meter" class="load-meter" data-available="false" role="meter" aria-label="Carga del UPS, porcentaje de capacidad nominal" aria-valuemin="0" aria-valuemax="100" aria-valuetext="No disponible">
+                  <span id="load-bar" class="load-meter-fill"></span><span class="load-meter-slots" aria-hidden="true"></span>
+                </div>
+                <div class="ups-load-value"><span id="load-percent">—</span><span>%</span></div>
+              </div>
+              <h3 class="energy-ups-label">UPS</h3>
+              <div class="diagram-model"><span id="connection-badge" class="connection-indicator" role="status" title="Conectando"><span class="status-dot" aria-hidden="true"></span><span class="sr-only">Conectando</span></span><span>FORZA NT-2402PRO</span></div>
+            </div>
+
+            <div class="energy-route route-output" aria-hidden="true">
+              <svg class="energy-link flow-output" viewBox="0 0 200 32" preserveAspectRatio="none">
+                <path class="flow-track" d="M0 16h200"/><path class="flow-active" d="M0 16h200"/><path class="flow-motion" d="M0 16h200"/>
+                <path class="flow-chevron" d="m62 10 6 6-6 6m67-12 6 6-6 6"/>
+              </svg>
+            </div>
+
+            <div class="energy-node energy-output">
+              <svg class="output-illustration" viewBox="0 0 144 112" aria-hidden="true">
+                <rect class="monitor-bezel" x="8" y="13" width="128" height="77" rx="6"/>
+                <rect class="monitor-screen" x="14" y="19" width="116" height="65" rx="2"/>
+                <path class="monitor-stand" d="M63 90v15m18-15v15m-35 0h52v6H46Z"/>
+                <path class="monitor-highlight" d="M18 23h106"/>
+              </svg>
+              <h3 class="energy-node-label">SALIDA A TUS EQUIPOS</h3>
+              <div class="energy-voltage"><span id="output-voltage">—</span><span class="energy-unit">V</span></div>
+              <div class="output-frequency" aria-label="Frecuencia de salida"><span id="frequency">—</span><span>Hz</span></div>
+            </div>
+
+            <div class="energy-battery">
+              <svg class="energy-link battery-link flow-battery" viewBox="0 0 32 60" aria-hidden="true">
+                <path class="flow-track" d="M16 60V0"/><path class="flow-active" d="M16 60V0"/><path class="flow-motion" d="M16 60V0"/>
+                <path class="flow-chevron" d="m10 35 6-6 6 6"/>
+              </svg>
+              <svg class="energy-link battery-link-mobile flow-battery" viewBox="0 0 80 28" preserveAspectRatio="none" aria-hidden="true">
+                <path class="flow-track" d="M80 14H0"/><path class="flow-active" d="M80 14H0"/><path class="flow-motion" d="M80 14H0"/>
+                <path class="flow-chevron" d="m40 8-6 6 6 6"/>
+              </svg>
+              <div class="battery-symbol">
+                <svg class="battery-outline" viewBox="0 0 82 124" aria-hidden="true"><path class="battery-terminal" d="M30 14V5c0-2 2-3 4-3h14c2 0 4 1 4 3v9"/><rect class="battery-case" x="7" y="14" width="68" height="104" rx="9"/></svg>
+                <div id="battery-track" class="battery-meter" data-available="false" aria-hidden="true"><span id="battery-bar" class="battery-meter-fill"></span><span class="battery-meter-slots"></span></div>
+              </div>
+              <div class="battery-values">
+                <h3 class="energy-node-label">BATERÍA</h3>
+                <div class="battery-charge" aria-describedby="battery-note"><span id="battery-percent">—</span><span id="battery-unit">%</span></div>
+                <p id="battery-note" class="battery-charge-note">No disponible</p>
+                <div class="battery-voltage-value"><span id="battery-voltage">—</span><span>V</span></div>
+                <div id="battery-runtime" class="sr-only" hidden><span>Autonomía reportada</span><strong id="runtime">No disponible</strong></div>
+              </div>
+            </div>
+          </div>
+        </article>
       </section>
 
       <!-- One chart and recent-event list, shared by Resumen and Historial. -->
@@ -196,6 +267,15 @@
 
     </main>
   </div>
+  <dialog id="critical-dialog" class="critical-dialog" role="alertdialog" aria-labelledby="critical-title" aria-describedby="critical-description">
+    <div class="critical-dialog-icon" aria-hidden="true"><svg viewBox="0 0 32 32"><path d="M13.4 5.1a3 3 0 0 1 5.2 0l11 19a3 3 0 0 1-2.6 4.5H5a3 3 0 0 1-2.6-4.5Z"/><path d="M16 11v7m0 5v.1"/></svg></div>
+    <h2 id="critical-title" tabindex="-1">El UPS requiere atención</h2>
+    <p id="critical-description">Revisa el estado actual de tu equipo.</p>
+    <ul id="critical-list" class="critical-list"></ul>
+    <div id="critical-countdown" class="critical-countdown" hidden><div><span id="critical-countdown-label">Tiempo restante</span><strong id="critical-countdown-time" aria-live="off">—</strong></div><button id="critical-cancel" class="button button-warning" type="button">Cancelar esta acción</button></div>
+    <p id="critical-feedback" class="critical-feedback" role="status" hidden></p>
+    <div class="critical-dialog-actions"><button id="critical-ack" class="button button-primary" type="button">Entendido</button></div>
+  </dialog>
   <div id="toast" class="toast" role="status" hidden></div>
 </body>
 </html>

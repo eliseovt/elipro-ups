@@ -3,12 +3,19 @@
 (() => {
   const themeStorageKey = "elipro-theme";
   let selectedTheme = "dark";
+  let themeTransitionTimer = null;
   try {
     const savedTheme = localStorage.getItem(themeStorageKey);
     if (savedTheme === "light" || savedTheme === "dark") selectedTheme = savedTheme;
   } catch { /* Theme storage is optional; retain the established dark appearance. */ }
 
   function applyTheme(theme, persist = false) {
+    if (persist) {
+      clearTimeout(themeTransitionTimer);
+      const animate = !window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
+      document.documentElement.classList.toggle("theme-transitioning", animate);
+      if (animate) themeTransitionTimer = setTimeout(() => document.documentElement.classList.remove("theme-transitioning"), 350);
+    }
     selectedTheme = theme === "light" ? "light" : "dark";
     document.documentElement.dataset.theme = selectedTheme;
     document.documentElement.style.colorScheme = selectedTheme;
@@ -78,6 +85,13 @@
     incidentsLoaded: false,
     archiveLoaded: false,
     incidentVersion: 0,
+    criticalKnown: new Map(),
+    criticalAcknowledged: new Set(),
+    criticalItems: new Map(),
+    criticalOpen: false,
+    criticalFocusTarget: null,
+    criticalBatterySources: new Set(),
+    criticalCountdownVisible: false,
   };
   const views = {
     overview: { hash: "resumen", title: "Resumen", description: "Lo esencial de tu UPS, en tiempo real." },
@@ -100,6 +114,136 @@
     const parsed = new Date(value);
     return Number.isFinite(parsed.getTime()) ? parsed : null;
   };
+
+  const criticalDefinitions = [
+    { kind: "ups_fault", title: "Falla del UPS", active: (sample) => sample.fault === true ? true : sample.fault === false || ["Line mode", "AVR mode", "Battery mode", "Battery test mode", "Shutdown mode"].includes(sample.raw_status) ? false : null,
+      message: () => "El UPS reporta una falla. Revisa sus indicadores físicos." },
+    { kind: "overload", title: "Sobrecarga del UPS", active: (sample) => finite(sample.load_percent) ? sample.load_percent >= 100 : null,
+      message: (sample) => `Carga reportada: ${numeric(sample.load_percent)} %. La capacidad del UPS está al límite o se ha superado.` },
+    { kind: "battery_low", title: "Batería baja", active: (sample) => {
+      const reported = percentage(sample.battery_percent);
+      if (sample.low_battery === true) state.criticalBatterySources.add("signal");
+      if (reported && sample.battery_percent <= 20) state.criticalBatterySources.add("reported");
+      if (sample.low_battery === true || (reported && sample.battery_percent <= 20)) return true;
+      if (state.criticalBatterySources.size) {
+        return [...state.criticalBatterySources].every((source) => source === "signal" ? sample.low_battery === false : reported && sample.battery_percent > 20) ? false : null;
+      }
+      return sample.low_battery === false || (reported && sample.battery_percent > 20) ? false : null;
+    },
+      message: (sample) => sample.low_battery === true ? "El UPS ha enviado la señal de batería baja." : `Carga reportada de batería: ${numeric(sample.battery_percent)} %.` },
+  ];
+  const criticalKinds = new Set(criticalDefinitions.map((definition) => definition.kind));
+
+  function telemetryContext() {
+    if (!state.serviceAvailable) return { sample: null, quality: state.stopAcknowledged ? "stopped" : state.lastStatusAt ? "disconnected" : "starting", mode: "unknown" };
+    const connection = state.status?.connection || {};
+    if (connection.state !== "connected") return { sample: null, quality: connection.state === "stale" ? "stale" : "disconnected", mode: "unknown" };
+    const sample = state.status?.sample;
+    const stamp = parseDate(sample?.timestamp);
+    const age = stamp ? (Date.now() - stamp.getTime()) / 1000 : null;
+    if (!sample || sample.connected === false || !stamp || age < -5 || age > 15) return { sample: null, quality: sample ? "stale" : "starting", mode: "unknown" };
+    return { sample, quality: "live", mode: sample.fault === true ? "fault" : sample.on_battery === true ? "battery" : sample.on_battery === false ? "line" : "unknown" };
+  }
+
+  function acknowledgeCritical(closeDialog = true) {
+    if (!state.criticalOpen) return;
+    for (const kind of state.criticalItems.keys()) {
+      if (state.criticalKnown.get(kind) === true) state.criticalAcknowledged.add(kind);
+    }
+    state.criticalItems.clear();
+    state.criticalOpen = false;
+    const dialog = $("critical-dialog");
+    if (closeDialog && dialog.open) dialog.close();
+    const previous = state.criticalFocusTarget;
+    state.criticalFocusTarget = null;
+    const focusable = previous && previous !== document.body && previous.isConnected !== false && !previous.disabled && !previous.closest?.("[hidden], [inert]");
+    (focusable ? previous : $("page-title"))?.focus?.({ preventScroll: true });
+  }
+
+  function renderCriticalCountdown() {
+    const protection = state.status?.protection;
+    const visible = state.criticalOpen && !state.stopAcknowledged && protection?.state === "countdown";
+    $("critical-countdown").hidden = !visible;
+    if (!visible) { state.criticalCountdownVisible = false; return; }
+    if (!state.criticalCountdownVisible) $("critical-feedback").hidden = true;
+    state.criticalCountdownVisible = true;
+    const label = protection.simulation ? "Cuenta atrás de prueba" : state.status?.policy?.action === "hibernate" ? "Hibernación programada" : "Apagado programado";
+    setText("critical-countdown-label", `${label}. Entendido no cancela esta cuenta atrás.${!state.serviceAvailable ? " Estado sin confirmar." : ""}`);
+    setText("critical-countdown-time", $("countdown").textContent);
+    $("critical-cancel").textContent = protection.simulation ? "Cancelar prueba" : "Cancelar esta acción";
+    $("critical-cancel").disabled = !state.serviceAvailable || !state.token || !!state.mutation;
+  }
+
+  function renderCriticalAlerts(sample, live) {
+    if (live && sample) {
+      for (const definition of criticalDefinitions) {
+        const active = definition.active(sample);
+        if (active === null) {
+          if (state.criticalItems.has(definition.kind)) state.criticalItems.get(definition.kind).status = "unconfirmed";
+          continue;
+        }
+        state.criticalKnown.set(definition.kind, active);
+        if (!active) state.criticalAcknowledged.delete(definition.kind);
+        if (!active && definition.kind === "battery_low") state.criticalBatterySources.clear();
+        if (active && !state.criticalAcknowledged.has(definition.kind)) {
+          const item = state.criticalItems.get(definition.kind) || { definition };
+          item.status = "active";
+          item.message = definition.message(sample);
+          state.criticalItems.set(definition.kind, item);
+        } else if (state.criticalItems.has(definition.kind)) {
+          const item = state.criticalItems.get(definition.kind);
+          item.status = active ? "active" : "resolved";
+        }
+      }
+    } else {
+      for (const item of state.criticalItems.values()) item.status = "unconfirmed";
+    }
+    if (!state.criticalItems.size) return;
+    const items = criticalDefinitions.map((definition) => state.criticalItems.get(definition.kind)).filter(Boolean);
+    const active = items.filter((item) => item.status === "active");
+    const unconfirmed = items.some((item) => item.status === "unconfirmed");
+    setText("critical-title", active.length ? active[0].definition.title : unconfirmed ? "Estado sin confirmar" : "Alerta resuelta");
+    setText("critical-description", active.length ? "El UPS requiere tu atención. Revisa las condiciones detectadas." : unconfirmed ? "No hay información suficiente para confirmar las condiciones detectadas. Revisa el estado y la conexión con el monitor." : "El UPS ya no reporta estas condiciones. El incidente permanece en el registro.");
+    const list = $("critical-list");
+    const signature = items.map((item) => `${item.definition.kind}:${item.status}:${item.message}`).join("|");
+    if (list.dataset.signature !== signature) {
+      list.dataset.signature = signature;
+      list.replaceChildren(...items.map((item) => {
+        if (!item.element) {
+          item.element = document.createElement("li");
+          item.titleElement = document.createElement("strong");
+          item.messageElement = document.createElement("p");
+          item.stateElement = document.createElement("span");
+          item.stateElement.className = "critical-condition-state";
+          item.element.append(item.titleElement, item.messageElement, item.stateElement);
+        }
+        const row = item.element;
+        row.dataset.kind = item.definition.kind;
+        row.dataset.state = item.status;
+        item.titleElement.textContent = item.definition.title;
+        item.messageElement.textContent = item.message;
+        item.stateElement.textContent = { active: "Activa", resolved: "Resuelta", unconfirmed: "Sin confirmar" }[item.status];
+        return row;
+      }));
+    }
+    const dialog = $("critical-dialog");
+    dialog.dataset.state = active.length ? "active" : unconfirmed ? "unconfirmed" : "resolved";
+    if (!state.criticalOpen) {
+      state.criticalFocusTarget = document.activeElement;
+      state.criticalOpen = true;
+      $("critical-feedback").hidden = true;
+      dialog.showModal();
+      $("critical-title").focus({ preventScroll: true });
+    }
+    renderCriticalCountdown();
+  }
+
+  function refreshTelemetry() {
+    const context = telemetryContext();
+    renderConnection(state.status?.connection || {}, context.sample, context);
+    renderSample(context.sample);
+    renderCriticalAlerts(context.sample, context.quality === "live");
+  }
 
   function setText(id, value) {
     const element = $(id);
@@ -244,6 +388,7 @@
     const enabled = !!state.status?.policy?.enabled;
     $("save-policy").disabled = unavailable || busy;
     $("cancel-shutdown").disabled = unavailable || busy;
+    $("critical-cancel").disabled = unavailable || busy || state.status?.protection?.state !== "countdown";
     $("test-shutdown").disabled = unavailable || busy || enabled;
     $("policy-form").querySelectorAll("input, select").forEach((field) => { field.disabled = busy; });
     const notificationSettingsMissing = !state.status?.notifications?.settings;
@@ -288,8 +433,7 @@
   function serviceUnavailable(error) {
     state.serviceAvailable = false;
     renderServiceState(error.message);
-    renderConnection(state.status?.connection || {}, null);
-    renderSample(null);
+    refreshTelemetry();
     // Losing this panel's API connection does not cancel the monitor's countdown.
     renderProtection(state.status?.protection || {});
     renderNotifications(state.status?.notifications);
@@ -339,7 +483,10 @@
     }
   }
 
-  function renderConnection(connection, sample) {
+  function renderConnection(connection, sample, context = telemetryContext()) {
+    const diagram = $("energy-diagram");
+    diagram.dataset.mode = context.mode;
+    diagram.dataset.quality = context.quality;
     const badge = $("connection-badge");
     const showConnection = (status, label) => {
       badge.className = `connection-indicator ${status}`;
@@ -349,14 +496,12 @@
     if (!state.serviceAvailable) {
       showConnection("disconnected", state.stopAcknowledged ? "Elipro detenido" : "Monitor sin conexión");
       $("connection-notice").hidden = true;
-      const card = document.querySelector(".power-card");
-      card.classList.remove("is-online", "is-battery", "has-fault");
       setText("power-state", state.stopAcknowledged ? "Monitor detenido" : "Estado sin confirmar");
       setText("power-detail", state.stopAcknowledged ? "Inicia Elipro de nuevo para volver a vigilar el UPS y mostrar sus lecturas." : "El panel necesita comunicarse con el monitor para mostrar lecturas actuales.");
       updateFreshness();
       return;
     }
-    const status = ["connected", "stale", "disconnected"].includes(connection.state) ? connection.state : "disconnected";
+    const status = context.quality === "live" ? "connected" : context.quality === "stale" || context.quality === "starting" ? "stale" : "disconnected";
     showConnection(status, { connected: "UPS conectado", stale: "Datos desactualizados", disconnected: "Sin conexión al UPS" }[status]);
     const notice = $("connection-notice");
     notice.hidden = status === "connected";
@@ -366,12 +511,8 @@
         : "No se reciben lecturas del UPS. Revisa el cable USB y la conexión del servicio de lectura.";
       notice.textContent = `${prefix}${connection.error ? ` ${String(connection.error)}` : ""}`;
     }
-    const card = document.querySelector(".power-card");
-    card.classList.toggle("is-online", !!sample && sample.on_battery === false && !sample.fault);
-    card.classList.toggle("is-battery", !!sample && sample.on_battery === true && !sample.fault);
-    card.classList.toggle("has-fault", !!sample && !!sample.fault);
     if (!sample) {
-      setText("power-state", status === "stale" ? "Lecturas en pausa" : "UPS sin conexión");
+      setText("power-state", context.quality === "starting" ? "Esperando al UPS" : status === "stale" ? "Lecturas en pausa" : "UPS sin conexión");
       setText("power-detail", "Esperando una lectura válida para mostrar el estado.");
     } else if (sample.fault) {
       setText("power-state", "El UPS reporta una falla");
@@ -380,7 +521,7 @@
       setText("power-state", "Usando batería");
       setText("power-detail", "El UPS está alimentando tus equipos con su batería.");
     } else if (sample.on_battery === false) {
-      setText("power-state", "Red eléctrica activa");
+      setText("power-state", sample.raw_status === "AVR mode" ? "Red eléctrica · Regulación AVR" : "Red eléctrica activa");
       setText("power-detail", "Tus equipos reciben energía de la red eléctrica.");
     } else {
       setText("power-state", "UPS conectado");
@@ -401,7 +542,7 @@
     setText("output-voltage", numeric(data.output_voltage, 1));
     setText("battery-percent", numeric(battery));
     setText("battery-unit", "%");
-    $("battery-track").hidden = !finite(battery);
+    $("battery-track").dataset.available = String(finite(battery));
     $("battery-note").hidden = false;
     setText("battery-note", reported ? "Carga reportada" : estimated ? "Carga estimada" : "No disponible");
     $("battery-note").title = estimated ? `Estimación informativa · ${data.battery_estimate_method}. La protección usa la alerta real del UPS y los límites configurados.` : "";
@@ -410,28 +551,15 @@
     setText("battery-voltage", numeric(data.battery_voltage, 2));
     setText("runtime", runtimeLabel(data.runtime_seconds));
     $("battery-runtime").hidden = !finite(data.runtime_seconds) || data.runtime_seconds <= 0;
-    $("battery-bar").style.width = finite(battery) ? `${battery}%` : "0%";
+    $("battery-bar").style.height = finite(battery) ? `${battery}%` : "0%";
     $("battery-bar").classList.toggle("low", data.low_battery === true || (reported && battery <= 20));
-    $("load-bar").style.width = finite(data.load_percent) ? `${Math.max(0, Math.min(100, data.load_percent))}%` : "0%";
+    $("load-bar").style.height = finite(data.load_percent) ? `${Math.max(0, Math.min(100, data.load_percent))}%` : "0%";
     $("load-bar").classList.toggle("high", finite(data.load_percent) && data.load_percent >= 80);
-    const batteryTag = $("battery-tag");
-    batteryTag.className = "battery-status";
-    if (!sample) {
-      batteryTag.textContent = "Sin lectura";
-    } else if (data.low_battery === true || (reported && battery <= 20)) {
-      batteryTag.textContent = "Batería baja";
-      batteryTag.classList.add("warning");
-    } else if (data.on_battery === true) {
-      batteryTag.textContent = "En uso";
-      batteryTag.classList.add("warning");
-    } else if (data.low_battery === false) {
-      batteryTag.textContent = "Sin alerta";
-    } else {
-      batteryTag.textContent = "Sin estado";
-    }
-    $("load-footer").hidden = !finite(data.estimated_watts);
-    setText("watts", `${data.watts_is_estimate && finite(data.estimated_watts) ? "≈ " : ""}${numeric(data.estimated_watts)} W`);
-    setText("watts-label", !finite(data.estimated_watts) ? "Potencia no disponible" : data.watts_is_estimate ? "Estimación según carga nominal" : "Potencia reportada por el UPS");
+    const meter = $("load-meter");
+    meter.dataset.available = String(finite(data.load_percent));
+    if (finite(data.load_percent)) meter.setAttribute("aria-valuenow", String(Math.max(0, Math.min(100, data.load_percent))));
+    else meter.removeAttribute("aria-valuenow");
+    meter.setAttribute("aria-valuetext", finite(data.load_percent) ? `${numeric(data.load_percent)} % de carga del UPS${data.load_percent >= 100 ? "; capacidad al límite o sobrecarga" : ""}` : "Carga del UPS no disponible");
   }
 
   function updateFreshness() {
@@ -490,7 +618,7 @@
     } else if (notify) {
       const fresh = sorted.filter((event) => !state.seenEvents.has(eventKey(event)));
       state.seenEvents = new Set(sorted.map(eventKey));
-      const relevant = fresh.filter((event) => /power|connection|battery_low|overload|fault|policy_countdown|policy_unknown|policy_action_failed/.test(String(event.kind || "")));
+      const relevant = fresh.filter((event) => !criticalKinds.has(event.kind) && /power|connection|policy_countdown|policy_unknown|policy_action_failed/.test(String(event.kind || "")));
       if (relevant.length) {
         const newest = relevant[0];
         const severity = String(newest.severity || "");
@@ -951,12 +1079,14 @@
     const protection = state.status?.protection;
     if (state.stopAcknowledged || !protection || protection.state !== "countdown") {
       setText("countdown", "—");
+      renderCriticalCountdown();
       return;
     }
     const deadline = parseDate(protection.deadline);
     const seconds = deadline ? Math.max(0, Math.ceil((deadline.getTime() - Date.now()) / 1000)) : finite(protection.countdown_remaining) ? Math.max(0, Math.ceil(protection.countdown_remaining)) : null;
     setText("countdown", seconds === null ? "—" : `${String(Math.floor(seconds / 60)).padStart(2, "0")}:${String(seconds % 60).padStart(2, "0")}`);
     $("countdown").title = !state.serviceAvailable ? "Referencia del último plazo confirmado. La ejecución y la cancelación requieren confirmación del monitor." : "Tiempo restante comunicado por el monitor.";
+    renderCriticalCountdown();
   }
 
   function applyStatus(data) {
@@ -972,10 +1102,7 @@
     $("development-notice").hidden = !data.meta?.dry_run;
     $("bridge-policy-note").hidden = data.meta?.bridge_required !== true;
     renderServiceState();
-    const connection = data.connection || {};
-    const sample = connection.state === "connected" ? data.sample : null;
-    renderConnection(connection, sample);
-    renderSample(sample);
+    refreshTelemetry();
     renderEvents(data.events);
     renderPolicy(data.policy || {});
     renderProtection(data.protection || {});
@@ -1337,21 +1464,45 @@
       toast(error.message, true);
     } finally { state.mutation = null; updateMutationControls(); }
   });
-  $("cancel-shutdown").addEventListener("click", async () => {
+  async function cancelProtection() {
     if (!state.serviceAvailable || state.mutation) return;
     state.mutation = "cancel";
     state.statusGeneration += 1;
     updateMutationControls();
+    $("critical-feedback").hidden = true;
     try {
       const simulation = !!state.status?.protection?.simulation;
       const result = await post("/api/protection/cancel", {});
       applyStatus(result);
       if (["countdown", "executed"].includes(result.protection.state)) throw new Error("El monitor aún reporta una cuenta atrás o una acción enviada a Windows.");
       toast(simulation ? "El monitor confirmó la cancelación de la prueba." : result.protection.state === "cancelled" ? "Cuenta atrás cancelada. La protección volverá a evaluarse en el próximo corte." : "El monitor confirma que no hay una cuenta atrás activa.");
+      if (state.criticalOpen) {
+        setText("critical-feedback", "El monitor confirmó que no hay una cuenta atrás activa.");
+        $("critical-feedback").hidden = false;
+      }
     } catch (error) {
       if (error.communicationFailure) serviceUnavailable(error);
       toast(`No se confirmó la cancelación. ${error.message}`, true);
+      if (state.criticalOpen) {
+        setText("critical-feedback", `No se confirmó la cancelación. ${error.message}`);
+        $("critical-feedback").hidden = false;
+      }
     } finally { state.mutation = null; updateMutationControls(); }
+  }
+  $("cancel-shutdown").addEventListener("click", cancelProtection);
+  $("critical-cancel").addEventListener("click", cancelProtection);
+  $("critical-ack").addEventListener("click", () => acknowledgeCritical());
+  $("critical-dialog").addEventListener("cancel", (event) => { event.preventDefault(); acknowledgeCritical(); });
+  $("critical-dialog").addEventListener("close", () => acknowledgeCritical(false));
+  $("critical-dialog").addEventListener("keydown", (event) => {
+    if (event.key !== "Tab" || !state.criticalOpen) return;
+    const buttons = [!$("critical-countdown").hidden && !$("critical-cancel").disabled ? $("critical-cancel") : null, $("critical-ack")].filter(Boolean);
+    const first = buttons[0], last = buttons.at(-1);
+    if (event.shiftKey && (document.activeElement === first || document.activeElement === $("critical-title"))) {
+      event.preventDefault(); last.focus();
+    } else if (!event.shiftKey && document.activeElement === last) {
+      event.preventDefault(); first.focus();
+    }
   });
 
   $("refresh-records").addEventListener("click", refreshRecords);
@@ -1426,7 +1577,9 @@
   setInterval(loadStatus, 2000);
   setInterval(loadHistory, 30000);
   setInterval(() => { if (state.observationLoaded) loadObservation(); }, 60000);
-  setInterval(() => { updateFreshness(); updateCountdown(); }, 1000);
+  setInterval(() => { if (state.status) refreshTelemetry(); updateCountdown(); }, 1000);
+  window.addEventListener?.("focus", () => { if (state.status) refreshTelemetry(); });
+  document.addEventListener?.("visibilitychange", () => { if (state.status) refreshTelemetry(); });
   }
 
   if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", initializeApp, { once: true });

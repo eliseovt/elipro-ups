@@ -10,6 +10,8 @@ Elipro es un proyecto independiente en desarrollo. No es software oficial de For
 
 - Lectura de alimentación de red/batería, voltajes de entrada y salida, frecuencia, carga del UPS, voltaje de batería y señales de batería baja o falla.
 - Seis secciones: **Resumen, Incidentes, Historial, Protección, Avisos y Sistema**; temas claro y oscuro con selector sol/luna. Resumen e Historial comparten el gráfico completo y los eventos recientes, conservando sus filtros al navegar.
+- Resumen con un diagrama de energía: red, UPS, equipos y batería. Integra la carga del UPS en su frontal y mantiene la frecuencia junto a la salida; los recorridos solo se activan con lecturas recientes y suministro confirmado.
+- Ventana modal global para batería baja, sobrecarga y falla del UPS. Agrupa condiciones reales, permite reconocerlas sin cancelar la protección y mantiene accesible la cancelación de una cuenta atrás desde la misma ventana.
 - Avisos de Windows, sonido e icono de bandeja aunque se cierre el navegador.
 - Avisos eléctricos retenidos durante bloqueo o desconexión de sesión, con acuse de aceptación nativa y recuperación del contexto al reanudar.
 - Historial local SQLite, gráficas, incidentes, filtros, exportación CSV, diagnóstico y respaldo ZIP.

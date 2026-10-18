@@ -12,7 +12,8 @@ const html = fs.readFileSync(path.join(root, "static/index.html"), "utf8");
 const source = fs.readFileSync(path.join(root, "static/app.js"), "utf8");
 
 class Element {
-  constructor() {
+  constructor(ownerDocument = null) {
+    this.ownerDocument = ownerDocument;
     this.textContent = "";
     this.value = "";
     this.checked = false;
@@ -23,6 +24,10 @@ class Element {
     this.attributes = {};
     this.listeners = {};
     this.children = [];
+    this.open = false;
+    this.isConnected = true;
+    this.modalShows = 0;
+    this.modalCloses = 0;
     this.selectors = new Map();
     const classes = new Set();
     this.classList = {
@@ -35,30 +40,48 @@ class Element {
       contains: (item) => classes.has(item),
     };
   }
-  setAttribute(name, value) { this.attributes[name] = value; }
+  setAttribute(name, value) { this.attributes[name] = String(value); }
   getAttribute(name) { return this.attributes[name] ?? null; }
-  append(...children) { this.children.push(...children); }
-  replaceChildren(...children) { this.children = children; }
-  get lastChild() { if (!this.children.length) this.children.push(new Element()); return this.children.at(-1); }
+  removeAttribute(name) { delete this.attributes[name]; }
+  append(...children) { children.forEach((child) => { if (child && typeof child === "object") child.parentElement = this; }); this.children.push(...children); }
+  replaceChildren(...children) { this.children = []; this.append(...children); }
+  get lastChild() { if (!this.children.length) this.append(new Element(this.ownerDocument)); return this.children.at(-1); }
   get lastElementChild() { return this.lastChild; }
   querySelector(selector) {
-    if (!this.selectors.has(selector)) this.selectors.set(selector, new Element());
+    if (!this.selectors.has(selector)) this.selectors.set(selector, new Element(this.ownerDocument));
     return this.selectors.get(selector);
   }
   querySelectorAll() { return this.fields || []; }
   addEventListener(name, callback) { this.listeners[name] = callback; }
   reportValidity() { return true; }
   scrollIntoView() {}
-  focus() { this.focused = true; }
+  focus() { this.focused = true; if (this.ownerDocument) this.ownerDocument.activeElement = this; }
   click() { this.clicked = true; }
-  remove() { this.removed = true; }
-  emit(name, details = {}) { return this.listeners[name]?.({ preventDefault() {}, ...details }); }
+  remove() { this.removed = true; this.isConnected = false; }
+  contains(element) { return element === this || this.children.some((child) => child?.contains?.(element)); }
+  showModal() { this.open = true; this.modalShows += 1; }
+  close() { if (!this.open) return; this.open = false; this.modalCloses += 1; this.emit("close"); }
+  emit(name, details = {}) {
+    const event = { defaultPrevented: false, target: this, currentTarget: this,
+      preventDefault() { this.defaultPrevented = true; }, ...details };
+    const result = this.listeners[name]?.(event);
+    if (name === "cancel" && !event.defaultPrevented) this.close();
+    return result;
+  }
 }
+
+function liveSample(changes = {}, at = Date.now()) {
+  return { timestamp: new Date(at).toISOString(), input_voltage: 220, output_voltage: 220,
+    frequency_hz: 59.9, load_percent: 8, battery_voltage: 27.4, battery_percent: null,
+    low_battery: false, fault: false, on_battery: false, raw_status: "Line mode", ...changes };
+}
+
+const textOf = (element) => [element?.textContent || "", ...(element?.children || []).map(textOf)].join(" ");
 
 function snapshot(settings = {}) {
   return {
     csrf_token: "test-token",
-    connection: { state: "connected" }, sample: null, events: [],
+    connection: { state: "connected" }, sample: liveSample(), events: [],
     meta: { source: "native" },
     policy: { enabled: false, on_battery_seconds: 300, countdown_seconds: 60, action: "shutdown" },
     protection: { state: "idle" },
@@ -71,7 +94,25 @@ function snapshot(settings = {}) {
 }
 
 function harness(historyOptions = {}) {
-  const elements = new Map([...html.matchAll(/\bid="([^"]+)"/g)].map((match) => [match[1], new Element()]));
+  let documentRef;
+  let now = historyOptions.now ?? Date.now();
+  class TestDate extends Date {
+    constructor(...values) { super(...(values.length ? values : [now])); }
+    static now() { return now; }
+  }
+  const elements = new Map([...html.matchAll(/<[a-z][^>]*\bid="([^"]+)"[^>]*>/gi)].map((match) => {
+    const element = new Element();
+    element.tagName = match[0].match(/^<([a-z]+)/i)[1].toUpperCase();
+    for (const attribute of match[0].matchAll(/\s([\w:-]+)(?:="([^"]*)")?/g)) {
+      const [, name, value = ""] = attribute;
+      element.setAttribute(name, value);
+      if (name.startsWith("data-")) element.dataset[name.slice(5).replace(/-([a-z])/g, (_all, letter) => letter.toUpperCase())] = value;
+      if (["hidden", "disabled", "open"].includes(name)) element[name] = true;
+      if (name === "class") { element.className = value; element.classList.add(...value.split(/\s+/)); }
+      if (name === "value") element.value = value;
+    }
+    return [match[1], element];
+  }));
   const get = (id) => {
     assert.ok(elements.has(id), `HTML must include #${id}`);
     return elements.get(id);
@@ -81,6 +122,8 @@ function harness(historyOptions = {}) {
   get("notifications-form").fields = ["notifications-enabled", "notifications-sound", "notifications-repeat", "notifications-persistent"].map(get);
   const selectors = new Map();
   const intervals = [];
+  const timeouts = new Map();
+  let timeoutId = 0;
   const calls = [];
   const downloads = [];
   const body = new Element();
@@ -99,25 +142,29 @@ function harness(historyOptions = {}) {
   const windowListeners = {};
   const navigationScrolls = [];
   const location = { hash: historyOptions.hash || "" };
-  const context = vm.createContext({
-    document: {
+  documentRef = {
       body,
       documentElement: rootElement,
       readyState: historyOptions.loading ? "loading" : "complete",
       addEventListener: (name, callback) => { documentListeners[name] = callback; },
       getElementById: (id) => domReady ? get(id) : null,
       querySelector: (selector) => {
-        if (!selectors.has(selector)) selectors.set(selector, new Element());
+        if (!selectors.has(selector)) selectors.set(selector, new Element(documentRef));
         return selectors.get(selector);
       },
       querySelectorAll: (selector) => selector === ".sidebar-nav [data-view]" ? nav : selector === "[data-page]" ? pages : selector === "[data-go-view]" ? shortcuts : selector === "[data-metric]" ? metrics : [],
-      createElement: () => new Element(), createElementNS: () => new Element(),
-      createTextNode: (text) => Object.assign(new Element(), { textContent: text }),
-    },
+      createElement: () => new Element(documentRef), createElementNS: () => new Element(documentRef),
+      createTextNode: (text) => Object.assign(new Element(documentRef), { textContent: text }),
+      activeElement: body,
+      contains: (element) => element?.isConnected === true,
+  };
+  [...elements.values(), body, rootElement, ...nav, ...shortcuts, ...metrics].forEach((element) => { element.ownerDocument = documentRef; });
+  const context = vm.createContext({
+    document: documentRef,
     window: { location, addEventListener: (name, callback) => { windowListeners[name] = callback; },
       scrollTo: (options) => { navigationScrolls.push(options); },
       history: { replaceState: (_state, _title, url) => { location.hash = url; } },
-      matchMedia: () => ({ matches: true }), URL: {
+      matchMedia: (query) => ({ matches: query.includes("prefers-reduced-motion") ? historyOptions.reducedMotion === true : true }), URL: {
       createObjectURL: (blob) => { downloads.push(blob); return "blob:test-download"; }, revokeObjectURL() {},
     } },
     localStorage: {
@@ -128,9 +175,10 @@ function harness(historyOptions = {}) {
         storageWrites.push({ key, value });
       },
     },
-    setTimeout: () => 1, clearTimeout() {},
+    setTimeout: (callback, ms) => { timeouts.set(++timeoutId, { callback, due: now + ms }); return timeoutId; },
+    clearTimeout: (id) => timeouts.delete(id),
     setInterval: (callback, ms) => intervals.push({ callback, ms }),
-    Date, Intl, AbortController, TypeError, URLSearchParams,
+    Date: TestDate, Intl, AbortController, TypeError, URLSearchParams,
     fetch: (url, options = {}) => {
       if (url.startsWith("/api/history")) {
         historyCalls.push(url);
@@ -159,6 +207,11 @@ function harness(historyOptions = {}) {
   const poll = () => intervals.find((item) => item.ms === 2000).callback();
   const pollHistory = () => intervals.find((item) => item.ms === 30000).callback();
   return { get, calls, historyCalls, pendingHistory, poll, pollHistory, downloads, body, rootElement, nav, pages, shortcuts, metrics, location, intervals, navigationScrolls, storedPreferences, storageWrites,
+    document: documentRef,
+    now: () => now,
+    advance: (milliseconds) => { now += milliseconds; },
+    tick: () => intervals.filter((entry) => entry.ms === 1000).forEach((entry) => entry.callback()),
+    runTimeouts: () => { for (const [id, entry] of [...timeouts]) if (entry.due <= now) { timeouts.delete(id); entry.callback(); } },
     ready: () => { domReady = true; context.document.readyState = "interactive"; documentListeners.DOMContentLoaded?.(); delete documentListeners.DOMContentLoaded; },
     open: (view) => nav[views.indexOf(view)].emit("click"),
     hashChange: (hash) => { location.hash = hash; windowListeners.hashchange?.(); },
@@ -167,6 +220,22 @@ function harness(historyOptions = {}) {
 }
 
 async function flush() { await new Promise((resolve) => setImmediate(resolve)); }
+async function pushStatus(ui, data) {
+  ui.poll();
+  const request = ui.calls.findLast((call) => call.url === "/api/status");
+  request.respond(data);
+  await flush();
+}
+
+async function currentUi(changes = {}, options = {}) {
+  const ui = harness(options);
+  const data = snapshot();
+  data.sample = liveSample(changes, ui.now());
+  ui.calls[0].respond(data);
+  await flush();
+  return { ui, data };
+}
+
 async function connected(settings) {
   const ui = harness();
   ui.calls[0].respond(snapshot(settings));
@@ -333,7 +402,7 @@ test("healthy history and older snapshots do not add a warning", async () => {
 test("history failure is separate from USB readings, notices and disabled shutdown", async () => {
   const ui = harness();
   const data = snapshot();
-  data.sample = { timestamp: new Date().toISOString(), input_voltage: 219, on_battery: false };
+  data.sample = liveSample({ input_voltage: 219 });
   data.history = { available: false, state: "degraded", pending: 3, dropped: 2, message: "No se pudo guardar <dato>." };
   ui.calls[0].respond(data);
   await flush();
@@ -485,7 +554,7 @@ test("archive failures stay inside their section and incident errors do not mark
 test("historical incidents without recovery do not claim an ongoing outage or communication failure", async () => {
   const ui = harness();
   const data = snapshot();
-  data.sample = { timestamp: new Date().toISOString(), on_battery: false, low_battery: false, fault: false, input_voltage: 220, output_voltage: 220 };
+  data.sample = liveSample();
   ui.calls[0].respond(data);
   await flush();
   const pending = ui.get("refresh-records").emit("click");
@@ -622,6 +691,8 @@ test("exiting the monitor requires an explicit second click and never requests a
   await pending;
   assert.equal(ui.get("test-notifications").disabled, true);
   assert.equal(ui.get("health-state").textContent, "Detenido");
+  assert.equal(ui.get("energy-diagram").dataset.quality, "stopped");
+  assert.equal(ui.get("energy-diagram").dataset.mode, "unknown");
   assert.match(ui.get("service-notice").textContent, /se detuvo por tu solicitud/);
   assert.match(ui.get("health-message").textContent, /Detuviste Elipro/);
   assert.equal(ui.get("connection-badge").lastElementChild.textContent, "Elipro detenido");
@@ -973,7 +1044,7 @@ test("Resumen voltage chart respects collection gaps and omits unsupported batte
     { timestamp: new Date(now - 10000).toISOString(), input_voltage: 220, output_voltage: 220, gap_before: true },
   ] });
   const data = snapshot();
-  data.sample = { runtime_seconds: null, battery_voltage: 27.4 };
+  data.sample = liveSample({ runtime_seconds: null, battery_voltage: 27.4 });
   ui.calls[0].respond(data);
   await flush();
   const chart = ui.get("history-chart");
@@ -1118,7 +1189,7 @@ test("Resumen and Historial share one chart and recent-event filter without extr
   assert.equal(ui.intervals.filter((item) => item.ms === 30000).length, 1);
   const ids = [...html.matchAll(/\bid="([^"]+)"/g)].map((match) => match[1]);
   assert.equal(new Set(ids).size, ids.length, "the shared surface must not duplicate any IDs");
-  assert.doesNotMatch(html, /summary-history-spark|summary-health|summary-last-incident|details-row|battery-art/);
+  assert.doesNotMatch(html, /summary-history-spark|summary-health|summary-last-incident|details-row/);
 });
 
 for (const outcome of ["failure", "success"]) {
@@ -1150,6 +1221,7 @@ for (const outcome of ["failure", "success"]) {
 test("connection point keeps an accessible state for fresh, stale and disconnected UPS data", async () => {
   const ui = harness({ navigation: true });
   const data = snapshot();
+  data.sample = liveSample();
   for (const [state, label] of [["connected", "UPS conectado"], ["stale", "Datos desactualizados"], ["disconnected", "Sin conexión al UPS"]]) {
     if (state !== "connected") ui.poll();
     data.connection.state = state;
@@ -1159,33 +1231,35 @@ test("connection point keeps an accessible state for fresh, stale and disconnect
     assert.equal(ui.get("connection-badge").title, label);
     assert.equal(ui.get("connection-badge").lastElementChild.textContent, label);
   }
-  assert.match(html, /class="sidebar-equipment"><span id="connection-badge"[^>]*role="status"/);
+  assert.equal(ui.get("connection-badge").getAttribute("role"), "status");
+  const model = html.match(/<div class="diagram-model">([\s\S]*?)<\/div>/)?.[1];
+  assert.ok(model?.includes('id="connection-badge"') && model.includes("FORZA NT-2402PRO"));
   assert.match(html, /class="sr-only">Conectando/);
 });
 
 test("battery charge is primary, estimates are labelled and voltage stays secondary", async () => {
   const ui = harness();
   const data = snapshot();
-  data.sample = { battery_percent: 83, battery_percent_estimate: 40, battery_estimate_method: "fixture_v1", battery_voltage: 27.41, low_battery: false, on_battery: false };
+  data.sample = liveSample({ battery_percent: 83, battery_percent_estimate: 40, battery_estimate_method: "fixture_v1", battery_voltage: 27.41 });
   ui.calls[0].respond(data);
   await flush();
   assert.equal(ui.get("battery-percent").textContent, "83");
   assert.equal(ui.get("battery-unit").textContent, "%");
   assert.equal(ui.get("battery-voltage").textContent, "27.41");
   assert.equal(ui.get("battery-note").textContent, "Carga reportada");
-  assert.equal(ui.get("battery-tag").textContent, "Sin alerta");
+  assert.equal(ui.get("critical-dialog").open, false);
   data.sample.battery_percent = null;
   data.sample.on_battery = true;
   ui.poll(); ui.calls.at(-1).respond(data); await flush();
   assert.equal(ui.get("battery-percent").textContent, "40");
   assert.equal(ui.get("battery-note").textContent, "Carga estimada");
   assert.match(ui.get("battery-note").title, /fixture_v1/);
-  assert.equal(ui.get("battery-tag").textContent, "En uso");
-  assert.equal(ui.get("battery-bar").style.width, "40%");
+  assert.equal(ui.get("energy-diagram").dataset.mode, "battery");
+  assert.equal(ui.get("battery-bar").style.height, "40%");
   data.sample.low_battery = true;
   ui.poll(); ui.calls.at(-1).respond(data); await flush();
-  assert.equal(ui.get("battery-tag").textContent, "Batería baja");
-  assert.equal(ui.get("battery-tag").classList.contains("warning"), true);
+  assert.equal(ui.get("critical-dialog").open, true);
+  assert.match(textOf(ui.get("critical-list")), /Batería baja/);
 });
 
 test("invalid or unproven percentages stay unavailable and an estimate cannot fabricate an alarm", async () => {
@@ -1200,16 +1274,17 @@ test("invalid or unproven percentages stay unavailable and an estimate cannot fa
   ];
   for (const [index, value] of cases.entries()) {
     if (index) ui.poll();
-    data.sample = { battery_voltage: 25, low_battery: false, on_battery: false, ...value };
+    data.sample = liveSample({ battery_voltage: 25, ...value });
     ui.calls.at(-1).respond(data); await flush();
     assert.equal(ui.get("battery-percent").textContent, index < 3 ? "—" : "0");
     assert.equal(ui.get("battery-note").textContent, index < 3 ? "No disponible" : index === 3 ? "Carga estimada" : "Carga reportada");
-    assert.equal(ui.get("battery-track").hidden, index < 3);
-    assert.equal(ui.get("battery-tag").textContent, index === 4 ? "Batería baja" : "Sin alerta");
+    assert.equal(ui.get("battery-track").dataset.available, String(index >= 3));
+    assert.equal(ui.get("critical-dialog").open, index === 4);
   }
-  data.sample = { battery_voltage: 25, battery_percent_estimate: 5, battery_estimate_method: "fixture_v1" };
+  ui.get("critical-ack").emit("click");
+  data.sample = liveSample({ battery_voltage: 25, battery_percent_estimate: 5, battery_estimate_method: "fixture_v1" });
   ui.poll(); ui.calls.at(-1).respond(data); await flush();
-  assert.equal(ui.get("battery-tag").textContent, "Sin estado");
+  assert.equal(ui.get("critical-dialog").open, false);
   assert.equal(ui.get("policy-battery-field").hidden, true, "an estimate does not enable the native power-policy threshold");
   assert.equal(ui.get("protection-alert").hidden, true);
 });
@@ -1273,4 +1348,358 @@ test("the shared chart uses its mobile width for readable axes and correctly pos
   assert.doesNotMatch(ui.get("chart-tooltip").style.left, /NaN/);
   chart.emit("pointerleave");
   assert.equal(ui.get("chart-tooltip").hidden, true);
+});
+
+test("energy flow follows fresh line, AVR, battery and fault telemetry without claiming unknown modes", async () => {
+  const { ui, data } = await currentUi();
+  const diagram = ui.get("energy-diagram");
+  assert.equal(diagram.dataset.mode, "line");
+  assert.equal(diagram.dataset.quality, "live");
+  for (const [changes, mode] of [
+    [{ on_battery: false, raw_status: "AVR mode" }, "line"],
+    [{ on_battery: true, raw_status: "Battery mode", input_voltage: 0 }, "battery"],
+    [{ on_battery: null, raw_status: "Fault mode", fault: true }, "fault"],
+    [{ on_battery: null, raw_status: "Unrecognized mode", fault: false }, "unknown"],
+  ]) {
+    data.sample = liveSample(changes, ui.now());
+    await pushStatus(ui, data);
+    assert.equal(diagram.dataset.mode, mode);
+    assert.equal(diagram.dataset.quality, "live");
+  }
+  assert.equal(ui.calls.some((call) => call.options.method === "POST"), false);
+  assert.doesNotMatch(html, /class="power-card\b|id="battery-tag"/);
+});
+
+test("diagram quality distinguishes unconfirmed, stale and disconnected readings and recovers", async () => {
+  const ui = harness();
+  assert.equal(ui.get("energy-diagram").dataset.mode, "unknown");
+  assert.equal(ui.get("energy-diagram").dataset.quality, "starting");
+  const data = snapshot();
+  data.sample = liveSample({}, ui.now());
+  ui.calls[0].respond(data); await flush();
+  for (const state of ["stale", "disconnected"]) {
+    data.connection.state = state;
+    await pushStatus(ui, data);
+    assert.equal(ui.get("energy-diagram").dataset.mode, "unknown");
+    assert.equal(ui.get("energy-diagram").dataset.quality, state);
+    assert.equal(ui.get("input-voltage").textContent, "—");
+  }
+  data.connection.state = "connected";
+  data.sample = null;
+  await pushStatus(ui, data);
+  assert.equal(ui.get("energy-diagram").dataset.mode, "unknown");
+  assert.notEqual(ui.get("energy-diagram").dataset.quality, "live");
+  for (const timestamp of [undefined, "not-a-date", new Date(ui.now() + 5001).toISOString()]) {
+    data.sample = liveSample({ timestamp }, ui.now());
+    await pushStatus(ui, data);
+    assert.equal(ui.get("energy-diagram").dataset.mode, "unknown");
+    assert.notEqual(ui.get("energy-diagram").dataset.quality, "live");
+  }
+  data.sample = liveSample({}, ui.now());
+  await pushStatus(ui, data);
+  assert.equal(ui.get("energy-diagram").dataset.mode, "line");
+  assert.equal(ui.get("energy-diagram").dataset.quality, "live");
+});
+
+test("a displayed sample expires after fifteen seconds even without another fetch", async () => {
+  const { ui, data } = await currentUi({ battery_percent: 80 });
+  const fetches = ui.calls.length;
+  ui.advance(15000); ui.tick();
+  assert.equal(ui.get("energy-diagram").dataset.quality, "live");
+  ui.advance(1); ui.tick();
+  assert.equal(ui.calls.length, fetches);
+  assert.equal(ui.get("energy-diagram").dataset.mode, "unknown");
+  assert.equal(ui.get("energy-diagram").dataset.quality, "stale");
+  assert.equal(ui.get("battery-percent").textContent, "—");
+  assert.equal(ui.get("load-percent").textContent, "—");
+  data.sample = liveSample({ battery_percent: 79 }, ui.now());
+  await pushStatus(ui, data);
+  assert.equal(ui.get("energy-diagram").dataset.quality, "live");
+  assert.equal(ui.get("battery-percent").textContent, "79");
+});
+
+test("vertical load meter preserves zero, caps the graphic at one hundred and exposes unavailable values", async () => {
+  const { ui, data } = await currentUi({ load_percent: 0 });
+  assert.equal(ui.get("load-meter").getAttribute("role"), "meter");
+  for (const [load, height, label] of [[0, "0%", "0"], [100, "100%", "100"], [130, "100%", "130"], [null, "0%", "—"]]) {
+    data.sample = liveSample({ load_percent: load }, ui.now());
+    await pushStatus(ui, data);
+    assert.equal(ui.get("load-bar").style.height, height);
+    assert.equal(ui.get("load-percent").textContent, label);
+    if (load === null) assert.equal(ui.get("load-meter").getAttribute("aria-valuenow"), null);
+    else assert.equal(ui.get("load-meter").getAttribute("aria-valuenow"), String(Math.min(load, 100)));
+  }
+});
+
+test("vertical battery meter accepts reported and estimated zero without converting estimates into alarms", async () => {
+  const { ui, data } = await currentUi({ battery_percent_estimate: 0, battery_estimate_method: "fixture-v1" });
+  assert.equal(ui.get("battery-percent").textContent, "0");
+  assert.equal(ui.get("battery-bar").style.height, "0%");
+  assert.equal(ui.get("battery-note").textContent, "Carga estimada");
+  assert.equal(ui.get("critical-dialog").open, false);
+  data.sample = liveSample({ battery_percent: 0 }, ui.now());
+  await pushStatus(ui, data);
+  assert.equal(ui.get("battery-percent").textContent, "0");
+  assert.equal(ui.get("battery-bar").style.height, "0%");
+  assert.equal(ui.get("battery-note").textContent, "Carga reportada");
+  assert.equal(ui.get("critical-dialog").open, true);
+  assert.equal(ui.get("critical-list").children[0].dataset.kind, "battery_low");
+});
+
+test("critical dialog opens on initial current alarms and orders fault, overload and real low battery", async () => {
+  const { ui } = await currentUi({ fault: true, load_percent: 130, low_battery: true });
+  assert.equal(ui.get("critical-dialog").open, true);
+  assert.equal(ui.get("critical-dialog").modalShows, 1);
+  assert.equal(ui.get("critical-title").textContent, "Falla del UPS");
+  assert.deepEqual(ui.get("critical-list").children.map((row) => row.dataset.kind), ["ups_fault", "overload", "battery_low"]);
+  assert.ok(ui.get("critical-list").children.every((row) => row.dataset.state === "active"));
+  const tag = html.match(/<dialog\b[^>]*id="critical-dialog"[^>]*>/)?.[0];
+  assert.ok(tag);
+  assert.match(tag, /role="alertdialog"/);
+  assert.match(tag, /aria-labelledby="critical-title"/);
+  assert.match(tag, /aria-describedby="critical-description"/);
+});
+
+test("historical critical events and stale alarm flags never open a current alarm dialog", async () => {
+  const ui = harness();
+  const data = snapshot();
+  data.sample = liveSample({}, ui.now());
+  data.events = [{ id: 1, kind: "ups_fault", timestamp: new Date(ui.now() - 60000).toISOString(), message: "Falla anterior" }];
+  ui.calls[0].respond(data); await flush();
+  assert.equal(ui.get("critical-dialog").open, false);
+  data.sample = liveSample({ timestamp: new Date(ui.now() - 15001).toISOString(), fault: true, low_battery: true, load_percent: 130 }, ui.now());
+  await pushStatus(ui, data);
+  assert.equal(ui.get("critical-dialog").open, false);
+  data.sample = liveSample({ timestamp: undefined, fault: true }, ui.now());
+  await pushStatus(ui, data);
+  assert.equal(ui.get("critical-dialog").open, false);
+});
+
+test("acknowledged alarms do not reopen on polls or navigation but a confirmed new episode does", async () => {
+  const { ui, data } = await currentUi({ fault: true }, { navigation: true });
+  const dialog = ui.get("critical-dialog");
+  const originalRow = ui.get("critical-list").children[0];
+  ui.get("critical-ack").focus();
+  await pushStatus(ui, data);
+  assert.equal(ui.get("critical-list").children[0], originalRow, "polling must preserve existing dialog nodes");
+  assert.equal(ui.document.activeElement, ui.get("critical-ack"));
+  assert.equal(dialog.modalShows, 1);
+  ui.get("critical-ack").emit("click");
+  assert.equal(dialog.open, false);
+  for (const view of ["history", "overview", "protection", "notifications"]) ui.open(view);
+  await pushStatus(ui, data);
+  assert.equal(dialog.open, false);
+  assert.equal(dialog.modalShows, 1);
+  data.sample.fault = false;
+  await pushStatus(ui, data);
+  data.sample.fault = true;
+  await pushStatus(ui, data);
+  assert.equal(dialog.open, true);
+  assert.equal(dialog.modalShows, 2);
+  assert.equal(ui.calls.some((call) => call.options.method === "POST"), false);
+});
+
+test("a different new alarm opens independently while another active condition remains acknowledged", async () => {
+  const { ui, data } = await currentUi({ fault: true });
+  ui.get("critical-ack").emit("click");
+  data.sample.load_percent = 100;
+  await pushStatus(ui, data);
+  assert.equal(ui.get("critical-dialog").open, true);
+  assert.equal(ui.get("critical-title").textContent, "Sobrecarga del UPS");
+  assert.deepEqual(ui.get("critical-list").children.map((row) => row.dataset.kind), ["overload"]);
+});
+
+test("a missing load reading cannot rearm an acknowledged overload episode", async () => {
+  const { ui, data } = await currentUi({ load_percent: 120 });
+  ui.get("critical-ack").emit("click");
+  data.sample.load_percent = null;
+  await pushStatus(ui, data);
+  assert.equal(ui.get("critical-dialog").open, false);
+  data.sample.load_percent = 120;
+  await pushStatus(ui, data);
+  assert.equal(ui.get("critical-dialog").open, false);
+  data.sample.load_percent = 20;
+  await pushStatus(ui, data);
+  data.sample.load_percent = 120;
+  await pushStatus(ui, data);
+  assert.equal(ui.get("critical-dialog").open, true);
+  assert.equal(ui.get("critical-title").textContent, "Sobrecarga del UPS");
+});
+
+test("a pending overload becomes unconfirmed rather than resolved when its load reading disappears", async () => {
+  const { ui, data } = await currentUi({ load_percent: 120 });
+  const row = ui.get("critical-list").children[0];
+  data.sample.load_percent = null;
+  await pushStatus(ui, data);
+  assert.equal(ui.get("critical-dialog").open, true);
+  assert.equal(ui.get("critical-title").textContent, "Estado sin confirmar");
+  assert.equal(row.dataset.state, "unconfirmed");
+  assert.match(textOf(row), /Sin confirmar/);
+  data.sample.load_percent = 120;
+  await pushStatus(ui, data);
+  assert.equal(ui.get("critical-list").children[0], row);
+  assert.equal(row.dataset.state, "active");
+});
+
+test("recovery before acknowledgment stays visible as resolved until the user acknowledges it", async () => {
+  const { ui, data } = await currentUi({ low_battery: true });
+  const row = ui.get("critical-list").children[0];
+  data.sample.low_battery = false;
+  await pushStatus(ui, data);
+  assert.equal(ui.get("critical-dialog").open, true);
+  assert.equal(ui.get("critical-title").textContent, "Alerta resuelta");
+  assert.equal(ui.get("critical-list").children[0], row);
+  assert.equal(row.dataset.state, "resolved");
+  assert.match(textOf(row), /Resuelta/i);
+  ui.get("critical-ack").emit("click");
+  assert.equal(ui.get("critical-dialog").open, false);
+  await pushStatus(ui, data);
+  assert.equal(ui.get("critical-dialog").open, false);
+});
+
+test("lost communication marks pending alarms unconfirmed and cannot reset acknowledgment", async () => {
+  const { ui, data } = await currentUi({ fault: true });
+  ui.poll(); ui.calls.at(-1).reject(new TypeError("offline")); await flush();
+  assert.equal(ui.get("critical-dialog").open, true);
+  assert.equal(ui.get("critical-title").textContent, "Estado sin confirmar");
+  assert.equal(ui.get("critical-list").children[0].dataset.state, "unconfirmed");
+  ui.get("critical-ack").emit("click");
+  await pushStatus(ui, data);
+  assert.equal(ui.get("critical-dialog").open, false, "uncertainty is not a confirmed clear of the old incident");
+  data.sample.fault = false;
+  await pushStatus(ui, data);
+  data.sample.fault = true;
+  await pushStatus(ui, data);
+  assert.equal(ui.get("critical-dialog").open, true);
+});
+
+test("Escape acknowledges the dialog and restores focus without posting a power action", async () => {
+  const ui = harness();
+  ui.get("theme-toggle").focus();
+  const data = snapshot();
+  data.sample = liveSample({ fault: true }, ui.now());
+  ui.calls[0].respond(data); await flush();
+  assert.equal(ui.get("critical-dialog").open, true);
+  ui.get("critical-dialog").emit("cancel");
+  assert.equal(ui.get("critical-dialog").open, false);
+  assert.equal(ui.document.activeElement, ui.get("theme-toggle"));
+  assert.equal(ui.calls.some((call) => call.options.method === "POST"), false);
+  await pushStatus(ui, data);
+  assert.equal(ui.get("critical-dialog").open, false);
+});
+
+test("critical countdown cancellation uses the confirmed endpoint and does not acknowledge real alarms", async () => {
+  const { ui, data } = await currentUi({ low_battery: true });
+  data.protection = { state: "countdown", simulation: false, deadline: new Date(ui.now() + 60000).toISOString(), reason: "Batería baja" };
+  await pushStatus(ui, data);
+  assert.equal(ui.get("critical-dialog").open, true);
+  assert.equal(ui.get("critical-countdown").hidden, false);
+  assert.equal(ui.get("critical-countdown-time").textContent, "01:00");
+  assert.equal(ui.get("critical-cancel").disabled, false);
+  const cancellation = ui.get("critical-cancel").emit("click");
+  const request = ui.calls.at(-1);
+  assert.equal(request.url, "/api/protection/cancel");
+  assert.equal(request.options.headers["X-UPS-Token"], "test-token");
+  assert.equal(ui.get("critical-dialog").open, true);
+  assert.equal(ui.get("critical-cancel").disabled, true);
+  const callsWhilePending = ui.calls.length;
+  ui.get("critical-cancel").emit("click");
+  assert.equal(ui.calls.length, callsWhilePending, "a second click cannot send another cancellation while pending");
+  request.respond({ ...data, protection: { state: "cancelled", simulation: false } });
+  await cancellation;
+  assert.equal(ui.get("critical-dialog").open, true);
+  assert.equal(ui.get("critical-list").children[0].dataset.state, "active");
+  const posts = ui.calls.filter((call) => call.options.method === "POST").length;
+  ui.get("critical-ack").emit("click");
+  assert.equal(ui.get("critical-dialog").open, false);
+  assert.equal(ui.calls.filter((call) => call.options.method === "POST").length, posts);
+});
+
+test("uncertain countdown keeps its last deadline in the dialog while disabling cancellation", async () => {
+  const { ui, data } = await currentUi({ low_battery: true });
+  data.protection = { state: "countdown", simulation: false, deadline: new Date(ui.now() + 60000).toISOString() };
+  await pushStatus(ui, data);
+  ui.poll(); ui.calls.at(-1).reject(new TypeError("offline")); await flush();
+  ui.advance(1000); ui.tick();
+  assert.equal(ui.get("critical-dialog").open, true);
+  assert.equal(ui.get("critical-countdown-time").textContent, "00:59");
+  assert.equal(ui.get("critical-cancel").disabled, true);
+  assert.equal(ui.get("cancel-shutdown").disabled, true);
+});
+
+test("acknowledgment closes only the physical alert and leaves the confirmed countdown running", async () => {
+  const { ui, data } = await currentUi({ low_battery: true });
+  data.protection = { state: "countdown", simulation: false, deadline: new Date(ui.now() + 60000).toISOString() };
+  await pushStatus(ui, data);
+  ui.get("critical-ack").emit("click");
+  assert.equal(ui.get("critical-dialog").open, false);
+  assert.equal(ui.get("protection-alert").hidden, false);
+  assert.equal(ui.get("countdown").textContent, "01:00");
+  assert.equal(ui.calls.some((call) => call.options.method === "POST"), false);
+  await pushStatus(ui, data);
+  assert.equal(ui.get("critical-dialog").open, false);
+});
+
+test("an unconfirmed modal cancellation stays visible and does not acknowledge the physical condition", async () => {
+  const { ui, data } = await currentUi({ low_battery: true });
+  data.protection = { state: "countdown", simulation: false, deadline: new Date(ui.now() + 60000).toISOString() };
+  await pushStatus(ui, data);
+  const cancellation = ui.get("critical-cancel").emit("click");
+  ui.calls.at(-1).respond(data);
+  await cancellation;
+  assert.equal(ui.get("critical-dialog").open, true);
+  assert.equal(ui.get("critical-feedback").hidden, false);
+  assert.match(ui.get("critical-feedback").textContent, /No se confirmó la cancelación/);
+  assert.equal(ui.get("critical-cancel").disabled, false);
+  assert.equal(ui.get("critical-list").children[0].dataset.state, "active");
+  assert.equal(ui.get("critical-countdown-time").textContent, "01:00");
+});
+
+test("a refreshed deadline in the same active countdown cannot erase an unconfirmed cancellation error", async () => {
+  const { ui, data } = await currentUi({ low_battery: true });
+  data.protection = { state: "countdown", simulation: false, deadline: new Date(ui.now() + 60000).toISOString() };
+  await pushStatus(ui, data);
+  const cancellation = ui.get("critical-cancel").emit("click");
+  ui.calls.at(-1).respond(data);
+  await cancellation;
+  const feedback = ui.get("critical-feedback").textContent;
+  assert.equal(ui.get("critical-feedback").hidden, false);
+  assert.match(feedback, /No se confirmó la cancelación/);
+  data.protection = { ...data.protection, deadline: new Date(ui.now() + 61000).toISOString() };
+  await pushStatus(ui, data);
+  assert.equal(ui.get("critical-feedback").hidden, false);
+  assert.equal(ui.get("critical-feedback").textContent, feedback);
+  assert.equal(ui.get("critical-countdown-time").textContent, "01:01");
+});
+
+test("a new countdown clears feedback about an earlier confirmed cancellation in the still-open dialog", async () => {
+  const { ui, data } = await currentUi({ low_battery: true });
+  data.protection = { state: "countdown", simulation: false, deadline: new Date(ui.now() + 60000).toISOString() };
+  await pushStatus(ui, data);
+  const cancellation = ui.get("critical-cancel").emit("click");
+  ui.calls.at(-1).respond({ ...data, protection: { state: "cancelled", simulation: false } });
+  await cancellation;
+  assert.equal(ui.get("critical-dialog").open, true);
+  assert.equal(ui.get("critical-feedback").hidden, false);
+  data.protection = { state: "countdown", simulation: false, deadline: new Date(ui.now() + 120000).toISOString() };
+  await pushStatus(ui, data);
+  assert.equal(ui.get("critical-dialog").open, true);
+  assert.equal(ui.get("critical-countdown-time").textContent, "02:00");
+  assert.equal(ui.get("critical-feedback").hidden, true);
+});
+
+test("theme transitions run only for manual changes and honor reduced motion", () => {
+  const ui = harness({ storage: { "elipro-theme": "light" } });
+  assert.equal(ui.rootElement.classList.contains("theme-transitioning"), false);
+  ui.get("theme-toggle").emit("click");
+  assert.equal(ui.rootElement.classList.contains("theme-transitioning"), true);
+  ui.advance(350); ui.runTimeouts();
+  assert.equal(ui.rootElement.classList.contains("theme-transitioning"), false);
+  const reduced = harness({ reducedMotion: true });
+  reduced.get("theme-toggle").emit("click");
+  assert.equal(reduced.rootElement.dataset.theme, "light");
+  assert.equal(reduced.rootElement.classList.contains("theme-transitioning"), false);
+  const styles = fs.readFileSync(path.join(root, "static/style.css"), "utf8");
+  assert.ok(/\.theme-toggle\s*\{[^}]*width:\s*100%/s.test(styles), "the theme toggle must fill the sidebar control width");
+  assert.match(styles, /prefers-reduced-motion:\s*reduce/);
 });
