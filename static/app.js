@@ -646,23 +646,6 @@
     if (!state.navigationReady) return;
     const data = state.status;
     const confirmed = state.serviceAvailable && data;
-    const policy = data?.policy || {};
-    const simulated = data?.meta?.dry_run === true;
-    const global = $("protection-global-status");
-    setText("protection-global-status", !confirmed ? state.stopAcknowledged ? "Elipro detenido" : "Protección sin confirmar"
-      : policy.enabled ? simulated ? "Protección simulada" : "Apagado automático activado" : "Apagado automático desactivado");
-    global?.classList.toggle("enabled", !!confirmed && policy.enabled === true && !simulated);
-    global?.classList.toggle("unconfirmed", !confirmed);
-    const globalBar = global?.closest?.(".global-status-bar");
-    globalBar?.classList.toggle("is-enabled", !!confirmed && policy.enabled === true && !simulated);
-    globalBar?.classList.toggle("is-unknown", !confirmed);
-    setText("protection-global-detail", !confirmed ? "El panel necesita recuperar la comunicación con el monitor."
-      : simulated ? "Modo de prueba · las acciones reales de Windows están bloqueadas."
-      : policy.enabled ? `Acción configurada: ${policy.action === "hibernate" ? "hibernar" : "apagar"} Windows.` : "Elipro vigila y avisa; no iniciará un apagado automático.");
-    const connection = !confirmed ? state.stopAcknowledged ? "Monitor detenido" : "Monitor sin conexión"
-      : data.connection?.state === "connected" ? "USB conectado" : data.connection?.state === "stale" ? "Lecturas desactualizadas" : "USB sin conexión";
-    setText("sidebar-connection-text", connection);
-    $("sidebar-connection")?.classList.toggle("warning", !confirmed || data?.connection?.state !== "connected");
     const health = data?.health;
     const healthy = confirmed && health?.reader_alive === true && health?.supervisor_alive === true && ["healthy", "ok", "running"].includes(health.state);
     setText("summary-health", !confirmed ? "Sin confirmar" : healthy ? "Monitor supervisado" : "Revisar monitor");
@@ -1051,7 +1034,7 @@
     state.lastStatusAt = new Date();
     state.token = typeof data.csrf_token === "string" ? data.csrf_token : null;
     if (finite(data.meta?.history_interval_seconds) && data.meta.history_interval_seconds > 0) state.historyInterval = data.meta.history_interval_seconds * 1000;
-    $("development-notice").hidden = state.navigationReady || !data.meta?.dry_run;
+    $("development-notice").hidden = !data.meta?.dry_run;
     $("bridge-policy-note").hidden = data.meta?.bridge_required !== true;
     renderServiceState();
     const connection = data.connection || {};

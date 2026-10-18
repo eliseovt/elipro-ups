@@ -840,32 +840,63 @@ test("unsaved protection and notice edits survive navigation and status updates"
   assert.equal(ui.calls.some((call) => call.options.method === "POST"), false);
 });
 
-test("global protection and connection status remain accurate across all six sections", async () => {
+test("sidebar monitoring and critical protection controls remain accurate across all six sections", async () => {
   const ui = harness({ navigation: true });
   const data = snapshot();
   data.meta.dry_run = true;
+  data.connection.last_success = new Date(Date.now() - 5000).toISOString();
   data.protection = { state: "countdown", simulation: true, countdown_remaining: 12, reason: "Prueba segura" };
   data.health = { state: "healthy", reader_alive: true, supervisor_alive: true,
     observation: { state: "running", elapsed_seconds: 3600, target_seconds: 172800 } };
   ui.calls[0].respond(data);
   await flush();
-  for (const name of ["overview", "incidents", "history", "protection", "notifications", "system"]) {
+  const views = ["overview", "incidents", "history", "protection", "notifications", "system"];
+  assert.equal(ui.get("development-notice").hidden, false);
+  const lastReading = ui.get("last-updated").textContent;
+  assert.match(lastReading, /^Hace \d+ s · /);
+  assert.equal(ui.get("last-updated").title, new Date(data.connection.last_success).toLocaleString("es-PE"));
+  for (const name of views) {
     ui.open(name);
     assert.equal(ui.get("protection-alert").hidden, false);
     assert.equal(ui.get("countdown").textContent, "00:12");
-    assert.equal(ui.get("protection-global-status").textContent, "Apagado automático desactivado");
-    assert.match(ui.get("protection-global-detail").textContent, /acciones reales de Windows están bloqueadas/);
-    assert.equal(ui.get("sidebar-connection-text").textContent, "USB conectado");
+    assert.equal(ui.get("cancel-shutdown").hidden, false);
+    assert.equal(ui.get("cancel-shutdown").disabled, false);
+    assert.equal(ui.get("connection-badge").lastElementChild.textContent, "UPS conectado");
+    assert.equal(ui.get("last-updated").textContent, lastReading);
   }
   assert.equal(ui.get("summary-health").textContent, "Monitor supervisado");
   assert.match(ui.get("summary-observation").textContent, /1 h 0 min de 48 h/);
   ui.poll();
   ui.calls.at(-1).reject(new TypeError("offline"));
   await flush();
-  assert.equal(ui.get("protection-global-status").textContent, "Protección sin confirmar");
-  assert.equal(ui.get("sidebar-connection-text").textContent, "Monitor sin conexión");
-  assert.equal(ui.get("protection-alert").hidden, false);
-  assert.match(ui.get("protection-reason").textContent, /cancelación no está confirmada/);
+  for (const name of views) {
+    ui.open(name);
+    assert.equal(ui.get("connection-badge").lastElementChild.textContent, "Monitor sin conexión");
+    assert.equal(ui.get("last-updated").textContent, lastReading);
+    assert.equal(ui.get("protection-alert").hidden, false);
+    assert.match(ui.get("protection-reason").textContent, /cancelación no está confirmada/);
+    assert.equal(ui.get("cancel-shutdown").disabled, true);
+  }
+  ui.poll();
+  ui.calls.at(-1).respond(data);
+  await flush();
+  for (const name of views) {
+    ui.open(name);
+    assert.equal(ui.get("connection-badge").lastElementChild.textContent, "UPS conectado");
+    assert.equal(ui.get("protection-alert").hidden, false);
+    assert.doesNotMatch(ui.get("protection-reason").textContent, /cancelación no está confirmada/);
+    assert.equal(ui.get("cancel-shutdown").disabled, false);
+  }
+  const cancellation = ui.get("cancel-shutdown").emit("click");
+  assert.equal(ui.calls.at(-1).url, "/api/protection/cancel");
+  ui.calls.at(-1).respond({ ...data, meta: { ...data.meta, dry_run: false }, protection: { state: "cancelled", simulation: true } });
+  await cancellation;
+  assert.equal(ui.get("development-notice").hidden, true);
+  for (const name of views) {
+    ui.open(name);
+    assert.equal(ui.get("protection-alert").hidden, true);
+  }
+  assert.equal(ui.get("toast").textContent, "El monitor confirmó la cancelación de la prueba.");
 });
 
 test("Incidentes and Historial load on entry and use independent date filters", async () => {

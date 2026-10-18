@@ -16,7 +16,6 @@
         <span class="brand-mark" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="m13.5 2-8 12h6L10.5 22l8-12h-6Z"/></svg></span>
         <span>elipro<span class="brand-local">UPS</span></span>
       </a>
-      <div class="sidebar-label">CENTRO DE ENERGÍA</div>
       <nav class="sidebar-nav" aria-label="Secciones del monitor">
         <button type="button" class="nav-item active" data-view="overview" aria-controls="page-overview" aria-current="page"><span class="nav-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg></span><span>Resumen</span></button>
         <button type="button" class="nav-item" data-view="incidents" aria-controls="page-incidents"><span class="nav-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="m13.5 2-8 12h6L10.5 22l8-12h-6Z"/></svg></span><span>Incidentes</span></button>
@@ -25,28 +24,22 @@
         <button type="button" class="nav-item" data-view="notifications" aria-controls="page-notifications"><span class="nav-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M18 8a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9M10 21h4"/></svg></span><span>Avisos</span></button>
         <button type="button" class="nav-item" data-view="system" aria-controls="page-system"><span class="nav-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="13" rx="2"/><path d="M8 21h8m-4-4v4M7 10h2l2-3 3 7 2-4h2"/></svg></span><span>Sistema</span></button>
       </nav>
-      <div class="sidebar-footer"><span class="sidebar-model">FORZA NT-2402PRO</span><span>2400 VA · 1200 W nominales</span><span id="sidebar-connection" class="sidebar-status"><i class="status-dot" aria-hidden="true"></i><span id="sidebar-connection-text">Conectando al UPS</span></span><span class="sidebar-local">Tus datos se quedan en esta PC</span></div>
+      <div class="sidebar-bottom">
+        <div class="sidebar-controls" role="group" aria-label="Estado del UPS y apariencia">
+          <span id="connection-badge" class="connection-badge"><span class="status-dot" aria-hidden="true"></span><span>Conectando</span></span>
+          <div class="last-sync"><span class="sync-icon" aria-hidden="true">↻</span><div><span class="meta-label">ÚLTIMA LECTURA</span><strong id="last-updated">Esperando conexión</strong></div></div>
+          <button id="theme-toggle" class="theme-toggle" type="button" aria-label="Cambiar a modo claro" title="Cambiar a modo claro" aria-pressed="false"><span id="theme-icon" aria-hidden="true"><svg class="theme-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M2 12h2m16 0h2M5 5l1.5 1.5m11 11L19 19M5 19l1.5-1.5m11-11L19 5"/></svg><svg class="theme-moon" viewBox="0 0 24 24"><path d="M20 15.4A8.8 8.8 0 0 1 8.6 4a8.8 8.8 0 1 0 11.4 11.4Z"/></svg></span></button>
+        </div>
+        <div class="sidebar-footer"><span class="sidebar-model">FORZA NT-2402PRO</span><span>2400 VA · 1200 W nominales</span><span class="sidebar-local">Tus datos se quedan en esta PC</span></div>
+      </div>
     </aside>
 
     <main class="workspace">
-      <header class="topbar workspace-header">
-        <div class="workspace-identity"><span class="workspace-name">Elipro UPS</span><span class="local-label"><span aria-hidden="true">↳</span> Solo en esta PC</span></div>
-        <div class="topbar-right"><span id="connection-badge" class="connection-badge"><span class="status-dot"></span><span>Conectando</span></span><div class="last-sync"><span class="sync-icon" aria-hidden="true">↻</span><div><span class="meta-label">ÚLTIMA LECTURA</span><strong id="last-updated">Esperando conexión</strong></div></div><button id="theme-toggle" class="theme-toggle" type="button" aria-label="Cambiar a modo claro" title="Cambiar a modo claro" aria-pressed="false"><span id="theme-icon" aria-hidden="true"><svg class="theme-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M2 12h2m16 0h2M5 5l1.5 1.5m11 11L19 19M5 19l1.5-1.5m11-11L19 5"/></svg><svg class="theme-moon" viewBox="0 0 24 24"><path d="M20 15.4A8.8 8.8 0 0 1 8.6 4a8.8 8.8 0 1 0 11.4 11.4Z"/></svg></span></button></div>
-      </header>
-
-      <div class="global-status-bar" aria-label="Estado de protección de Windows">
-        <span class="global-status-primary"><span class="global-status-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="m12 3 8 3v6c0 5-8 9-8 9s-8-4-8-9V6Z"/><path d="m8 12 3 3 5-6"/></svg></span><strong id="protection-global-status">Consultando protección de Windows</strong></span>
-        <span id="protection-global-detail" class="global-status-policy">Esperando al monitor local.</span>
-        <button type="button" class="text-link" data-go-view="protection">Ver protección <span aria-hidden="true">→</span></button>
-      </div>
-
       <section class="page-heading" aria-labelledby="page-title">
-        <div><div class="eyebrow">CENTRO DE ENERGÍA</div><h1 id="page-title" tabindex="-1"><span id="view-title">Resumen</span><span class="heading-dot">.</span></h1><p id="view-description">Lo esencial de tu UPS, de un vistazo.</p></div>
+        <div><h1 id="page-title" tabindex="-1"><span id="view-title">Resumen</span><span class="heading-dot">.</span></h1><p id="view-description">Lo esencial de tu UPS, de un vistazo.</p></div>
       </section>
 
-
-
-<div id="service-notice" class="notice service-notice" role="status" hidden></div>
+      <div id="service-notice" class="notice service-notice" role="status" hidden></div>
       <div id="connection-notice" class="notice connection-notice" role="status" hidden></div>
       <div id="history-notice" class="notice history-notice" role="status" hidden></div>
       <section id="protection-alert" class="protection-alert" aria-live="assertive" hidden>
@@ -219,7 +212,6 @@
       </section>
       </section>
 
-      <footer class="footer"><span><i aria-hidden="true"></i> Tus datos se quedan en esta PC</span><span>Elipro UPS <span class="footer-slash">/</span> Monitor local</span></footer>
     </main>
   </div>
   <div id="toast" class="toast" role="status" hidden></div>
