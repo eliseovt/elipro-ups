@@ -10,6 +10,7 @@ from unittest.mock import Mock, patch
 from ups_monitor.alerts import DEFAULT_NOTIFICATION_SETTINGS
 from ups_monitor.core import DEFAULT_POLICY, Store, iso_utc
 from ups_monitor.persistence import HistoryUnavailable, ResilientStore
+from ups_monitor.webhooks import DEFAULT_WEBHOOK_SETTINGS, WebhookManager
 
 
 def eventually(predicate, timeout=1.5):
@@ -35,6 +36,29 @@ class PersistenceTests(unittest.TestCase):
                                      retry_seconds=0.02, max_retry_seconds=0.05, **options)
         self.backends.append(result)
         return result, backend
+
+    def test_saved_webhooks_are_primed_before_history_worker_starts(self):
+        backend = Store(":memory:", busy_timeout_ms=100)
+        saved = {"webhook_enabled": True, "webhook_url": "https://receiver.example/ups",
+                 "webhook_events": ["power_restored", "ups_fault"]}
+        backend.set_setting("webhooks", saved)
+        store = ResilientStore.open(":memory:", store_factory=lambda path: backend)
+        self.backends.append(store)
+        store.start()
+        with patch.object(backend, "get_setting", side_effect=AssertionError("No SQL on a monitor tick")):
+            manager = WebhookManager(store)
+            self.assertEqual(manager.status()["settings"], saved)
+            snapshot = store.get_setting("webhooks")
+            snapshot["webhook_events"].clear()
+            self.assertEqual(store.get_setting("webhooks"), saved)
+
+    def test_invalid_saved_webhooks_start_disabled_with_configuration_warning(self):
+        backend = Store(":memory:", busy_timeout_ms=100)
+        backend.set_setting("webhooks", {"webhook_enabled": True, "webhook_url": "file:///private"})
+        store = ResilientStore.open(":memory:", store_factory=lambda path: backend)
+        self.backends.append(store)
+        self.assertEqual(store.get_setting("webhooks"), DEFAULT_WEBHOOK_SETTINGS)
+        self.assertIn("webhooks", store.status()["configuration_warning"])
 
     def test_async_sample_event_preserve_timestamp_and_flush(self):
         store, backend = self.memory()

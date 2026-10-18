@@ -16,6 +16,7 @@ from collections import deque
 from dataclasses import dataclass
 
 from .alerts import CRITICAL_HISTORY_EVENTS, DEFAULT_NOTIFICATION_SETTINGS, validate_notification_settings
+from .webhooks import DEFAULT_WEBHOOK_SETTINGS, validate_webhook_settings
 from .core import (DEFAULT_POLICY, SAMPLE_FIELDS, IncidentCursorExpired, RecordCursorExpired, Store, _timestamp,
                    battery_estimate_fields, iso_utc, validate_policy)
 
@@ -78,6 +79,7 @@ class ResilientStore:
         self._io_lock = threading.Lock()
         self._queue, self._events = deque(), deque(maxlen=event_limit)
         self._settings = {}
+        self._webhook_deliveries = {}
         self._next_event_id = -1
         self._backend = self._thread = None
         self._inflight = ()
@@ -133,6 +135,14 @@ class ResilientStore:
         self._load_setting("policy", DEFAULT_POLICY, validate_policy)
         self._load_setting("notification_settings", DEFAULT_NOTIFICATION_SETTINGS,
                            validate_notification_settings)
+        self._load_setting("webhooks", DEFAULT_WEBHOOK_SETTINGS, validate_webhook_settings)
+        if self._backend is not None and callable(getattr(type(self._backend), "webhook_deliveries", None)):
+            try:
+                for record in self._backend.webhook_deliveries(limit=50):
+                    value = Store._webhook_delivery(record)
+                    self._webhook_deliveries[value["id"]] = value
+            except Exception:
+                self._configuration_warnings.append("No se pudo cargar el historial de entregas de webhooks.")
 
     def _load_setting(self, key, default, validator=None):
         value = copy.deepcopy(default)
@@ -244,6 +254,24 @@ class ResilientStore:
             raise ValueError("limit debe ser entero entre 1 y 1000")
         with self._condition:
             return copy.deepcopy(list(self._events)[:limit])
+
+    def add_webhook_delivery(self, record):
+        value = Store._webhook_delivery(record)
+        with self._condition:
+            self._webhook_deliveries[value["id"]] = value
+            ordered = sorted(self._webhook_deliveries.values(),
+                             key=lambda item: (item["timestamp"], item["id"]), reverse=True)[:50]
+            self._webhook_deliveries = {item["id"]: item for item in ordered}
+            self._enqueue(_Write("webhook_delivery", copy.deepcopy(value), self._clock(), urgent=True))
+        return copy.deepcopy(value)
+
+    def webhook_deliveries(self, limit=50):
+        if type(limit) is not int or not 1 <= limit <= 50:
+            raise ValueError("limit debe ser entero entre 1 y 50")
+        with self._condition:
+            ordered = sorted(self._webhook_deliveries.values(),
+                             key=lambda item: (item["timestamp"], item["id"]), reverse=True)
+            return copy.deepcopy(ordered[:limit])
 
     def _read(self, method, *args, **kwargs):
         if not self._io_lock.acquire(timeout=0.1):
@@ -386,6 +414,8 @@ class ResilientStore:
             if entry.kind == "event":
                 result = self._backend.add_event(value["kind"], value["message"], value["data"],
                                                  timestamp=value["timestamp"])
+            elif entry.kind == "webhook_delivery":
+                result = self._backend.add_webhook_delivery(value)
             else:
                 result = self._backend.add_sample(value)
             self._acknowledge((entry,), (result,))

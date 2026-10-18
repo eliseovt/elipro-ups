@@ -14,7 +14,7 @@
     <img src="https://img.shields.io/badge/Runtime-Python_3.10+_StdLib-3776AB?style=flat-square&logo=python&logoColor=white" alt="Python StdLib" />
     <img src="https://img.shields.io/badge/Hardware-Forza_NT--2402PRO-00bfa5?style=flat-square" alt="Forza NT-2402PRO" />
     <img src="https://img.shields.io/badge/Seguridad-Dry--Run_por_Defecto-f59e0b?style=flat-square" alt="Dry Run Activo" />
-    <img src="https://img.shields.io/badge/Privacidad-100%25_Local_(127.0.0.1)-10b981?style=flat-square" alt="100% Local" />
+    <img src="https://img.shields.io/badge/Panel-Local_(127.0.0.1)-10b981?style=flat-square" alt="Panel local" />
   </p>
 
   <p align="center">
@@ -86,7 +86,7 @@ El corte de la salida del UPS es una capacidad separada, bloqueada hasta validar
 ## <a id="funciones"></a>✨ Funciones
 
 ### Interfaz y secciones del panel
-* **Cuatro secciones especializadas:** **Resumen**, **Protección**, **Historial** y **Sistema**; temas claro y oscuro con selector sol/luna.
+* **Cinco secciones especializadas:** **Resumen**, **Protección**, **Historial**, **Sistema** y **Webhooks**; temas claro y oscuro con selector sol/luna.
 * **Resumen compacto y fiel al hardware:** Permite consultar el diagrama de energía, las mediciones y los eventos recientes en una sola vista de escritorio (1920 × 1080).
   * La ilustración del UPS muestra **FORZA** y el modelo en el frontal, **sin visor LCD** (fiel al dispositivo físico); su botón de encendido refleja el estado del suministro.
   * **Conductos de luz:** Emplean color **turquesa** en la entrada de red y **azul** en batería y salida, con pulsos solo cuando las lecturas recientes confirman energía hacia los equipos.
@@ -131,6 +131,24 @@ Las capturas muestran una configuración de ejemplo; la protección automática 
 * **Historial con tabla única «Registro»:** Reúne las mediciones en gráfica y una única tabla Registro, conservando sus filtros al navegar. Los eventos recientes permanecen exclusivos en Resumen.
 * **Sistema:** Reúne el funcionamiento del monitor (última lectura, tiempo activo y recursos) y los ajustes de avisos (avisos de escritorio, sonido, persistencia de avisos críticos e intervalo de repetición) sin opciones contraídas.
 * **Botón de salida limpio:** La franja inferior de Sistema conserva **Salir de Elipro**: cerrar el panel mantiene la vigilancia; salir detiene el monitor y sus avisos.
+
+### Webhooks e integraciones externas
+
+La sección **Webhooks**, después de Sistema, permite enviar alertas a n8n u otros receptores mediante **POST JSON, sin HMAC ni cabeceras de firma**. El interruptor general está fuera del campo URL y viene apagado. **Guardar webhooks** conserva `webhook_enabled`, `webhook_url` y `webhook_events` en el mismo store SQLite de ajustes; desactivar conserva la URL y la selección.
+
+Los únicos eventos configurables son `power_lost` (Corte de energía), `power_restored` (Suministro recuperado), `battery_low` (Batería baja), `overload` (Sobrecarga) y `ups_fault` (Falla del UPS). Solo corte de energía y batería baja están seleccionados por defecto. Se encola un envío al aparecer cada transición, si el interruptor está activo, hay URL y el evento está seleccionado. Los avisos de escritorio conservan su comportamiento.
+
+Cada payload incluye `event`, `severity`, `timestamp` en UTC, `message`, `hostname` y las mediciones disponibles del sample actual, por ejemplo:
+
+```json
+{"event":"power_lost","severity":"critical","timestamp":"2026-10-18T23:15:00Z","message":"UPS funcionando con batería: suministro de red interrumpido.","on_battery":true,"battery_voltage":26.1,"load_percent":35,"input_voltage":0,"hostname":"NOMBRE-PC"}
+```
+
+**Probar webhook** usa la configuración guardada y envía `webhook_test`; el panel informa el resultado HTTP o el error. Guarda primero los cambios. Las peticiones salen desde un worker independiente con cola acotada y un presupuesto total de **5 segundos por intento**, incluyendo DNS, conexión, TLS y respuesta: si el destino no responde a tiempo, se cierra la petición y se registra el error. Cada entrega admite **un máximo de dos intentos**, con **5 segundos de espera después del primer fallo**; el segundo fallo es definitivo. No se siguen redirecciones. La espera de reintento no bloquea el envío de otros eventos ni el monitor.
+
+**Entregas recientes** muestra las últimas 50 entregas con fecha, evento, estado, intentos y resultado HTTP o error. El registro se conserva en SQLite con un ID estable por entrega: un reintento actualiza la misma fila. Al reiniciar se conserva el historial y se cancelan los pendientes sin reenviarlos. Los errores o la saturación de la cola se registran sin detener la lectura ni la protección. Cambiar o desactivar la configuración invalida los envíos y reintentos pendientes; una petición ya iniciada puede terminar dentro de su plazo.
+
+Con **`--dry-run`** o una fuente simulada no se realiza ningún POST, ni siquiera de prueba: el panel muestra un resultado **simulado**. El servicio del instalador incluye `--dry-run` por defecto, por lo que también simula los webhooks mientras ese flag siga activo. La URL no se registra en el log de entregas.
 
 ---
 

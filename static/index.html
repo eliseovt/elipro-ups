@@ -21,6 +21,7 @@
         <button type="button" class="nav-item" data-view="protection" aria-controls="page-protection"><span class="nav-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="m12 3 8 3v6c0 5-8 9-8 9s-8-4-8-9V6Z"/><path d="m8 12 3 3 5-6"/></svg></span><span>Protección</span></button>
         <button type="button" class="nav-item" data-view="history" aria-controls="shared-history page-history"><span class="nav-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M4 4v16h16M7 15l4-5 4 3 5-7"/></svg></span><span>Historial</span></button>
         <button type="button" class="nav-item" data-view="system" aria-controls="page-system"><span class="nav-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="13" rx="2"/><path d="M8 21h8m-4-4v4M7 10h2l2-3 3 7 2-4h2"/></svg></span><span>Sistema</span></button>
+        <button type="button" class="nav-item" data-view="webhooks" aria-controls="page-webhooks"><span class="nav-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><circle cx="12" cy="5" r="3"/><circle cx="5" cy="18" r="3"/><circle cx="19" cy="18" r="3"/><path d="m10.5 7.5-4 8m7-8 4 8M8 18h8"/></svg></span><span>Webhooks</span></button>
       </nav>
       <div class="sidebar-bottom">
         <div class="sidebar-controls" role="group" aria-label="Estado del UPS y apariencia">
@@ -277,6 +278,34 @@
         </section>
       </section>
 
+      <section id="page-webhooks" class="page-view" data-page="webhooks" aria-label="Configuración de webhooks" hidden>
+        <form id="webhooks-form" class="webhooks-card card">
+          <div class="webhook-url-heading">
+            <label for="webhook-url">URL del webhook</label>
+            <label class="webhook-master-control" for="webhook-enabled"><span>Activar webhooks</span><span class="switch-label"><input id="webhook-enabled" name="webhook_enabled" type="checkbox" role="switch" aria-describedby="webhook-enabled-note" title="Activar o desactivar todos los envíos de webhooks" disabled><span class="switch" aria-hidden="true"></span></span></label>
+          </div>
+          <input id="webhook-url" name="webhook_url" class="webhook-url-input" type="url" inputmode="url" placeholder="https://n8n.tudominio.com/webhook/elipro-ups" autocomplete="off" spellcheck="false" aria-describedby="webhook-enabled-note" disabled>
+          <p id="webhook-enabled-note" class="webhook-control-note">Al desactivar los envíos se conservan la URL y los eventos. Guarda para aplicar los cambios.</p>
+          <p id="webhooks-dry-run" class="webhook-dry-run" role="status" hidden>Modo simulación (--dry-run): no se envían webhooks.</p>
+          <div class="webhook-events-heading"><h2 id="webhook-events-heading">Eventos a notificar</h2><span id="webhook-event-count" class="count-badge" aria-live="polite">2 de 5 seleccionados</span></div>
+          <div class="webhook-events-grid" role="group" aria-labelledby="webhook-events-heading">
+            <label class="webhook-event-card" for="webhook-event-power_lost"><span class="webhook-event-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M12 3v9m-5-6a8 8 0 1 0 10 0"/></svg></span><span class="webhook-event-copy"><strong>Corte de energía</strong><code>power_lost</code></span><span class="switch-label"><input id="webhook-event-power_lost" name="webhook_events" value="power_lost" type="checkbox" role="switch" aria-label="Notificar corte de energía" checked disabled><span class="switch" aria-hidden="true"></span></span></label>
+            <label class="webhook-event-card" for="webhook-event-power_restored"><span class="webhook-event-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M12 3v9m-5-6a8 8 0 1 0 10 0m-1 13h4v-4"/></svg></span><span class="webhook-event-copy"><strong>Suministro recuperado</strong><code>power_restored</code></span><span class="switch-label"><input id="webhook-event-power_restored" name="webhook_events" value="power_restored" type="checkbox" role="switch" aria-label="Notificar suministro recuperado" disabled><span class="switch" aria-hidden="true"></span></span></label>
+            <label class="webhook-event-card" for="webhook-event-battery_low"><span class="webhook-event-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><rect x="2" y="6" width="18" height="12" rx="2"/><path d="M22 10v4M6 10v4m4-4v4"/></svg></span><span class="webhook-event-copy"><strong>Batería baja</strong><code>battery_low</code></span><span class="switch-label"><input id="webhook-event-battery_low" name="webhook_events" value="battery_low" type="checkbox" role="switch" aria-label="Notificar batería baja" checked disabled><span class="switch" aria-hidden="true"></span></span></label>
+            <label class="webhook-event-card" for="webhook-event-overload"><span class="webhook-event-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M10.3 3.9a2 2 0 0 1 3.4 0l8 14a2 2 0 0 1-1.7 3H4a2 2 0 0 1-1.7-3Z M12 9v5m0 3v.1"/></svg></span><span class="webhook-event-copy"><strong>Sobrecarga</strong><code>overload</code></span><span class="switch-label"><input id="webhook-event-overload" name="webhook_events" value="overload" type="checkbox" role="switch" aria-label="Notificar sobrecarga" disabled><span class="switch" aria-hidden="true"></span></span></label>
+            <label class="webhook-event-card" for="webhook-event-ups_fault"><span class="webhook-event-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><rect x="5" y="2" width="14" height="20" rx="2"/><path d="M8 6h8m-7 5 6 6m0-6-6 6"/></svg></span><span class="webhook-event-copy"><strong>Falla del UPS</strong><code>ups_fault</code></span><span class="switch-label"><input id="webhook-event-ups_fault" name="webhook_events" value="ups_fault" type="checkbox" role="switch" aria-label="Notificar falla del UPS" disabled><span class="switch" aria-hidden="true"></span></span></label>
+          </div>
+          <div class="webhooks-actions"><p id="webhooks-feedback" class="webhooks-feedback" role="status" aria-live="polite"></p><button id="test-webhook" class="button button-secondary" type="button" disabled><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m22 2-7 20-4-9-9-4Zm0 0L11 13"/></svg><span id="test-webhook-label">Probar webhook</span></button><button id="save-webhooks" class="button button-primary" type="submit" disabled><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 3h15l3 3v15H3Zm4 0v7h10V3M7 21v-8h10v8"/></svg><span id="save-webhooks-label">Guardar webhooks</span></button></div>
+          <p id="webhooks-test-feedback" class="webhooks-test-feedback" role="status" aria-live="polite" hidden></p>
+          <p class="webhooks-footnote"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 11v6m0-10v.1"/></svg><span>Solo se envían los eventos activados. Sin firma.</span></p>
+        </form>
+        <section id="webhook-deliveries-card" class="webhook-deliveries-card card" aria-labelledby="webhook-deliveries-heading">
+          <div class="webhook-deliveries-heading"><div><h2 id="webhook-deliveries-heading">Entregas recientes</h2><p>Eventos y pruebas de webhook, del más reciente al más antiguo.</p></div><span id="webhook-deliveries-count" class="count-badge">0 entregas</span></div>
+          <p id="webhook-delivery-policy" class="webhook-delivery-policy">Máximo 2 intentos · Espera entre intentos: 5 s · Timeout por intento: 5 s</p>
+          <div id="webhook-deliveries-empty" class="webhook-deliveries-empty"><strong>Aún no hay entregas registradas.</strong><p>Los eventos y las pruebas aparecerán aquí con su estado de envío.</p></div>
+          <div id="webhook-deliveries-scroll" class="webhook-deliveries-scroll" tabindex="0" role="region" aria-label="Últimas 50 entregas de webhooks" hidden><table id="webhook-deliveries-table" class="webhook-deliveries-table"><caption class="sr-only">Últimas entregas de eventos y pruebas de webhooks</caption><thead><tr><th scope="col">Fecha/hora</th><th scope="col">Evento</th><th scope="col">Estado</th><th scope="col">Intentos</th><th scope="col">Resultado</th></tr></thead><tbody id="webhook-deliveries-body"></tbody></table></div>
+        </section>
+      </section>
     </main>
   </div>
   <dialog id="critical-dialog" class="critical-dialog" role="alertdialog" aria-labelledby="critical-title" aria-describedby="critical-description">

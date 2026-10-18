@@ -26,6 +26,7 @@ from .native_adapter import make_adapter
 from .core import (BATTERY_ESTIMATE_FIELDS, DEFAULT_POLICY, SAMPLE_FIELDS, IncidentCursorExpired, RecordCursorExpired, PolicyEngine,
                    TelemetryRingBuffer, battery_estimate_fields, iso_utc, validate_policy)
 from .alerts import AlertManager, DEFAULT_NOTIFICATION_SETTINGS
+from .webhooks import WebhookManager
 from .instance_guard import MonitorInstanceGuard, InstanceGuardError
 from .health import MonitorHealth
 from .persistence import ResilientStore, HistoryUnavailable
@@ -128,7 +129,8 @@ def write_records_csv(store, options, target):
 class Monitor:
     def __init__(self, store, adapter, *, dry_run=False, action_callback=None, alerts=None, health_clock=None,
                  telemetry_capacity=256, poll_interval=2, allow_ups_poweroff=False, ups_power=None, ups_journal_path=None,
-                 ups_cancel_test=None, ups_cancel_test_journal=None, ups_battery_test=None, ups_battery_test_journal=None):
+                 ups_cancel_test=None, ups_cancel_test_journal=None, ups_battery_test=None, ups_battery_test_journal=None,
+                 webhooks=None):
         self.store, self.adapter = store, adapter
         self.simulation_source = getattr(adapter, "simulation", False) is True
         self.dry_run = bool(dry_run) or self.simulation_source
@@ -206,6 +208,7 @@ class Monitor:
                 self._record_event("policy_changed", "Tiempo para cancelar ajustado al máximo admitido de 120 segundos.")
             except Exception as exc:
                 self._history_failed("settings_write", exc)
+        self.webhooks = webhooks if webhooks is not None else WebhookManager(store, dry_run=self.dry_run)
 
     def _history_failed(self, operation, exc):
         if operation not in self._history_failures:
@@ -224,7 +227,17 @@ class Monitor:
     def _event(self, kind, message, data=None):
         # Desktop delivery must never depend on SQLite accepting an event.
         self._notify_event(kind, message, data)
+        self._notify_webhook(kind, message)
         return self._record_event(kind, message, data)
+
+    def _notify_webhook(self, kind, message):
+        if not self.stop_event.is_set():
+            try:
+                # Only an in-memory snapshot is queued here. HTTP belongs to
+                # the separate worker and never owns the protection lock.
+                self.webhooks.on_event(kind, message, self.sample)
+            except Exception as exc:
+                log_failure("No se pudo preparar el webhook", exc)
 
     def _notify_event(self, kind, message, data=None):
         if self.alerts is not None and not self.stop_event.is_set():
@@ -268,6 +281,25 @@ class Monitor:
         if self.alerts is None or self.stop_event.is_set():
             raise ValueError("Los avisos locales no están disponibles.")
         self.alerts.test()
+        return self.snapshot()
+
+    def webhook_status(self):
+        return self.webhooks.status()
+
+    def set_webhooks(self, settings):
+        # Configuration may touch SQLite; never hold the telemetry lock here.
+        with self.settings_lock:
+            if self.stop_event.is_set():
+                raise ValueError("Los webhooks no están disponibles: el monitor está detenido.")
+            self.webhooks.update_settings(settings)
+        return self.snapshot()
+
+    def test_webhooks(self):
+        if self.stop_event.is_set():
+            raise ValueError("Los webhooks no están disponibles: el monitor está detenido.")
+        with self.lock:
+            sample = dict(self.sample) if self.sample is not None else None
+        self.webhooks.test(sample)
         return self.snapshot()
 
     def _policy_event(self, kind, message, data):
@@ -1228,6 +1260,10 @@ class Monitor:
     def start(self):
         if self.thread is not None:
             raise RuntimeError("El monitor ya fue iniciado; crea otro para reiniciar.")
+        try:
+            self.webhooks.start()
+        except Exception as exc:
+            log_failure("No se pudo iniciar el envío de webhooks", exc)
         self._last_processed_at = self.health.clock()
         self.processor_thread = threading.Thread(target=self.consume, name="ups-telemetry-consumer", daemon=True)
         self.thread = threading.Thread(target=self.run, name="ups-hardware-polling", daemon=True)
@@ -1240,6 +1276,10 @@ class Monitor:
         self.stop_event.set()
         self._poll_wake.set()
         self._health_fault.set()
+        try:
+            self.webhooks.stop()
+        except Exception as exc:
+            log_failure("No se pudo detener el envío de webhooks", exc)
         if self.lock.acquire(timeout=1):
             try:
                 self.ups_cancel_test.interrupted()
@@ -1333,6 +1373,7 @@ class Monitor:
                 "ups_cancel_test": self.ups_cancel_test_status(),
                 "ups_battery_test": self.ups_battery_test_status(),
                 "notifications": self.notification_status(),
+                "webhooks": self.webhook_status(),
                 "protection": {"state": state, "reason": reason,
                                "phase": phase, "windows_request": self._windows_request,
                                "cancelable": state == "countdown" and phase == "windows_countdown",
@@ -1524,6 +1565,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(self.monitor.health_status())
             if parsed.path == "/api/notifications":
                 return self._json(self.monitor.notification_status())
+            if parsed.path == "/api/webhooks":
+                return self._json(self.monitor.webhook_status())
             if parsed.path == "/api/history":
                 hours = float(parse_qs(parsed.query).get("hours", ["24"])[0])
                 return self._json({"samples": self.monitor.store.history(hours)})
@@ -1568,6 +1611,12 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(self.monitor.set_notifications(data))
             if path == "/api/notifications/test":
                 return self._json(self.monitor.test_notifications())
+            if path == "/api/webhooks":
+                return self._json(self.monitor.set_webhooks(data))
+            if path == "/api/webhooks/test":
+                if not isinstance(data, dict) or data:
+                    raise ValueError("La prueba usa la configuración de webhooks guardada.")
+                return self._json(self.monitor.test_webhooks())
             if path == "/api/session/poll":
                 broker = getattr(self.server, "session_broker", None)
                 if broker is None:
@@ -1648,7 +1697,7 @@ def main(argv=None, *, stop_event=None, ready_callback=None):
     parser.add_argument("--forza-url", default="http://127.0.0.1:15179/Forza")
     parser.add_argument("--source", choices=("auto", "native", "bridge", "simulation"), default="auto")
     parser.add_argument("--usb-info", action="store_true", help="Inspecciona metadatos HID sin enviar consultas")
-    parser.add_argument("--dry-run", action="store_true", help="Bloquea acciones reales en Windows para desarrollo")
+    parser.add_argument("--dry-run", action="store_true", help="Simula las acciones de energía y los webhooks, sin realizar POST")
     parser.add_argument("--diagnose", action="store_true", help="Lee una muestra real y termina")
     parser.add_argument("--headless", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--allow-ups-poweroff", action="store_true", help="Permiso adicional para perfiles UPS físicamente validados")

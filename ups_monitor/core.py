@@ -147,6 +147,8 @@ class Store:
                     CREATE INDEX IF NOT EXISTS events_ts ON events(ts);
                     CREATE TABLE IF NOT EXISTS settings (
                         key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                    CREATE TABLE IF NOT EXISTS webhook_deliveries (
+                        id TEXT PRIMARY KEY, ts REAL NOT NULL, payload TEXT NOT NULL);
                 """)
             self._last_prune = 0.0
             self._prune()
@@ -210,7 +212,7 @@ class Store:
         Public hooks remain in the path for instrumented/custom stores.
         """
         entries = list(entries)
-        if any(kind not in ("sample", "event") for kind, _ in entries):
+        if any(kind not in ("sample", "event", "webhook_delivery") for kind, _ in entries):
             raise ValueError("Tipo de escritura desconocido")
         self._prune()
         results = []
@@ -220,6 +222,8 @@ class Store:
                 for kind, value in entries:
                     if kind == "sample":
                         results.append(self.add_sample(value))
+                    elif kind == "webhook_delivery":
+                        results.append(self.add_webhook_delivery(value))
                     else:
                         results.append(self.add_event(value["kind"], value["message"], value["data"],
                                                       timestamp=value["timestamp"]))
@@ -236,6 +240,40 @@ class Store:
         payload = json.dumps(value, allow_nan=False)
         with self._lock, self._db:
             self._db.execute("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, payload))
+
+    @staticmethod
+    def _webhook_delivery(record):
+        if (not isinstance(record, dict) or not isinstance(record.get("id"), str)
+                or not 1 <= len(record["id"]) <= 64):
+            raise ValueError("Registro de entrega de webhook no válido.")
+        value = copy.deepcopy(record)
+        value["timestamp"] = iso_utc(_timestamp(value.get("timestamp")))
+        json.dumps(value, allow_nan=False)
+        return value
+
+    def add_webhook_delivery(self, record):
+        """Update a delivery by stable ID, retaining only the latest 50.
+
+        Delivery state has its own ledger so retries never appear as new UPS
+        incidents or alter the desktop notification/event history.
+        """
+        value = self._webhook_delivery(record)
+        with self._transaction():
+            self._db.execute(
+                "INSERT INTO webhook_deliveries(id,ts,payload) VALUES(?,?,?) "
+                "ON CONFLICT(id) DO UPDATE SET ts=excluded.ts,payload=excluded.payload",
+                (value["id"], _timestamp(value["timestamp"]).timestamp(), json.dumps(value, allow_nan=False)))
+            self._db.execute("DELETE FROM webhook_deliveries WHERE id NOT IN "
+                             "(SELECT id FROM webhook_deliveries ORDER BY ts DESC,id DESC LIMIT 50)")
+        return value
+
+    def webhook_deliveries(self, limit=50):
+        if type(limit) is not int or not 1 <= limit <= 50:
+            raise ValueError("limit debe ser entero entre 1 y 50")
+        with self._lock:
+            rows = self._db.execute("SELECT payload FROM webhook_deliveries ORDER BY ts DESC,id DESC LIMIT ?",
+                                    (limit,)).fetchall()
+        return [json.loads(row[0]) for row in rows]
 
     @staticmethod
     def _hours(hours):

@@ -50,6 +50,10 @@
     policyDirty: false,
     notificationsInitialized: false,
     notificationsDirty: false,
+    webhooksInitialized: false,
+    webhooksDirty: false,
+    webhookTestSignature: null,
+    webhookDeliveriesSignature: null,
     statusBusy: false,
     historyBusy: false,
     historyQueryError: null,
@@ -91,7 +95,9 @@
     protection: { hash: "proteccion", title: "Protección", description: "Elige qué hacer cuando se corte la luz." },
     history: { hash: "historial", title: "Historial", description: "" },
     system: { hash: "sistema", title: "Sistema", description: "" },
+    webhooks: { hash: "webhooks", title: "Webhooks", description: "Configura y gestiona tus integraciones con sistemas externos." },
   };
+  const webhookEventIds = ["power_lost", "power_restored", "battery_low", "overload", "ups_fault"];
   const clockFormat = new Intl.DateTimeFormat("es-PE", { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false });
   const shortClockFormat = new Intl.DateTimeFormat("es-PE", { hour: "2-digit", minute: "2-digit", hour12: false });
   const dateFormat = new Intl.DateTimeFormat("es-PE", { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit", hour12: false });
@@ -471,6 +477,21 @@
     $("test-notifications").title = unavailable ? "El panel debe recuperar la conexión con el monitor."
       : delivery?.available === false ? "Los avisos de escritorio no están disponibles. Consulta el diagnóstico."
       : delivery?.ready === false ? "Espera a que el canal de avisos esté listo." : "Envía una prueba desde el monitor. No apaga ni hiberna Windows.";
+    const webhookSettingsMissing = !state.status?.webhooks?.settings;
+    $("webhooks-form").querySelectorAll("input").forEach((field) => { field.disabled = unavailable || busy || webhookSettingsMissing; });
+    $("save-webhooks").disabled = unavailable || busy || webhookSettingsMissing;
+    const webhookTestPending = ["queued", "sending", "retrying"].includes(state.status?.webhooks?.test?.state);
+    $("test-webhook").disabled = unavailable || busy || webhookSettingsMissing || webhookTestPending
+      || !$("webhook-enabled").checked || !$("webhook-url").value.trim();
+    $("test-webhook").title = unavailable ? "El panel debe recuperar la conexión con el monitor."
+      : webhookSettingsMissing ? "La configuración de webhooks no está disponible."
+      : !$("webhook-enabled").checked ? "Activa y guarda los webhooks antes de probar."
+      : !$("webhook-url").value.trim() ? "Configura y guarda una URL antes de probar."
+      : webhookTestPending ? "Hay una prueba de webhook en curso."
+      : state.webhooksDirty ? "Guarda los cambios antes de probar el webhook."
+      : state.status?.webhooks?.dry_run ? "Simula la prueba sin enviar un POST (--dry-run)."
+      : "Envía un evento webhook_test a la URL guardada.";
+    if (state.mutation !== "test-webhook") setText("test-webhook-label", state.status?.webhooks?.test?.state === "retrying" ? "Esperando reintento…" : webhookTestPending ? "Enviando prueba…" : "Probar webhook");
     $("test-shutdown").title = unavailable ? "El panel debe recuperar la conexión con el monitor."
       : transition ? "Espera a que Windows reanude las lecturas antes de simular."
       : enabled ? "Desactiva y guarda la protección automática antes de probar el aviso."
@@ -507,6 +528,7 @@
     // Losing this panel's API connection does not cancel the monitor's countdown.
     renderProtection(state.status?.protection || {});
     renderNotifications(state.status?.notifications);
+    renderWebhooks(state.status?.webhooks);
     renderHistoryStatus();
     renderHealth(state.status?.health);
     renderUpsPoweroff();
@@ -1018,6 +1040,118 @@
     state.notificationsInitialized = true;
   }
 
+  function webhookDraft() {
+    return {
+      webhook_enabled: $("webhook-enabled").checked,
+      webhook_url: $("webhook-url").value.trim(),
+      webhook_events: webhookEventIds.filter((id) => $("webhook-event-" + id).checked),
+    };
+  }
+
+  function webhookSettingsMatch(draft, saved) {
+    return !!saved && draft.webhook_enabled === saved.webhook_enabled
+      && draft.webhook_url === saved.webhook_url
+      && webhookEventIds.every((id) => draft.webhook_events.includes(id) === (saved.webhook_events || []).includes(id));
+  }
+
+  function renderWebhookSelection() {
+    const count = webhookEventIds.filter((id) => $("webhook-event-" + id).checked).length;
+    setText("webhook-event-count", `${count} de 5 seleccionados`);
+  }
+
+  function renderWebhooks(webhooks) {
+    const settings = webhooks?.settings;
+    $("webhooks-dry-run").hidden = webhooks?.dry_run !== true;
+    if (settings && !(state.webhooksInitialized && state.webhooksDirty)) {
+      $("webhook-enabled").checked = settings.webhook_enabled === true;
+      $("webhook-url").value = typeof settings.webhook_url === "string" ? settings.webhook_url : "";
+      const events = Array.isArray(settings.webhook_events) ? settings.webhook_events : ["power_lost", "battery_low"];
+      webhookEventIds.forEach((id) => { $("webhook-event-" + id).checked = events.includes(id); });
+      state.webhooksInitialized = true;
+    }
+    renderWebhookSelection();
+    const test = webhooks?.test;
+    if (test && test.id != null) {
+      const signature = JSON.stringify([test.id, test.state, test.message, test.http_status, test.attempts, test.next_retry_at]);
+      if (signature !== state.webhookTestSignature) {
+        state.webhookTestSignature = signature;
+        const feedback = $("webhooks-test-feedback");
+        const fallback = {
+          queued: "Prueba en cola. Esperando el envío…",
+          sending: "Enviando prueba al webhook…",
+          retrying: "El primer intento falló. Reintento en 5 s (2/2).",
+          success: "Prueba enviada correctamente.",
+          error: "No se pudo enviar la prueba del webhook.",
+          simulated: "Prueba simulada (--dry-run). No se envió ningún webhook.",
+          cancelled: "La prueba se canceló al cambiar la configuración.",
+        };
+        // A queued request is not a successful delivery; the monitor confirms it in later polls.
+        const message = test.state === "simulated" ? fallback.simulated : test.state === "retrying" ? fallback.retrying : test.message || fallback[test.state] || "Estado de prueba no disponible.";
+        setText("webhooks-test-feedback", test.state === "success" && Number.isInteger(test.http_status) ? `${message} HTTP ${test.http_status}.` : message);
+        feedback.hidden = false;
+        feedback.classList.toggle("error", test.state === "error");
+        feedback.classList.toggle("simulated", test.state === "simulated" || test.state === "retrying");
+      }
+    }
+    renderWebhookDeliveries(webhooks?.deliveries);
+    updateMutationControls();
+  }
+
+  function renderWebhookDeliveries(deliveries) {
+    const events = {
+      power_lost: "Corte de energía", power_restored: "Suministro recuperado", battery_low: "Batería baja",
+      overload: "Sobrecarga", ups_fault: "Falla del UPS", webhook_test: "Prueba de webhook",
+    };
+    const labels = { queued: "En cola", sending: "Enviando", success: "Entregado", error: "Fallido", cancelled: "Cancelado", simulated: "Simulado" };
+    const rows = (Array.isArray(deliveries) ? deliveries : []).filter((delivery) => delivery && typeof delivery === "object")
+      .slice().sort((left, right) => (parseDate(right.timestamp)?.getTime() || 0) - (parseDate(left.timestamp)?.getTime() || 0)).slice(0, 50)
+      .map((delivery) => {
+        const knownState = delivery.state === "retrying" || Object.hasOwn(labels, delivery.state);
+        const kind = knownState ? delivery.state : "unknown";
+        const retryAt = parseDate(delivery.next_retry_at);
+        const seconds = retryAt ? Math.max(0, Math.ceil((retryAt.getTime() - Date.now()) / 1000)) : 5;
+        const status = kind === "retrying" ? seconds > 0 ? `Reintento en ${seconds} s` : "Reintento pendiente" : labels[kind] || "No disponible";
+        const attempts = Number.isInteger(delivery.attempts) ? Math.max(0, Math.min(2, delivery.attempts)) : 0;
+        const message = typeof delivery.message === "string" ? delivery.message : "";
+        const http = Number.isInteger(delivery.http_status) ? `HTTP ${delivery.http_status}` : "";
+        const result = message && http && !message.includes(http) ? `${message} (${http})` : message || http || "—";
+        return { id: delivery.id, timestamp: delivery.timestamp, event: String(delivery.event || "—"), kind, status, attempts, result };
+      });
+    const signature = JSON.stringify(rows);
+    if (signature === state.webhookDeliveriesSignature) return;
+    state.webhookDeliveriesSignature = signature;
+    setText("webhook-deliveries-count", `${rows.length} ${rows.length === 1 ? "entrega" : "entregas"}`);
+    $("webhook-deliveries-empty").hidden = rows.length !== 0;
+    $("webhook-deliveries-scroll").hidden = rows.length === 0;
+    const body = $("webhook-deliveries-body");
+    const nodes = rows.map((delivery) => {
+      const row = document.createElement("tr");
+      row.dataset.deliveryId = String(delivery.id || "");
+      const cell = (value) => {
+        const node = document.createElement("td");
+        node.textContent = value;
+        row.append(node);
+        return node;
+      };
+      cell(formatMoment(delivery.timestamp));
+      const event = cell("");
+      const name = document.createElement("strong");
+      name.textContent = Object.hasOwn(events, delivery.event) ? events[delivery.event] : delivery.event;
+      const code = document.createElement("code");
+      code.textContent = delivery.event;
+      event.append(name, code);
+      const status = cell("");
+      const badge = document.createElement("span");
+      badge.classList.add("webhook-delivery-state", `webhook-delivery-${delivery.kind}`);
+      badge.textContent = delivery.status;
+      status.append(badge);
+      cell(`${delivery.attempts}/2`);
+      cell(delivery.result);
+      return row;
+    });
+    body.replaceChildren(...nodes);
+  }
+
   function formatMoment(value) {
     const date = parseDate(value);
     return date ? recordDateFormat.format(date) : "Sin registro";
@@ -1312,6 +1446,7 @@
     renderProtection(data.protection || {});
     renderManualUpsTestNotices();
     renderNotifications(data.notifications);
+    renderWebhooks(data.webhooks);
     renderHistoryStatus();
     renderHealth(data.health);
     loadViewData();
@@ -1547,6 +1682,74 @@
     updateMutationControls();
     renderManualUpsTestNotices();
     renderUpsPoweroff();
+  });
+  $("webhooks-form").addEventListener("input", () => {
+    state.webhooksDirty = !webhookSettingsMatch(webhookDraft(), state.status?.webhooks?.settings);
+    setText("webhooks-feedback", state.webhooksDirty ? "Cambios sin guardar" : "");
+    $("webhooks-feedback").classList.remove("error");
+    renderWebhookSelection();
+    updateMutationControls();
+  });
+  $("webhooks-form").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    if ($("save-webhooks").disabled || state.mutation) return;
+    if (!$("webhooks-form").reportValidity()) return;
+    const settings = webhookDraft();
+    if (settings.webhook_enabled && !settings.webhook_url) {
+      setText("webhooks-feedback", "Introduce una URL para activar los webhooks.");
+      $("webhooks-feedback").classList.add("error");
+      $("webhook-url").focus();
+      return;
+    }
+    state.mutation = "save-webhooks";
+    state.statusGeneration += 1;
+    updateMutationControls();
+    setText("save-webhooks-label", "Guardando…");
+    try {
+      const result = await post("/api/webhooks", settings);
+      applyStatus(result);
+      if (!result.webhooks?.settings || !webhookSettingsMatch(settings, result.webhooks.settings)) throw new Error("El monitor no confirmó la configuración de webhooks.");
+      state.webhooksDirty = false;
+      state.webhooksInitialized = false;
+      renderWebhooks(result.webhooks);
+      setText("webhooks-feedback", settings.webhook_enabled ? "Webhooks guardados" : "Envíos desactivados. Configuración conservada.");
+      $("webhooks-feedback").classList.remove("error");
+      toast(settings.webhook_enabled ? "Configuración de webhooks guardada." : "Webhooks desactivados. Se conservaron la URL y los eventos.");
+    } catch (error) {
+      if (error.communicationFailure) serviceUnavailable(error);
+      setText("webhooks-feedback", `Guardado sin confirmar. ${error.message}`);
+      $("webhooks-feedback").classList.add("error");
+    } finally {
+      state.mutation = null;
+      setText("save-webhooks-label", "Guardar webhooks");
+      updateMutationControls();
+    }
+  });
+  $("test-webhook").addEventListener("click", async () => {
+    if ($("test-webhook").disabled || state.mutation) return;
+    if (state.webhooksDirty) {
+      setText("webhooks-feedback", "Guarda los cambios antes de probar el webhook.");
+      $("webhooks-feedback").classList.add("error");
+      return;
+    }
+    state.mutation = "test-webhook";
+    state.statusGeneration += 1;
+    updateMutationControls();
+    setText("test-webhook-label", "Solicitando prueba…");
+    try {
+      const result = await post("/api/webhooks/test", {});
+      if (result.webhooks?.test?.id == null) throw new Error("El monitor no confirmó la solicitud de prueba.");
+      applyStatus(result);
+    } catch (error) {
+      if (error.communicationFailure) serviceUnavailable(error);
+      setText("webhooks-test-feedback", `Prueba sin confirmar. ${error.message}`);
+      $("webhooks-test-feedback").hidden = false;
+      $("webhooks-test-feedback").classList.add("error");
+      $("webhooks-test-feedback").classList.remove("simulated");
+    } finally {
+      state.mutation = null;
+      updateMutationControls();
+    }
   });
   $("notifications-form").addEventListener("input", () => {
     state.notificationsDirty = true;

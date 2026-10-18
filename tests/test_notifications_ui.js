@@ -85,6 +85,12 @@ function snapshot(settings = {}) {
     meta: { source: "native" },
     policy: { enabled: false, on_battery_seconds: 300, countdown_seconds: 60, action: "shutdown" },
     protection: { state: "idle" },
+    webhooks: {
+      settings: { webhook_enabled: false, webhook_url: "", webhook_events: ["power_lost", "battery_low"] },
+      dry_run: false,
+      test: null,
+      deliveries: [],
+    },
     notifications: {
       settings: { enabled: true, sound_enabled: true, repeat_seconds: 30, ...settings },
       delivery: { available: true, ready: true, channel: "windows", last_error: null, last_delivered_at: null },
@@ -120,6 +126,7 @@ function harness(historyOptions = {}) {
   const policyFields = ["policy-enabled", "policy-on-battery", "policy-low-battery", "policy-runtime", "policy-countdown", "policy-action", "policy-ups-poweroff", "policy-ups-delay"];
   get("policy-form").fields = policyFields.map(get);
   get("notifications-form").fields = ["notifications-enabled", "notifications-sound", "notifications-repeat", "notifications-persistent"].map(get);
+  get("webhooks-form").fields = ["webhook-enabled", "webhook-url", ...["power_lost", "power_restored", "battery_low", "overload", "ups_fault"].map((event) => "webhook-event-" + event)].map(get);
   const selectors = new Map();
   const intervals = [];
   const timeouts = new Map();
@@ -134,7 +141,7 @@ function harness(historyOptions = {}) {
   const storageWrites = [];
   const historyCalls = [];
   const pendingHistory = [];
-  const views = ["overview", "protection", "history", "system"];
+  const views = ["overview", "protection", "history", "system", "webhooks"];
   const nav = historyOptions.navigation ? views.map((view) => Object.assign(new Element(), { dataset: { view } })) : [];
   const pages = historyOptions.navigation ? views.map((view) => Object.assign(get(`page-${view}`), { dataset: { page: view } })) : [];
   const markupShortcuts = [...html.matchAll(/<a\b[^>]*\bdata-go-view="([^"]+)"[^>]*>/gi)].map((match) => {
@@ -1066,7 +1073,7 @@ test("unsaved protection and notice edits survive navigation and status updates"
   assert.equal(ui.calls.some((call) => call.options.method === "POST"), false);
 });
 
-test("sidebar monitoring and critical protection controls remain accurate across all four sections", async () => {
+test("sidebar monitoring and critical protection controls remain accurate across all five sections", async () => {
   const ui = harness({ navigation: true });
   const data = snapshot();
   data.meta.dry_run = true;
@@ -1075,7 +1082,7 @@ test("sidebar monitoring and critical protection controls remain accurate across
   data.health = { state: "healthy", reader_alive: true, supervisor_alive: true };
   ui.calls[0].respond(data);
   await flush();
-  const views = ["overview", "protection", "history", "system"];
+  const views = ["overview", "protection", "history", "system", "webhooks"];
   assert.equal(ui.get("development-notice").hidden, false);
   const lastReading = ui.get("last-updated").textContent;
   assert.match(lastReading, /^Hace \d+ s · /);
@@ -1166,13 +1173,13 @@ test("section shortcuts and keyboard navigation are accessible and do not submit
   const ui = harness({ navigation: true });
   ui.shortcuts[3].emit("click");
   assert.equal(ui.get("view-title").textContent, "Sistema");
-  ui.nav[3].emit("keydown", { key: "ArrowDown" });
+  ui.nav.at(-1).emit("keydown", { key: "ArrowDown" });
   assert.equal(ui.nav[0].focused, true);
   assert.equal(ui.get("view-title").textContent, "Sistema");
   ui.nav[3].emit("keydown", { key: "Home" });
   assert.equal(ui.nav[0].focused, true);
   ui.nav[0].emit("keydown", { key: "End" });
-  assert.equal(ui.nav[3].focused, true);
+  assert.equal(ui.nav.at(-1).focused, true);
   assert.equal(ui.calls.some((call) => call.options.method === "POST"), false);
 });
 
@@ -1937,7 +1944,7 @@ test("Escape acknowledges the dialog and restores focus without posting a power 
 });
 
 test("real protection countdowns open a cancelable dialog in every view without requiring physical alarms", async () => {
-  for (const view of ["overview", "protection", "history", "system"]) {
+  for (const view of ["overview", "protection", "history", "system", "webhooks"]) {
     const { ui, data } = await currentUi({}, { navigation: true });
     ui.open(view);
     ui.get("policy-countdown").value = "999";
@@ -2720,7 +2727,7 @@ test("an unconfirmed production review never retries or claims the previous phys
 });
 
 test("Protection is the second sidebar destination and keyboard order matches the production navigation", async () => {
-  const expected = ["overview", "protection", "history", "system"];
+  const expected = ["overview", "protection", "history", "system", "webhooks"];
   const sidebar = html.match(/<nav class="sidebar-nav"[\s\S]*?<\/nav>/)?.[0];
   assert.deepEqual([...sidebar.matchAll(/data-view="([^"]+)"/g)].map((match) => match[1]), expected);
   const { ui } = await currentUi({}, { navigation: true });
@@ -2991,4 +2998,276 @@ test("healthy UPS capability copy disappears only when actually available and no
   assert.equal(ui.get("ups-power-capability").hidden, false);
   assert.match(ui.get("ups-power-capability").textContent, /requiere revisión/);
   assert.equal(ui.calls.some((call) => call.options.method === "POST"), false);
+});
+
+async function connectedWebhooks(settings = {}, options = {}) {
+  const ui = harness(options);
+  const data = snapshot();
+  Object.assign(data.webhooks.settings, settings);
+  ui.calls[0].respond(data);
+  await flush();
+  return { ui, data };
+}
+
+test("Webhooks follows Sistema, opens by deep link and exposes the five default event switches", async () => {
+  const { ui } = await connectedWebhooks({}, { navigation: true, hash: "#webhooks" });
+  assert.equal(ui.get("page-webhooks").hidden, false);
+  assert.equal(ui.get("view-title").textContent, "Webhooks");
+  assert.equal(ui.get("view-description").textContent, "Configura y gestiona tus integraciones con sistemas externos.");
+  assert.equal(ui.nav.at(-2).dataset.view, "system");
+  assert.equal(ui.nav.at(-1).dataset.view, "webhooks");
+  assert.equal(ui.get("webhook-enabled").checked, false);
+  assert.equal(ui.get("webhook-url").value, "");
+  for (const event of ["power_lost", "power_restored", "battery_low", "overload", "ups_fault"]) {
+    assert.equal(ui.get("webhook-event-" + event).checked, ["power_lost", "battery_low"].includes(event));
+    assert.equal(ui.get("webhook-event-" + event).getAttribute("role"), "switch");
+    assert.equal(ui.get("webhook-event-" + event).disabled, false, "Paused webhooks still permit editing event choices");
+  }
+  assert.equal(ui.get("webhook-url").disabled, false);
+  assert.equal(ui.get("test-webhook").disabled, true);
+  assert.equal(ui.get("webhook-event-count").textContent, "2 de 5 seleccionados");
+  assert.equal(ui.get("shared-history").hidden, true);
+  assert.equal(ui.intervals.filter((interval) => interval.ms === 2000).length, 1);
+  assert.equal(ui.calls.some((call) => call.options.method === "POST"), false);
+});
+
+test("pausing webhooks saves the master switch without clearing its URL or selected events", async () => {
+  const settings = { webhook_enabled: true, webhook_url: "https://n8n.example.test/webhook/elipro", webhook_events: ["power_lost", "battery_low", "ups_fault"] };
+  const { ui, data } = await connectedWebhooks(settings);
+  ui.get("webhook-enabled").checked = false;
+  ui.get("webhooks-form").emit("input");
+  assert.equal(ui.get("webhook-url").value, settings.webhook_url);
+  assert.equal(ui.get("webhook-event-ups_fault").checked, true);
+  assert.equal(ui.get("test-webhook").disabled, true);
+  const pending = ui.get("webhooks-form").emit("submit");
+  const call = ui.calls.at(-1);
+  assert.equal(call.url, "/api/webhooks");
+  assert.equal(call.options.headers["X-UPS-Token"], "test-token");
+  assert.deepEqual(JSON.parse(call.options.body), { ...settings, webhook_enabled: false });
+  data.webhooks.settings.webhook_enabled = false;
+  call.respond(data);
+  await pending;
+  await pushStatus(ui, data);
+  assert.equal(ui.get("webhook-url").value, settings.webhook_url);
+  assert.equal(ui.get("webhook-event-ups_fault").checked, true);
+  assert.equal(ui.get("webhook-event-count").textContent, "3 de 5 seleccionados");
+  assert.equal(ui.get("webhook-enabled").checked, false);
+  assert.match(ui.get("webhooks-feedback").textContent, /desactivados.*conservada/);
+  ui.get("webhook-enabled").checked = true;
+  ui.get("webhooks-form").emit("input");
+  assert.equal(ui.get("webhook-url").value, settings.webhook_url);
+  assert.equal(ui.get("webhook-event-ups_fault").checked, true);
+});
+
+test("webhook drafts survive polling, navigation and saves of unrelated desktop notification settings", async () => {
+  const { ui, data } = await connectedWebhooks({}, { navigation: true });
+  ui.open("webhooks");
+  ui.get("webhook-enabled").checked = true;
+  ui.get("webhook-url").value = "https://n8n.example.test/draft";
+  ui.get("webhook-event-power_restored").checked = true;
+  ui.get("webhooks-form").emit("input");
+  ui.open("system");
+  await pushStatus(ui, data);
+  ui.get("notifications-sound").checked = false;
+  ui.get("notifications-form").emit("input");
+  const pending = ui.get("notifications-form").emit("submit");
+  data.notifications.settings.sound_enabled = false;
+  ui.calls.at(-1).respond(data);
+  await pending;
+  ui.open("webhooks");
+  assert.equal(ui.get("webhook-enabled").checked, true);
+  assert.equal(ui.get("webhook-url").value, "https://n8n.example.test/draft");
+  assert.equal(ui.get("webhook-event-power_restored").checked, true);
+  assert.equal(ui.get("webhook-event-count").textContent, "3 de 5 seleccionados");
+  assert.equal(ui.get("webhooks-feedback").textContent, "Cambios sin guardar");
+  assert.deepEqual(ui.calls.filter((call) => call.options.method === "POST").map((call) => call.url), ["/api/notifications"]);
+});
+
+test("testing a dirty webhook requires saving and never posts the draft destination", async () => {
+  const { ui } = await connectedWebhooks({ webhook_enabled: true, webhook_url: "https://n8n.example.test/saved" });
+  ui.get("webhook-url").value = "https://n8n.example.test/unsaved";
+  ui.get("webhooks-form").emit("input");
+  await ui.get("test-webhook").emit("click");
+  assert.match(ui.get("webhooks-feedback").textContent, /Guarda los cambios antes de probar/);
+  assert.equal(ui.calls.some((call) => call.options.method === "POST"), false);
+  ui.get("webhook-url").value = "https://n8n.example.test/saved";
+  ui.get("webhooks-form").emit("input");
+  assert.equal(ui.get("webhooks-feedback").textContent, "");
+});
+
+test("a queued webhook test keeps status polling active until HTTP success is confirmed", async () => {
+  const { ui, data } = await connectedWebhooks({ webhook_enabled: true, webhook_url: "https://n8n.example.test/saved" });
+  const pending = ui.get("test-webhook").emit("click");
+  const call = ui.calls.at(-1);
+  assert.equal(call.url, "/api/webhooks/test");
+  assert.equal(call.options.headers["X-UPS-Token"], "test-token");
+  assert.deepEqual(JSON.parse(call.options.body), {});
+  data.webhooks.test = { id: "test-1", state: "queued", message: "Prueba en cola." };
+  call.respond(data);
+  await pending;
+  assert.equal(ui.get("test-webhook").disabled, true);
+  assert.match(ui.get("webhooks-test-feedback").textContent, /cola/);
+  assert.doesNotMatch(ui.get("webhooks-test-feedback").textContent, /correctamente|éxito/);
+  data.webhooks.test = { id: "test-1", state: "sending", message: "Enviando prueba." };
+  const beforePoll = ui.calls.length;
+  await pushStatus(ui, data);
+  assert.equal(ui.calls.length, beforePoll + 1);
+  assert.equal(ui.calls.at(-1).url, "/api/status");
+  assert.match(ui.get("webhooks-test-feedback").textContent, /Enviando/);
+  data.webhooks.test = { id: "test-1", state: "success", message: "Prueba recibida.", http_status: 204 };
+  await pushStatus(ui, data);
+  assert.match(ui.get("webhooks-test-feedback").textContent, /Prueba recibida.*HTTP 204/);
+  assert.equal(ui.get("webhooks-test-feedback").classList.contains("error"), false);
+  assert.equal(ui.get("test-webhook").disabled, false);
+  assert.deepEqual(ui.calls.filter((request) => request.options.method === "POST").map((request) => request.url), ["/api/webhooks/test"]);
+});
+
+test("webhook HTTP errors remain local and a later cancelled test never claims successful delivery", async () => {
+  const { ui, data } = await connectedWebhooks({ webhook_enabled: true, webhook_url: "https://n8n.example.test/saved" });
+  data.webhooks.test = { id: "test-error", state: "error", message: "El destino devolvió HTTP 500.", http_status: 500 };
+  await pushStatus(ui, data);
+  assert.equal(ui.get("webhooks-test-feedback").classList.contains("error"), true);
+  assert.match(ui.get("webhooks-test-feedback").textContent, /HTTP 500/);
+  assert.equal(ui.get("save-webhooks").disabled, false);
+  assert.equal(ui.get("save-notifications").disabled, false);
+  assert.equal(ui.get("test-webhook").disabled, false);
+  assert.equal(ui.get("service-notice").hidden, true);
+  data.webhooks.test = { id: "test-cancelled", state: "cancelled", message: "" };
+  await pushStatus(ui, data);
+  assert.match(ui.get("webhooks-test-feedback").textContent, /canceló al cambiar la configuración/);
+  assert.equal(ui.get("webhooks-test-feedback").classList.contains("error"), false);
+  assert.equal(ui.get("test-webhook").disabled, false);
+});
+
+test("dry-run tests explicitly report simulation and never display a misleading delivery success", async () => {
+  const { ui, data } = await connectedWebhooks({ webhook_enabled: true, webhook_url: "https://n8n.example.test/saved" });
+  data.webhooks.dry_run = true;
+  await pushStatus(ui, data);
+  assert.equal(ui.get("webhooks-dry-run").hidden, false);
+  const pending = ui.get("test-webhook").emit("click");
+  data.webhooks.test = { id: "test-dry", state: "simulated", message: "Prueba aceptada." };
+  ui.calls.at(-1).respond(data);
+  await pending;
+  assert.match(ui.get("webhooks-test-feedback").textContent, /simulada.*--dry-run.*No se envió/);
+  assert.equal(ui.get("webhooks-test-feedback").classList.contains("simulated"), true);
+  assert.equal(ui.get("webhooks-test-feedback").classList.contains("error"), false);
+  assert.equal(ui.get("test-webhook").disabled, false);
+});
+
+test("API loss disables every webhook control and reconnect preserves unsaved URL and event edits", async () => {
+  const { ui, data } = await connectedWebhooks({ webhook_enabled: true, webhook_url: "https://n8n.example.test/saved" });
+  ui.get("webhook-url").value = "https://n8n.example.test/draft";
+  ui.get("webhook-event-overload").checked = true;
+  ui.get("webhooks-form").emit("input");
+  const pending = ui.poll();
+  ui.calls.at(-1).reject(new TypeError("network failure"));
+  await pending;
+  for (const field of ui.get("webhooks-form").fields) assert.equal(field.disabled, true);
+  assert.equal(ui.get("save-webhooks").disabled, true);
+  assert.equal(ui.get("test-webhook").disabled, true);
+  await pushStatus(ui, data);
+  assert.equal(ui.get("webhook-url").value, "https://n8n.example.test/draft");
+  assert.equal(ui.get("webhook-event-overload").checked, true);
+  assert.equal(ui.get("save-webhooks").disabled, false);
+  for (const field of ui.get("webhooks-form").fields) assert.equal(field.disabled, false);
+});
+
+test("webhook delivery history starts empty and exposes the bounded retry policy", async () => {
+  const { ui } = await connectedWebhooks();
+  assert.equal(ui.get("webhook-deliveries-empty").hidden, false);
+  assert.equal(ui.get("webhook-deliveries-scroll").hidden, true);
+  assert.equal(ui.get("webhook-deliveries-body").children.length, 0);
+  assert.equal(ui.get("webhook-deliveries-count").textContent, "0 entregas");
+  assert.match(html, /Máximo 2 intentos · Espera entre intentos: 5 s · Timeout por intento: 5 s/);
+  const table = html.match(/<table id="webhook-deliveries-table"[\s\S]*?<\/table>/)[0];
+  assert.deepEqual([...table.matchAll(/<th scope="col">([^<]+)<\/th>/g)].map((match) => match[1]), ["Fecha/hora", "Evento", "Estado", "Intentos", "Resultado"]);
+});
+
+test("webhook deliveries show real states and attempts, newest first, with the last fifty bounded", async () => {
+  const { ui, data } = await connectedWebhooks();
+  data.webhooks.deliveries = Array.from({ length: 52 }, (_unused, index) => ({
+    id: `delivery-${index}`, event: index === 51 ? "power_lost" : "battery_low", timestamp: new Date(ui.now() - (51 - index) * 1000).toISOString(),
+    state: index === 51 ? "success" : "error", attempts: index === 51 ? 1 : 2, max_attempts: 2,
+    message: index === 51 ? "Recibido" : "Sin respuesta del destino", http_status: index === 51 ? 204 : null,
+  }));
+  await pushStatus(ui, data);
+  const rows = ui.get("webhook-deliveries-body").children;
+  assert.equal(rows.length, 50);
+  assert.equal(ui.get("webhook-deliveries-count").textContent, "50 entregas");
+  assert.equal(ui.get("webhook-deliveries-empty").hidden, true);
+  assert.equal(ui.get("webhook-deliveries-scroll").hidden, false);
+  assert.equal(rows[0].dataset.deliveryId, "delivery-51");
+  assert.equal(rows.at(-1).dataset.deliveryId, "delivery-2");
+  assert.match(textOf(rows[0].children[1]), /Corte de energía.*power_lost/);
+  assert.equal(rows[0].children[2].children[0].textContent, "Entregado");
+  assert.equal(rows[0].children[2].children[0].classList.contains("webhook-delivery-success"), true);
+  assert.equal(rows[0].children[3].textContent, "1/2");
+  assert.equal(rows[0].children[4].textContent, "Recibido (HTTP 204)");
+  assert.equal(rows[1].children[2].children[0].textContent, "Fallido");
+  assert.equal(rows[1].children[2].children[0].classList.contains("webhook-delivery-error"), true);
+  assert.equal(rows[1].children[3].textContent, "2/2");
+});
+
+test("retrying webhook tests block duplicate clicks while polling updates the retry and final result", async () => {
+  const { ui, data } = await connectedWebhooks({ webhook_enabled: true, webhook_url: "https://n8n.example.test/saved" });
+  data.webhooks.test = {
+    id: "retry-test", event: "webhook_test", timestamp: new Date(ui.now()).toISOString(), state: "retrying",
+    attempts: 1, max_attempts: 2, message: "El destino no respondió.", next_retry_at: new Date(ui.now() + 5000).toISOString(),
+  };
+  data.webhooks.deliveries = [data.webhooks.test];
+  await pushStatus(ui, data);
+  assert.equal(ui.get("test-webhook").disabled, true);
+  assert.equal(ui.get("test-webhook-label").textContent, "Esperando reintento…");
+  assert.match(ui.get("webhooks-test-feedback").textContent, /primer intento falló.*Reintento en 5 s.*2\/2/);
+  let row = ui.get("webhook-deliveries-body").children[0];
+  assert.equal(row.children[2].children[0].textContent, "Reintento en 5 s");
+  assert.equal(row.children[2].children[0].classList.contains("webhook-delivery-retrying"), true);
+  assert.equal(row.children[3].textContent, "1/2");
+  const beforeClick = ui.calls.length;
+  await ui.get("test-webhook").emit("click");
+  assert.equal(ui.calls.length, beforeClick);
+  ui.advance(2000);
+  await pushStatus(ui, data);
+  row = ui.get("webhook-deliveries-body").children[0];
+  assert.equal(row.children[2].children[0].textContent, "Reintento en 3 s");
+  data.webhooks.test = { ...data.webhooks.test, state: "sending", attempts: 2, message: "Enviando segundo intento.", next_retry_at: null };
+  data.webhooks.deliveries = [data.webhooks.test];
+  await pushStatus(ui, data);
+  assert.equal(ui.get("test-webhook").disabled, true);
+  data.webhooks.test = { ...data.webhooks.test, state: "success", message: "Prueba recibida.", http_status: 200 };
+  data.webhooks.deliveries = [data.webhooks.test];
+  await pushStatus(ui, data);
+  row = ui.get("webhook-deliveries-body").children[0];
+  assert.equal(row.children[2].children[0].textContent, "Entregado");
+  assert.equal(row.children[3].textContent, "2/2");
+  assert.equal(ui.get("test-webhook").disabled, false);
+  assert.match(ui.get("webhooks-test-feedback").textContent, /recibida.*HTTP 200/);
+  assert.equal(ui.calls.some((call) => call.options.method === "POST"), false);
+});
+
+test("all webhook delivery states are readable and untrusted event names and results remain literal text", async () => {
+  const { ui, data } = await connectedWebhooks();
+  const created = [];
+  const createElement = ui.document.createElement;
+  ui.document.createElement = (tag) => { created.push(tag); return createElement(tag); };
+  const states = ["queued", "sending", "retrying", "success", "error", "cancelled", "simulated", "unexpected"];
+  data.webhooks.deliveries = states.map((state, index) => ({
+    id: `state-${state}`, event: index === 0 ? '<img src=x onerror="alert(1)">' : "webhook_test",
+    timestamp: new Date(ui.now() - index * 1000).toISOString(), state,
+    attempts: state === "queued" || state === "simulated" ? 0 : 1, max_attempts: 2,
+    message: index === 0 ? "<script>alert('delivery')</script>" : "Resultado literal",
+  }));
+  await pushStatus(ui, data);
+  const rows = ui.get("webhook-deliveries-body").children;
+  assert.deepEqual(rows.map((row) => row.children[2].children[0].textContent), ["En cola", "Enviando", "Reintento en 5 s", "Entregado", "Fallido", "Cancelado", "Simulado", "No disponible"]);
+  assert.match(textOf(rows[0].children[1]), /<img src=x onerror="alert\(1\)">/);
+  assert.equal(rows[0].children[4].textContent, "<script>alert('delivery')</script>");
+  assert.equal(rows[0].children[3].textContent, "0/2");
+  assert.equal(created.includes("img"), false);
+  assert.equal(created.includes("script"), false);
+  data.webhooks.deliveries = [];
+  await pushStatus(ui, data);
+  assert.equal(ui.get("webhook-deliveries-body").children.length, 0);
+  assert.equal(ui.get("webhook-deliveries-empty").hidden, false);
+  assert.equal(ui.get("webhook-deliveries-scroll").hidden, true);
 });
