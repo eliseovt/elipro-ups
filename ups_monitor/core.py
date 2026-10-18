@@ -10,9 +10,13 @@ import json
 import base64
 import hashlib
 import math
+import copy
+import queue
 import sqlite3
 import threading
 import time
+from collections import deque
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -85,10 +89,14 @@ class Store:
         self.retention_days = retention_days
         self.path = str(path)
         self._lock = threading.RLock()
+        self._batch_depth = 0
         self._db = sqlite3.connect(str(path), check_same_thread=False, timeout=busy_timeout_ms / 1000)
         try:
             with self._db:
                 self._db.execute("PRAGMA journal_mode=WAL")
+                # Critical barriers rely on an actual durable WAL commit, not
+                # merely a transfer into the operating system's page cache.
+                self._db.execute("PRAGMA synchronous=FULL")
                 self._db.execute(f"PRAGMA busy_timeout={busy_timeout_ms}")
                 self._db.executescript("""
                     CREATE TABLE IF NOT EXISTS samples (
@@ -116,7 +124,7 @@ class Store:
         if now - self._last_prune < 60:
             return
         cutoff = now - self.retention_days * 86400
-        with self._lock, self._db:
+        with self._transaction():
             self._db.execute("DELETE FROM samples WHERE ts < ?", (cutoff,))
             self._db.execute("DELETE FROM events WHERE ts < ?", (cutoff,))
             self._last_prune = now
@@ -129,7 +137,7 @@ class Store:
         # Prune before the insert: a cleanup failure must not turn a committed
         # write into an apparent failure that a persistence worker would retry.
         self._prune()
-        with self._lock, self._db:
+        with self._transaction():
             self._db.execute("INSERT INTO samples(ts,timestamp,payload) VALUES(?,?,?)",
                              (ts, normalized["timestamp"], json.dumps(normalized, allow_nan=False)))
         return normalized
@@ -138,12 +146,48 @@ class Store:
         stamp = iso_utc(_timestamp(timestamp)) if timestamp is not None else iso_utc()
         data = {} if data is None else data
         self._prune()
-        with self._lock, self._db:
+        with self._transaction():
             cursor = self._db.execute(
                 "INSERT INTO events(ts,timestamp,kind,message,data) VALUES(?,?,?,?,?)",
                 (_timestamp(stamp).timestamp(), stamp, kind, message, json.dumps(data, allow_nan=False)))
             event_id = cursor.lastrowid
         return {"id": event_id, "timestamp": stamp, "kind": kind, "message": message, "data": data}
+
+    @contextmanager
+    def _transaction(self):
+        """Allow public write hooks to share one atomic batch transaction."""
+        with self._lock:
+            if self._batch_depth:
+                yield
+            else:
+                with self._db:
+                    yield
+
+    def write_batch(self, entries):
+        """Commit ordered sample/event pairs atomically, or roll them all back.
+
+        Pruning happens before the batch starts, so cleanup cannot report an
+        already committed batch as failed. Event IDs are returned only after
+        the transaction commits; a retry after SQLite busy/disk full is safe.
+        Public hooks remain in the path for instrumented/custom stores.
+        """
+        entries = list(entries)
+        if any(kind not in ("sample", "event") for kind, _ in entries):
+            raise ValueError("Tipo de escritura desconocido")
+        self._prune()
+        results = []
+        with self._transaction():
+            self._batch_depth += 1
+            try:
+                for kind, value in entries:
+                    if kind == "sample":
+                        results.append(self.add_sample(value))
+                    else:
+                        results.append(self.add_event(value["kind"], value["message"], value["data"],
+                                                      timestamp=value["timestamp"]))
+            finally:
+                self._batch_depth -= 1
+        return results
 
     def get_setting(self, key, default=None):
         with self._lock:
@@ -424,6 +468,125 @@ class Store:
     def close(self):
         with self._lock:
             self._db.close()
+
+
+class TelemetryRingBuffer:
+    """Bounded hardware-to-consumer mailbox with one coalesced wake token.
+
+    The producer never waits for disk, the decision lock, or a slow consumer.
+    Samples and pending deliveries have a fixed capacity; overwritten deliveries
+    leave a bounded summary of their electrical transitions. A consumer must
+    invalidate policy continuity on overflow and must never execute an action
+    from historical entries. Returned dictionaries are independent snapshots.
+    """
+
+    _TRANSITIONS = ("power_lost", "power_restored", "battery_low", "ups_fault",
+                    "overload", "connection_lost", "connection_restored")
+
+    def __init__(self, capacity=256):
+        if type(capacity) is not int or not 2 <= capacity <= 10000:
+            raise ValueError("capacity debe ser entero entre 2 y 10000")
+        self.capacity = capacity
+        self._lock = threading.Lock()
+        self._samples, self._pending = deque(maxlen=capacity), deque(maxlen=capacity)
+        self._wake = queue.SimpleQueue()
+        self._wake_pending = False
+        self._sequence = self._dropped = 0
+        self._overflow = None
+        self._last_overflow = None
+        self._previous = None
+
+    def _facts(self, sample, error):
+        previous = self._previous
+        if error is not None:
+            self._previous = {"connected": False}
+            return ["connection_lost"] if previous is None or previous.get("connected") else []
+        current = {"connected": True, "on_battery": sample.get("on_battery"),
+                   "low_battery": sample.get("low_battery") is True or (
+                       type(sample.get("battery_percent")) in (int, float) and sample["battery_percent"] <= 20),
+                   "fault": sample.get("fault") is True,
+                   "overload": type(sample.get("load_percent")) in (int, float) and sample["load_percent"] >= 100}
+        result = []
+        if previous is None or not previous.get("connected"):
+            result.append("connection_restored")
+        if current["on_battery"] is True and (previous is None or previous.get("on_battery") is not True):
+            result.append("power_lost")
+        elif current["on_battery"] is False and previous is not None and previous.get("on_battery") is True:
+            result.append("power_restored")
+        for field, kind in (("low_battery", "battery_low"), ("fault", "ups_fault"), ("overload", "overload")):
+            if current[field] and (previous is None or previous.get(field) is not True):
+                result.append(kind)
+        self._previous = current
+        return result
+
+    def publish(self, sample=None, *, error=None, error_kind="telemetry", captured_at=None):
+        owned = copy.deepcopy(sample) if sample is not None else None
+        if error is None and not isinstance(owned, dict):
+            raise ValueError("La telemetría debe ser un objeto")
+        with self._lock:
+            self._sequence += 1
+            entry = {"sequence": self._sequence, "sample": owned,
+                     "error": str(error)[:1000] if error is not None else None,
+                     "error_kind": error_kind, "captured_at": captured_at,
+                     "facts": self._facts(owned, error)}
+            if owned is not None:
+                self._samples.append(owned)
+            if len(self._pending) == self.capacity:
+                lost = self._pending[0]
+                self._dropped += 1
+                if self._overflow is None:
+                    self._overflow = {"count": 0, "first_sequence": lost["sequence"],
+                                      "last_sequence": lost["sequence"], "transitions": {}}
+                self._overflow["count"] += 1
+                self._overflow["last_sequence"] = lost["sequence"]
+                stamp = (lost["sample"] or {}).get("timestamp")
+                for fact in lost["facts"]:
+                    summary = self._overflow["transitions"].setdefault(
+                        fact, {"count": 0, "first_observed_at": stamp, "last_observed_at": stamp})
+                    summary["count"] += 1
+                    summary["last_observed_at"] = stamp
+            self._pending.append(entry)
+            if not self._wake_pending:
+                self._wake_pending = True
+                self._wake.put(True)
+            return self._sequence
+
+    def wait(self, timeout=0.5):
+        try:
+            self._wake.get(timeout=timeout)
+            return True
+        except queue.Empty:
+            return False
+
+    def drain(self):
+        with self._lock:
+            entries, overflow = list(self._pending), self._overflow
+            self._pending.clear()
+            self._overflow = None
+            if overflow is not None:
+                self._last_overflow = copy.deepcopy(overflow)
+            self._wake_pending = False
+            try:
+                self._wake.get_nowait()
+            except queue.Empty:
+                pass
+        return copy.deepcopy(entries), copy.deepcopy(overflow)
+
+    def is_latest(self, sequence):
+        with self._lock:
+            return sequence == self._sequence
+
+    def samples(self):
+        with self._lock:
+            samples = list(self._samples)
+        return copy.deepcopy(samples)
+
+    def status(self):
+        with self._lock:
+            return {"capacity": self.capacity, "samples": len(self._samples),
+                    "pending": len(self._pending), "dropped": self._dropped,
+                    "latest_sequence": self._sequence, "wake_pending": self._wake_pending,
+                    "last_overflow": copy.deepcopy(self._last_overflow or self._overflow)}
 
 
 class PolicyEngine:

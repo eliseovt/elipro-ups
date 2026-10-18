@@ -21,6 +21,7 @@ exe = EXE(
     pyz, a.scripts, [],
     exclude_binaries=True,
     name="Elipro",
+    contents_directory="_internal",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

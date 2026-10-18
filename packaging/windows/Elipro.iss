@@ -39,6 +39,12 @@ SetupLogging=yes
 CloseApplications=yes
 RestartApplications=no
 RestartIfNeededByRun=no
+#ifdef EnableSigning
+SignTool=EliproSigning
+SignedUninstaller=yes
+#else
+SignedUninstaller=no
+#endif
 
 [Languages]
 Name: "spanish"; MessagesFile: "compiler:Languages\Spanish.isl"
@@ -85,6 +91,12 @@ var
   PreviousRedirection: Boolean;
 begin
   Result := '';
+  if (ExpandConstant('{param:SERVICESELFTEST|0}') = '1') and
+    (ExpandConstant('{param:SERVICESIMULATION|0}') = '1') then
+  begin
+    Result := 'SERVICESELFTEST y SERVICESIMULATION son modos distintos y no pueden combinarse.';
+    Exit;
+  end;
   if CompareText(RemoveBackslash(ExpandConstant('{app}')),
     RemoveBackslash(ExpandConstant('{autopf}\Elipro UPS'))) <> 0 then
   begin
@@ -135,6 +147,8 @@ begin
     // Only the disposable CI runner uses this explicit no-hardware mode.
     if ExpandConstant('{param:SERVICESELFTEST|0}') = '1' then
       Arguments := Arguments + ' --self-test';
+    if ExpandConstant('{param:SERVICESIMULATION|0}') = '1' then
+      Arguments := Arguments + ' --simulate';
     if not RunServiceCommand(Arguments) then
       RaiseException('No se pudo registrar el servicio de Elipro. Consulta el registro de instalación.');
     if not RunServiceCommand('start') then

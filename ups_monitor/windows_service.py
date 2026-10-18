@@ -1,8 +1,9 @@
 """Native Windows SCM host. Never displays UI or installs itself on import.
 
 The service owns USB, policy and history. Desktop delivery is delegated to the
-per-session agent. Installation deliberately keeps --dry-run; publishing an
-installer must not implicitly enable machine power actions.
+per-session agent. Installation deliberately keeps --dry-run unless an
+administrator explicitly registers --allow-power-actions. That capability never
+enables the saved policy; both gates must allow a real action independently.
 
 SCM contracts: https://learn.microsoft.com/windows/win32/services/service-programs
 """
@@ -103,12 +104,28 @@ def _apis():
     return api
 
 
-def service_command(data_dir, port=8765, *, self_test=False):
+def _validate_modes(self_test, allow_power_actions, simulate=False):
+    if any(type(value) is not bool for value in (self_test, allow_power_actions, simulate)):
+        raise ValueError("Las opciones de servicio deben ser booleanas.")
+    if self_test and allow_power_actions:
+        raise ValueError("--self-test no admite --allow-power-actions.")
+    if simulate and allow_power_actions:
+        raise ValueError("--simulate no admite --allow-power-actions.")
+    if simulate and self_test:
+        raise ValueError("--simulate no admite --self-test.")
+
+
+def service_command(data_dir, port=8765, *, self_test=False, allow_power_actions=False, simulate=False):
+    _validate_modes(self_test, allow_power_actions, simulate)
     if not 1 <= port <= 65535:
         raise ValueError("Puerto inválido.")
     command = child_command("service", "run", "--data-dir", Path(data_dir).resolve(), "--port", port)
     if self_test:
         command.append("--self-test")
+    if allow_power_actions:
+        command.append("--allow-power-actions")
+    if simulate:
+        command.append("--simulate")
     return command
 
 
@@ -162,7 +179,12 @@ def _owned_binary(binary_path):
     return binary_path == expected or binary_path.startswith(expected + " ")
 
 
-def manage(command, *, data_dir=None, port=8765, self_test=False, api=None):
+def manage(command, *, data_dir=None, port=8765, self_test=False, allow_power_actions=False, simulate=False, api=None):
+    _validate_modes(self_test, allow_power_actions, simulate)
+    if allow_power_actions and command != "install":
+        raise ValueError("--allow-power-actions requiere registrar el servicio con install.")
+    if simulate and command != "install":
+        raise ValueError("--simulate requiere registrar el servicio con install.")
     api = api or _apis()
     access = SC_MANAGER_CONNECT | (SC_MANAGER_CREATE_SERVICE if command == "install" else 0)
     manager = api.OpenSCManagerW(None, None, access)
@@ -183,7 +205,8 @@ def manage(command, *, data_dir=None, port=8765, self_test=False, api=None):
         if not handle and ctypes.get_last_error() != ERROR_SERVICE_DOES_NOT_EXIST:
             raise _error("abrir")
         if command == "install":
-            vector = service_command(data_dir or service_data_dir(), port, self_test=self_test)
+            vector = service_command(data_dir or service_data_dir(), port, self_test=self_test,
+                                     allow_power_actions=allow_power_actions, simulate=simulate)
             binary = subprocess.list2cmdline(vector)
             if handle:
                 if not _owned_binary(_configuration(api, handle)["binary_path"]):
@@ -203,11 +226,13 @@ def manage(command, *, data_dir=None, port=8765, self_test=False, api=None):
             on_failure = ctypes.c_int(1)
             if not api.ChangeServiceConfig2W(handle, 4, ctypes.byref(on_failure)):
                 raise _error("configurar errores de")
-            return {**_query(api, handle), "self_test": self_test}
+            return {**_query(api, handle), "self_test": self_test,
+                    "allow_power_actions": allow_power_actions, "simulation": simulate}
         if not handle:
             if command == "start":
                 raise RuntimeError("El servicio Elipro no está instalado.")
-            return {"name": NAME, "installed": False, "state": "absent", "pid": 0, "self_test": False}
+            return {"name": NAME, "installed": False, "state": "absent", "pid": 0,
+                    "self_test": False, "allow_power_actions": False, "simulation": False}
         configuration = _configuration(api, handle)
         if command != "status" and not _owned_binary(configuration["binary_path"]):
             raise RuntimeError("El servicio EliproUPS existente usa otro ejecutable; no se modificará.")
@@ -220,11 +245,14 @@ def manage(command, *, data_dir=None, port=8765, self_test=False, api=None):
             if command == "remove":
                 if not api.DeleteService(handle):
                     raise _error("eliminar")
-                return {"name": NAME, "installed": False, "state": "absent", "pid": 0, "self_test": False}
+                return {"name": NAME, "installed": False, "state": "absent", "pid": 0,
+                        "self_test": False, "allow_power_actions": False, "simulation": False}
             result = _query(api, handle)
         else:
             result = _query(api, handle)
-        return {**result, "self_test": "--self-test" in configuration["binary_path"]}
+        return {**result, "self_test": "--self-test" in configuration["binary_path"],
+                "allow_power_actions": "--allow-power-actions" in configuration["binary_path"],
+                "simulation": "--simulate" in configuration["binary_path"]}
     finally:
         if handle:
             api.CloseServiceHandle(handle)
@@ -233,6 +261,7 @@ def manage(command, *, data_dir=None, port=8765, self_test=False, api=None):
 
 class ServiceHost:
     def __init__(self, args, *, api=None, target=None):
+        _validate_modes(args.self_test, getattr(args, "allow_power_actions", False), getattr(args, "simulate", False))
         self.args, self.api, self.target = args, api or _apis(), target
         self.stop_event = threading.Event()
         self.handle = None
@@ -274,8 +303,12 @@ class ServiceHost:
             target = main
         else:
             target = self.target
-        target(["--headless", "--source", "native", "--dry-run", "--data-dir", str(self.args.data_dir),
-                "--port", str(self.args.port)], stop_event=self.stop_event,
+        simulated = getattr(self.args, "simulate", False)
+        vector = ["--headless", "--source", "simulation" if simulated else "native", "--data-dir", str(self.args.data_dir),
+                  "--port", str(self.args.port)]
+        if simulated or not getattr(self.args, "allow_power_actions", False):
+            vector.append("--dry-run")
+        target(vector, stop_event=self.stop_event,
                ready_callback=self._ready)
 
     def _main(self, _argc, _argv):
@@ -326,13 +359,25 @@ def main(argv=None):
     parser.add_argument("--data-dir", type=Path, default=service_data_dir())
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--self-test", action="store_true", help="Prueba SCM sin USB, monitor ni acciones de energía")
+    parser.add_argument("--simulate", action="store_true", help="Monitor y política reales con telemetría simulada; bloquea acciones Windows")
+    parser.add_argument("--allow-power-actions", action="store_true",
+                        help="Opt-in administrativo al registrar/ejecutar el servicio; no activa la política guardada")
     args = parser.parse_args(argv)
     if not 1 <= args.port <= 65535:
         parser.error("Puerto fuera de rango")
+    if args.self_test and args.allow_power_actions:
+        parser.error("--self-test no admite --allow-power-actions")
+    if args.simulate and (args.allow_power_actions or args.self_test):
+        parser.error("--simulate no admite --allow-power-actions ni --self-test")
+    if args.simulate and args.command not in ("install", "run"):
+        parser.error("--simulate solo se admite con install o run")
+    if args.allow_power_actions and args.command not in ("install", "run"):
+        parser.error("--allow-power-actions solo se admite con install o run")
     try:
         if args.command == "run":
             return ServiceHost(args).run()
-        print(json.dumps(manage(args.command, data_dir=args.data_dir, port=args.port, self_test=args.self_test), ensure_ascii=False))
+        print(json.dumps(manage(args.command, data_dir=args.data_dir, port=args.port, self_test=args.self_test,
+                                allow_power_actions=args.allow_power_actions, simulate=args.simulate), ensure_ascii=False))
         return 0
     except (OSError, RuntimeError, ValueError) as exc:
         print(str(exc), file=sys.stderr)

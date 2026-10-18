@@ -4,6 +4,7 @@ import sys
 import threading
 import time
 import unittest
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from ups_monitor import windows_notifications as wn
@@ -133,6 +134,106 @@ class WindowsNotifierTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 notifier.notify(*args)
 
+    def test_delivery_receipt_requires_native_true_and_duplicate_does_not_replay(self):
+        notifier = self.make_notifier()
+        notifier._ready = True
+        backend = Mock()
+        backend.deliver.return_value = True
+        self.assertTrue(notifier.notify("Corte", "En batería", delivery_id="epoch:1"))
+        self.assertEqual(notifier.drain_receipts(), [], "Queue admission is not an ACK")
+        notifier._drain(backend)
+        receipt = notifier.drain_receipts()
+        self.assertEqual([(item["delivery_id"], item["outcome"]) for item in receipt], [("epoch:1", "accepted")])
+        self.assertTrue(notifier.notify("Corte", "En batería", delivery_id="epoch:1"))
+        notifier._drain(backend)
+        backend.deliver.assert_called_once()
+        self.assertEqual(notifier.drain_receipts()[0]["outcome"], "accepted")
+
+    def test_none_rejection_and_exception_never_create_success_ack_and_allow_retry(self):
+        notifier = self.make_notifier()
+        notifier._ready = True
+        backend = Mock()
+        for result in (None, False, OSError("Shell rejected")):
+            backend.deliver.side_effect = result if isinstance(result, Exception) else None
+            backend.deliver.return_value = result
+            self.assertTrue(notifier.notify("Corte", "Pendiente", delivery_id="epoch:1"))
+            notifier._drain(backend)
+            receipts = notifier.drain_receipts()
+            self.assertEqual(len(receipts), 1)
+            self.assertNotEqual(receipts[0]["outcome"], "accepted")
+            self.assertEqual(notifier.status()["pending_deliveries"], 0)
+        backend.deliver.side_effect = None
+        backend.deliver.return_value = True
+        notifier.notify("Corte", "Reintento", delivery_id="epoch:1")
+        notifier._drain(backend)
+        self.assertEqual(notifier.drain_receipts()[0]["outcome"], "accepted")
+
+    def test_lock_cancels_queued_payload_and_fresh_resume_does_not_replay_old_text(self):
+        notifier = self.make_notifier()
+        notifier._ready = True
+        backend = Mock()
+        backend.deliver.return_value = True
+        notifier.notify("Apagado", "Quedan 60 segundos", delivery_id="epoch:1")
+        notifier.set_session_available(False)
+        notifier._drain(backend)
+        backend.deliver.assert_not_called()
+        self.assertEqual(notifier.drain_receipts()[0]["outcome"], "cancelled")
+        notifier.set_session_available(True)
+        notifier.notify("Recuperación", "La red ya volvió", delivery_id="epoch:1")
+        notifier._drain(backend)
+        backend.deliver.assert_called_once_with("Recuperación", "La red ya volvió", "info", True)
+        self.assertEqual(notifier.drain_receipts()[0]["outcome"], "accepted")
+
+    def test_live_session_probe_closes_queue_and_ack_races(self):
+        notifier = self.make_notifier()
+        notifier._ready = True
+        active = Mock(return_value=True)
+        notifier.set_session_probe(active)
+        notifier.notify("Corte", "Batería", delivery_id="epoch:1")
+        active.return_value = False
+        backend = Mock()
+        backend.deliver.return_value = True
+        notifier._drain(backend)
+        backend.deliver.assert_not_called()
+        self.assertEqual(notifier.drain_receipts()[0]["outcome"], "cancelled")
+        active.return_value = True
+        notifier.set_session_available(True)
+        notifier.notify("Corte", "Nueva entrega", delivery_id="epoch:2")
+        def lock_during_native(*_args):
+            notifier.set_session_available(False)
+            return True
+        backend.deliver.side_effect = lock_during_native
+        notifier._drain(backend)
+        self.assertEqual([item["outcome"] for item in notifier.drain_receipts()], ["cancelled"])
+
+    def test_cancelled_old_ticket_cannot_deliver_after_same_id_has_new_payload(self):
+        notifier = self.make_notifier()
+        notifier._ready = True
+        backend = Mock()
+        backend.deliver.return_value = True
+        notifier.notify("Viejo", "Cuenta obsoleta", delivery_id="epoch:1")
+        notifier.cancel_delivery("epoch:1")
+        notifier.notify("Actual", "Ya recuperado", delivery_id="epoch:1")
+        notifier._drain(backend)
+        backend.deliver.assert_called_once_with("Actual", "Ya recuperado", "info", True)
+        self.assertEqual([item["outcome"] for item in notifier.drain_receipts()], ["cancelled", "accepted"])
+        notifier.cancel_delivery("epoch:1")
+        notifier.notify("Actualizado", "Contexto posterior", delivery_id="epoch:1")
+        notifier._drain(backend)
+        self.assertEqual(backend.deliver.call_count, 2, "Explicit replacement also invalidates completed deduplication")
+
+    def test_receipts_and_completed_dedup_are_bounded(self):
+        notifier = self.make_notifier()
+        notifier._ready = True
+        backend = Mock()
+        backend.deliver.return_value = True
+        for index in range(300):
+            notifier.notify("Aviso", "Contenido", delivery_id="epoch:" + str(index))
+            notifier._drain(backend)
+        self.assertEqual(len(notifier._completed_deliveries), 256)
+        self.assertEqual(len(notifier.drain_receipts()), 256)
+        self.assertEqual(notifier.status()["pending_deliveries"], 0)
+
     def test_session_tray_labels_are_explicit_and_default_labels_stay_compatible(self):
         monitor = self.make_notifier()
         self.assertEqual(monitor.exit_label, wn.DEFAULT_EXIT_LABEL)
@@ -189,6 +290,9 @@ class NativeShellTests(unittest.TestCase):
         self.owner.cancel_callback = Mock()
         self.owner._stop = threading.Event()
         self.user, self.shell, self.kernel = Mock(), Mock(), Mock()
+        font_patch = patch.object(wn, "_load_font_apis", return_value=None)
+        font_patch.start()
+        self.addCleanup(font_patch.stop)
         self.user.RegisterWindowMessageW.return_value = 0xC001
         self.user.LoadImageW.return_value = 0
         self.user.LoadIconW.return_value = 0x123456789
@@ -224,6 +328,22 @@ class NativeShellTests(unittest.TestCase):
         self.assertEqual(self.native_calls[1][0], wn.NIM_SETVERSION)
         self.assertEqual(self.native_calls[1][1].uVersion, 4)
         self.assertEqual(self.backend._data().hBalloonIcon, None)
+
+    def test_per_monitor_v2_is_requested_before_any_window_class_is_registered(self):
+        calls = [item[0] for item in self.user.mock_calls]
+        self.assertLess(calls.index("SetProcessDpiAwarenessContext"), calls.index("RegisterClassW"))
+        self.assertEqual(self.user.SetProcessDpiAwarenessContext.call_args.args[0].value,
+                         ctypes.c_void_p(-4).value)
+        self.owner._set_dpi_status.assert_called_with({"mode": "per_monitor_v2", "error": None})
+
+    def test_already_configured_and_older_windows_dpi_modes_are_nonfatal(self):
+        user = Mock()
+        user.SetProcessDpiAwarenessContext.return_value = False
+        with patch.object(ctypes, "get_last_error", return_value=5):
+            self.assertEqual(wn.enable_per_monitor_dpi(user)["mode"], "already_configured")
+        user.SetProcessDPIAware.assert_not_called()
+        old = SimpleNamespace(SetProcessDPIAware=Mock(return_value=True))
+        self.assertEqual(wn.enable_per_monitor_dpi(old)["mode"], "system_aware_fallback")
 
     def test_file_icon_is_owned_reused_after_explorer_restart_and_released_once(self):
         # The initial fixture uses a shared fallback. A fresh backend exercises
@@ -409,6 +529,85 @@ class NativeShellTests(unittest.TestCase):
 
         self.user.SystemParametersInfoW.side_effect = workarea
         return notifier
+
+    def test_popup_scales_geometry_fonts_and_dpi_change_without_leaking_font(self):
+        self.configure_popup()
+        self.user.GetDpiForWindow.return_value = 192
+        self.backend.gdi = Mock()
+        self.backend.gdi.CreateFontW.side_effect = [1001, 1002]
+        self.backend._show_popup("DPI", "Escala 200 %")
+        create_popup = self.user.CreateWindowExW.call_args_list[1].args
+        self.assertEqual(create_popup[6:8], (840, 380))
+        self.assertEqual(self.user.SetWindowPos.call_args.args[4:6], (840, 380))
+        self.assertEqual(self.backend.gdi.CreateFontW.call_args.args[0], -26)
+        proposed = wn.RECT(20, 40, 650, 325)
+        self.backend._window_proc(self.backend.popup_hwnd, wn.WM_DPICHANGED,
+                                  144 | (144 << 16), ctypes.addressof(proposed))
+        self.assertEqual(self.backend.popup_dpi, 144)
+        self.assertEqual(self.user.SetWindowPos.call_args.args[2:6], (20, 40, 630, 285))
+        self.assertEqual(self.backend.gdi.CreateFontW.call_args.args[0], -20)
+        self.backend.gdi.DeleteObject.assert_called_once_with(1001)
+        self.assertEqual(self.user.SendMessageW.call_count, 8)
+        self.backend._destroy_popup()
+        self.backend.gdi.DeleteObject.assert_called_with(1002)
+        self.assertIsNone(self.backend.popup_font)
+
+    def test_cancelled_ticket_during_popup_creation_is_not_shown_or_acknowledged(self):
+        notifier = self.configure_popup()
+        notifier._ready = True
+        notifier.sync_persistent({"policy_countdown": {"title": "Cuenta", "message": "Quedan 30 segundos"}})
+        notifier.notify("Cuenta", "Quedan 30 segundos", persistent=True,
+                        key="policy_countdown", delivery_id="epoch:1")
+        handles = iter(range(500, 505))
+        def create(*_args):
+            handle = next(handles)
+            if handle == 504:
+                notifier.cancel_delivery("epoch:1")
+            return handle
+        self.user.CreateWindowExW.side_effect = create
+        notifier._drain(self.backend)
+        self.user.SetWindowPos.assert_not_called()
+        self.assertEqual([item["outcome"] for item in notifier.drain_receipts()], ["cancelled"])
+
+    def test_real_shell_acceptance_produces_receipt_without_claiming_user_saw_it(self):
+        notifier = self.configure_popup()
+        notifier._ready = True
+        notifier.notify("Prueba", "Solicitud nativa", sound=False, delivery_id="epoch:1")
+        notifier._drain(self.backend)
+        self.assertEqual(notifier.drain_receipts()[0]["outcome"], "accepted")
+        self.assertIsNone(notifier.status()["last_shown_at"])
+
+    def test_accepted_delivery_keeps_valid_fallback_until_explicitly_cancelled(self):
+        notifier = self.configure_popup()
+        notifier._ready = True
+        with patch.object(wn.time, "monotonic", return_value=100):
+            notifier.notify("Corte", "En batería", sound=False, delivery_id="epoch:1")
+            notifier._drain(self.backend)
+        self.assertEqual(notifier.drain_receipts()[0]["outcome"], "accepted")
+        self.assertEqual(notifier.status()["pending_deliveries"], 0)
+        with patch.object(wn.time, "monotonic", return_value=101.01):
+            self.backend._check_unconfirmed_popup()
+        self.assertIsNotNone(notifier.status()["last_popup_shown_at"],
+                             "Removing an accepted pending entry must not suppress a valid fallback")
+        notifier.cancel_delivery("epoch:1")
+        self.backend.sync_persistent()
+        self.assertIsNone(self.backend.last_notice)
+        self.assertIsNotNone(notifier.status()["last_popup_hidden_at"])
+
+    def test_cancelled_accepted_delivery_cannot_reappear_from_timer_or_shell_timeout(self):
+        notifier = self.configure_popup()
+        notifier._ready = True
+        with patch.object(wn.time, "monotonic", return_value=100):
+            notifier.notify("Corte", "Texto anterior", sound=False, delivery_id="epoch:1")
+            notifier._drain(self.backend)
+        notifier.cancel_delivery("epoch:1")
+        with patch.object(wn.time, "monotonic", return_value=100.05):
+            self.backend._maybe_fallback_popup()
+        with patch.object(wn.time, "monotonic", return_value=101.01):
+            self.backend._check_unconfirmed_popup()
+        self.user.SetWindowPos.assert_not_called()
+        self.assertIsNone(notifier.status()["last_popup_shown_at"])
+        self.assertEqual([item["outcome"] for item in notifier.drain_receipts()], ["cancelled"])
 
     def test_fast_shell_timeout_uses_one_nonactivating_popup_and_timer(self):
         notifier = self.configure_popup()

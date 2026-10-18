@@ -23,7 +23,7 @@ from urllib.parse import parse_qs, urlsplit
 from . import __version__
 from .adapters import TelemetryError
 from .native_adapter import make_adapter
-from .core import DEFAULT_POLICY, SAMPLE_FIELDS, PolicyEngine, iso_utc, validate_policy
+from .core import DEFAULT_POLICY, SAMPLE_FIELDS, PolicyEngine, TelemetryRingBuffer, iso_utc, validate_policy
 from .alerts import AlertManager, DEFAULT_NOTIFICATION_SETTINGS
 from .instance_guard import MonitorInstanceGuard, InstanceGuardError
 from .health import MonitorHealth
@@ -83,15 +83,28 @@ def write_events_csv(store, options, target):
 
 
 class Monitor:
-    def __init__(self, store, adapter, *, dry_run=False, action_callback=None, alerts=None, health_clock=None):
-        self.store, self.adapter, self.dry_run = store, adapter, dry_run
+    def __init__(self, store, adapter, *, dry_run=False, action_callback=None, alerts=None, health_clock=None,
+                 telemetry_capacity=256, poll_interval=2):
+        self.store, self.adapter = store, adapter
+        self.simulation_source = getattr(adapter, "simulation", False) is True
+        self.dry_run = bool(dry_run) or self.simulation_source
         self.alerts = alerts
         self.lock = threading.RLock()
         self.settings_lock = threading.Lock()
         self._history_failures = {}
         self.stop_event = threading.Event()
         self.thread = None
+        self.processor_thread = None
         self.supervisor_thread = None
+        if type(poll_interval) not in (int, float) or not math.isfinite(poll_interval) or not 0.01 <= poll_interval <= 10:
+            raise ValueError("poll_interval debe estar entre 0.01 y 10 segundos")
+        self.poll_interval = poll_interval
+        self.telemetry = TelemetryRingBuffer(telemetry_capacity)
+        self._read_lock = threading.Lock()
+        self._processing_sequence = None
+        self._last_processed_at = None
+        self._poll_failures = 0
+        self._next_poll_at = None
         self.health = MonitorHealth(clock=health_clock)
         self._health_fault = threading.Event()
         self._pending_health_failure = None
@@ -157,7 +170,7 @@ class Monitor:
     def _update_alerts(self):
         if self.alerts is not None and not self.stop_event.is_set():
             try:
-                protection = {**self.engine.status(), "simulation": self.dry_run}
+                protection = {**self.engine.status(), "simulation": self.power_actions_blocked}
                 self.alerts.update(protection, {"state": self.connection}, self.sample)
             except Exception as exc:
                 log_failure("No se pudieron actualizar los avisos locales", exc)
@@ -183,13 +196,17 @@ class Monitor:
         return self.snapshot()
 
     def _policy_event(self, kind, message, data):
-        if self.dry_run and kind == "policy_action_started":
+        if self.power_actions_blocked and kind == "policy_action_started":
             return
         # Routine online/disabled states add no noise to the incident history.
         if kind not in ("policy_online", "policy_disabled", "policy_on_battery"):
             if kind == "policy_countdown":
-                data = {**(data or {}), **self.engine.status(), "simulation": self.dry_run}
+                data = {**(data or {}), **self.engine.status(), "simulation": self.power_actions_blocked}
             self._event(kind, message, data)
+
+    @property
+    def power_actions_blocked(self):
+        return self.dry_run or self.simulation_source
 
     def _act(self, action):
         if self.stop_event.is_set():
@@ -198,7 +215,11 @@ class Monitor:
             raise RuntimeError("El lector no está sano; acción bloqueada.")
         if self.supervisor_thread is not None and not self.supervisor_thread.is_alive():
             raise RuntimeError("La supervisión del lector no está activa; acción bloqueada.")
-        if self.dry_run:
+        if self.processor_thread is not None and not self.processor_thread.is_alive():
+            raise RuntimeError("El procesador de telemetría no está activo; acción bloqueada.")
+        if self._processing_sequence is not None and not self.telemetry.is_latest(self._processing_sequence):
+            raise RuntimeError("Hay telemetría más reciente pendiente; acción bloqueada.")
+        if self.power_actions_blocked:
             self._event("simulation", "Modo de desarrollo: acción simulada; Windows sigue encendido.")
         else:
             if not self._fresh_sample(self.sample):
@@ -238,21 +259,31 @@ class Monitor:
             self._unavailable("Monitor detenido. Protección suspendida.", kind="stopped")
         elif self.thread is not None and not self.thread.is_alive():
             self._unavailable("El lector dejó de ejecutarse. Protección suspendida.", kind="backend")
+        elif self.processor_thread is not None and not self.processor_thread.is_alive():
+            self._unavailable("El procesador de telemetría dejó de ejecutarse. Protección suspendida.", kind="backend")
         elif self.sample is not None and not self._fresh_sample(self.sample):
             self._unavailable("La última lectura tiene más de 15 segundos o una fecha inválida. Protección suspendida.", "stale")
 
     def health_status(self):
         status = self.health.snapshot()
         supervisor_failed = self.supervisor_thread is not None and not self.supervisor_thread.is_alive()
+        processor_failed = self.processor_thread is not None and not self.processor_thread.is_alive()
         status.update({
             "reader_alive": self.thread is not None and self.thread.is_alive(),
             "supervisor_alive": self.supervisor_thread is not None and self.supervisor_thread.is_alive(),
             "state": "stopped" if self.stop_event.is_set() else (
-                "degraded" if self._health_fault.is_set() or self.error is not None or supervisor_failed else (
+                "degraded" if self._health_fault.is_set() or self.error is not None or supervisor_failed or processor_failed else (
                     "healthy" if self.connection == "connected" else "starting")),
             "message": ("El supervisor del lector dejó de ejecutarse. Las acciones automáticas están bloqueadas."
-                        if supervisor_failed and not self.stop_event.is_set() else self.error),
+                        if supervisor_failed and not self.stop_event.is_set() else (
+                            "El procesador de telemetría dejó de ejecutarse. Las acciones automáticas están bloqueadas."
+                            if processor_failed and not self.stop_event.is_set() else self.error)),
             "history": self.history_status(),
+            "processor_alive": self.processor_thread is not None and self.processor_thread.is_alive(),
+            "telemetry_buffer": self.telemetry.status(),
+            "reconnect_attempts": self._poll_failures,
+            "next_poll_in_seconds": max(0, round(self._next_poll_at - self.health.clock(), 2))
+                if self._next_poll_at is not None else 0,
         })
         observation = getattr(self, "observation", None)
         if observation is not None:
@@ -263,9 +294,14 @@ class Monitor:
         """Inspect independent counters without waiting for the reader's lock."""
         if self.thread is not None and not self.thread.is_alive():
             return ("El lector dejó de ejecutarse. Protección suspendida.", "disconnected", "backend")
+        if self.processor_thread is not None and not self.processor_thread.is_alive():
+            return ("El procesador de telemetría dejó de ejecutarse. Protección suspendida.", "disconnected", "backend")
+        if self.processor_thread is not None and self._last_processed_at is not None and self.health.clock() - self._last_processed_at > 15:
+            return ("El procesador lleva más de 15 segundos sin consumir telemetría. Protección suspendida.", "stale", "backend")
         if self.health.read_stalled(15):
             return ("El lector lleva más de 15 segundos sin terminar una lectura. Protección suspendida.", "stale", "backend")
-        if self.thread is not None and self.health.progress_stalled(15):
+        waiting_retry = self._next_poll_at is not None and self.health.clock() <= self._next_poll_at
+        if self.thread is not None and self.health.progress_stalled(15) and not waiting_retry:
             return ("El lector lleva más de 15 segundos sin procesar lecturas. Protección suspendida.", "stale", "backend")
         sample = self.sample
         if sample is not None and not self._fresh_sample(sample):
@@ -318,7 +354,7 @@ class Monitor:
         self._reader_dead_since = None
         self._restart_failures += 1
         self.health.reader_restarts += 1
-        self.thread = threading.Thread(target=self.run, name="ups-telemetry", daemon=True)
+        self.thread = threading.Thread(target=self.run, name="ups-hardware-polling", daemon=True)
         self.thread.start()
 
     def supervise(self):
@@ -331,28 +367,53 @@ class Monitor:
                 log_failure("Error en la supervisión del lector", exc)
             self.stop_event.wait(1)
 
+    def _read_hardware(self):
+        """Only the dedicated polling worker (or synchronous test tick) owns USB."""
+        if not self._read_lock.acquire(blocking=False):
+            raise RuntimeError("Ya hay una lectura de hardware en curso")
+        try:
+            self.health.begin_read()
+            try:
+                sample = self.adapter.read()
+            except Exception as exc:
+                known = isinstance(exc, (TelemetryError, OSError, ValueError))
+                kind = "telemetry" if known else "backend"
+                self.health.finish_read(False, error_kind=kind)
+                if not known:
+                    raise
+                return None, str(exc), kind
+            fresh = self._fresh_sample(sample)
+            self.health.finish_read(fresh, timestamp=sample.get("timestamp") if isinstance(sample, dict) else None,
+                                    error_kind=None if fresh else "stale")
+            return sample, None, None
+        finally:
+            self._read_lock.release()
+
     def tick(self):
+        """Synchronous compatibility hook; runtime uses separate polling/consumer."""
         if self.stop_event.is_set():
             return
-        self.health.begin_read()
-        try:
-            sample = self.adapter.read()
-        except Exception as exc:
-            known_error = isinstance(exc, (TelemetryError, OSError, ValueError))
-            self.health.finish_read(False, error_kind="telemetry" if known_error else "backend")
-            if not known_error:
-                raise
+        if self.processor_thread is not None and threading.current_thread() is not self.thread:
+            raise RuntimeError("El sondeo dedicado ya está activo")
+        sample, error, kind = self._read_hardware()
+        if error is not None:
             with self.lock:
-                if self.stop_event.is_set():
-                    return
-                state = "stale" if "obsoleto" in str(exc) else "disconnected"
-                self._unavailable(str(exc), state)
+                if not self.stop_event.is_set():
+                    self._unavailable(error, "stale" if "obsoleto" in error else "disconnected", kind)
             return
+        self._process_sample(sample)
+
+    def _process_sample(self, sample):
         with self.lock:
             if self.stop_event.is_set():
                 return
+            if self._processing_sequence is not None and not self.telemetry.is_latest(self._processing_sequence):
+                # A result superseded while waiting for this lock cannot reset
+                # manual cancellation or finish a protected deadline.
+                self.engine.evaluate(None)
+                return
             if not self._fresh_sample(sample):
-                self.health.finish_read(False, error_kind="stale")
+                self.health.problem("stale")
                 self._unavailable("La lectura no contiene una fecha reciente y válida. Protección suspendida.", "stale")
                 return
             if self._health_fault.is_set():
@@ -365,7 +426,6 @@ class Monitor:
                 self._pending_health_failure = None
             self._health_fault.clear()
             self._last_health_notice = None
-            self.health.finish_read(True, timestamp=sample["timestamp"])
             self._restart_failures = 0
             if self.connection != "connected":
                 self._event("connection_restored", "Telemetría del UPS conectada.")
@@ -401,24 +461,97 @@ class Monitor:
                     self._history_failed("samples_write", exc)
 
     def run(self):
+        """Hardware thread: no database, alert delivery, or decision lock."""
         while not self.stop_event.is_set():
             try:
-                self.tick()
+                self._next_poll_at = None
+                sample, error, kind = self._read_hardware()
+                if self.stop_event.is_set():
+                    return
+                self.telemetry.publish(sample, error=error, error_kind=kind,
+                                       captured_at=self.health.clock())
+                self._poll_failures = self._poll_failures + 1 if error is not None else 0
+            except Exception as exc:
+                self._poll_failures += 1
+                self.telemetry.publish(error="Error interno al leer telemetría. Protección suspendida.",
+                                       error_kind="backend", captured_at=self.health.clock())
+                # Do not touch the logfile from hardware polling. The consumer
+                # records the bounded backend error through its normal path.
+            delay = self.poll_interval if not self._poll_failures else min(
+                30, self.poll_interval * (2 ** min(self._poll_failures - 1, 10)))
+            retry_after = getattr(self.adapter, "retry_after_seconds", 0)
+            if type(retry_after) in (int, float) and math.isfinite(retry_after):
+                delay = max(delay, retry_after)
+            self._next_poll_at = self.health.clock() + delay
+            self.stop_event.wait(delay)
+
+    def _consume_once(self):
+        entries, overflow = self.telemetry.drain()
+        if not entries:
+            # An idle consumer waiting through intentional USB reconnection
+            # backoff is healthy; a consumer blocked on the decision lock is not.
+            self._last_processed_at = self.health.clock()
+            return
+        if self.stop_event.is_set():
+            return
+        with self.lock:
+            if self.stop_event.is_set():
+                return
+            if overflow is not None or len(entries) > 1:
+                # No unobserved interval or replayed online state may count as
+                # continuous battery time, release cancellation, or fire actions.
+                self.engine.evaluate(None)
+            if overflow is not None:
+                self._record_event("telemetry_overflow",
+                                   "El consumidor se retrasó; se reinició la continuidad de protección.", overflow)
+                for kind, detail in overflow["transitions"].items():
+                    self._record_event("telemetry_delayed_transition",
+                                       "Transición histórica retenida durante el retraso: " + kind,
+                                       {"transition": kind, "historical": True, **detail})
+            for entry in entries[:-1]:
+                for kind in entry["facts"]:
+                    self._record_event("telemetry_delayed_transition",
+                                       "Transición histórica recibida con retraso: " + kind,
+                                       {"transition": kind, "historical": True,
+                                        "observed_at": (entry["sample"] or {}).get("timestamp"),
+                                        "sequence": entry["sequence"]})
+            latest = entries[-1]
+            self._processing_sequence = latest["sequence"]
+            try:
+                if latest["error"] is not None:
+                    self._unavailable(latest["error"], "disconnected", latest["error_kind"] or "telemetry")
+                elif (latest["captured_at"] is not None and self.health.clock() - latest["captured_at"] > 15):
+                    self._unavailable("La entrega de telemetría tiene más de 15 segundos. Protección suspendida.", "stale")
+                else:
+                    self._process_sample(latest["sample"])
+                self._last_processed_at = self.health.clock()
+            finally:
+                self._processing_sequence = None
+
+    def consume(self):
+        """Decision worker; a blocked USB call never occupies this thread."""
+        while not self.stop_event.is_set():
+            self.telemetry.wait(timeout=0.5)
+            try:
+                self._consume_once()
             except Exception as exc:
                 log_failure("Error interno al procesar telemetría", exc)
+                self._health_fault.set()
                 with self.lock:
                     try:
                         self._unavailable("Error interno al procesar telemetría. Protección suspendida.", kind="backend")
                     except Exception as storage_error:
                         log_failure("No se pudo registrar el error del monitor", storage_error)
-            self.stop_event.wait(2)
 
     def start(self):
         if self.thread is not None:
             raise RuntimeError("El monitor ya fue iniciado; crea otro para reiniciar.")
-        self.thread = threading.Thread(target=self.run, name="ups-telemetry", daemon=True)
-        self.thread.start()
+        self._last_processed_at = self.health.clock()
+        self.processor_thread = threading.Thread(target=self.consume, name="ups-telemetry-consumer", daemon=True)
+        self.thread = threading.Thread(target=self.run, name="ups-hardware-polling", daemon=True)
+        self.processor_thread.start()
         self.supervisor_thread = threading.Thread(target=self.supervise, name="ups-supervisor", daemon=True)
+        self.thread.start()
         self.supervisor_thread.start()
 
     def stop(self):
@@ -437,6 +570,11 @@ class Monitor:
             if self.thread.is_alive():
                 LOGGER.error("El lector no terminó en 12 segundos; no se cerrará SQLite mientras siga activo.")
                 raise RuntimeError("No se pudo detener el lector a tiempo.")
+        if self.processor_thread:
+            self.processor_thread.join(timeout=2)
+            if self.processor_thread.is_alive():
+                LOGGER.error("El procesador no terminó; no se cerrará SQLite mientras siga activo.")
+                raise RuntimeError("No se pudo detener el procesador a tiempo.")
         if self.supervisor_thread and self.supervisor_thread.is_alive():
             LOGGER.error("El supervisor no terminó; no se cerrará SQLite mientras siga activo.")
             raise RuntimeError("No se pudo detener el supervisor a tiempo.")
@@ -462,9 +600,9 @@ class Monitor:
                      "action_failed": "blocked", "action_started": "executed"}.get(raw["state"], "idle")
             remaining = raw["countdown_remaining"]
             notice = self.test_deadline is not None and raw["state"] != "countdown"
-            simulation = self.dry_run or notice
+            simulation = self.power_actions_blocked or notice
             reason = raw["reason"]
-            if self.dry_run and raw["state"] == "action_started":
+            if self.power_actions_blocked and raw["state"] == "action_started":
                 reason = "Acción simulada; Windows sigue encendido."
             if notice:
                 remaining = max(0, int(self.test_deadline - time.monotonic() + 0.999))
@@ -490,9 +628,10 @@ class Monitor:
                                "deadline": iso_utc(datetime.now(timezone.utc) + timedelta(seconds=remaining)) if remaining else None},
                 "meta": {"name": "Elipro UPS", "model": "Forza NT-2402PRO", "capacity_watts": 1200,
                          "capacity_va": 2400, "history_interval_seconds": 10, "retention_days": self.store.retention_days,
-                         "dry_run": self.dry_run, "version": __version__,
+                         "dry_run": self.power_actions_blocked, "simulation_source": self.simulation_source, "version": __version__,
                          "runtime_mode": getattr(self, "runtime_mode", "session"),
-                         "source": "bridge" if getattr(self.adapter, "bridge_required", True) else "native",
+                         "source": "simulation" if self.simulation_source else (
+                             "bridge" if getattr(self.adapter, "bridge_required", True) else "native"),
                          "bridge_required": getattr(self.adapter, "bridge_required", True)},
             }
 
@@ -521,7 +660,7 @@ class Monitor:
                 observation = getattr(self, "observation", None)
                 if observation is not None:
                     try:
-                        observation.record_policy_change(value["enabled"], self.dry_run)
+                        observation.record_policy_change(value["enabled"], self.power_actions_blocked)
                     except Exception as exc:
                         log_failure("No se pudo registrar el cambio de política en la observación", exc)
                 self._event("policy_changed", "Protección automática " + ("activada." if value["enabled"] else "desactivada."))
@@ -739,7 +878,7 @@ def main(argv=None, *, stop_event=None, ready_callback=None):
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--data-dir", type=Path, default=default_data_dir())
     parser.add_argument("--forza-url", default="http://127.0.0.1:15179/Forza")
-    parser.add_argument("--source", choices=("auto", "native", "bridge"), default="auto")
+    parser.add_argument("--source", choices=("auto", "native", "bridge", "simulation"), default="auto")
     parser.add_argument("--usb-info", action="store_true", help="Inspecciona metadatos HID sin enviar consultas")
     parser.add_argument("--dry-run", action="store_true", help="Bloquea acciones reales en Windows para desarrollo")
     parser.add_argument("--diagnose", action="store_true", help="Lee una muestra real y termina")
@@ -747,6 +886,10 @@ def main(argv=None, *, stop_event=None, ready_callback=None):
     parser.add_argument("--observe-hours", type=float, default=0,
                         help="Inicia una observación de estabilidad (0 desactiva; hasta 168 horas)")
     args = parser.parse_args(argv)
+    if args.source == "simulation":
+        args.dry_run = True
+        if args.usb_info:
+            parser.error("La simulación no permite inspeccionar USB")
     if not math.isfinite(args.observe_hours) or not (args.observe_hours == 0 or 0.01 <= args.observe_hours <= 168):
         parser.error("--observe-hours debe ser 0 o un valor entre 0.01 y 168")
     if args.usb_info:
@@ -777,6 +920,8 @@ def _run_owned_monitor(args, ownership, *, stop_event=None, ready_callback=None)
     monitor = server = alerts = store = log_handler = observation = None
     safe_to_release = True
     try:
+        if args.source == "simulation":
+            args.dry_run = True
         adapter = make_adapter(args.source, args.forza_url)
         if args.diagnose:
             print(json.dumps(adapter.read(), indent=2, ensure_ascii=False))
@@ -860,6 +1005,8 @@ def _run_owned_monitor(args, ownership, *, stop_event=None, ready_callback=None)
             reader_stopped = monitor is None or monitor.thread is None or not monitor.thread.is_alive()
             supervisor = getattr(monitor, "supervisor_thread", None)
             reader_stopped = reader_stopped and (supervisor is None or not supervisor.is_alive())
+            processor = getattr(monitor, "processor_thread", None)
+            reader_stopped = reader_stopped and (processor is None or not processor.is_alive())
             if not reader_stopped:
                 safe_to_release = False
             elif store is not None:

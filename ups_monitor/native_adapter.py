@@ -2,9 +2,10 @@
 from __future__ import annotations
 
 import socket
+import time
 
 from .adapters import TelemetryError
-from .hid_windows import StatusTransport, enumerate_ups
+from .hid_windows import StatusTransport, enumerate_ups_bounded as enumerate_ups
 from .qs_protocol import parse_qs
 
 
@@ -29,10 +30,19 @@ class NativeHidAdapter:
     source = "USB directo · lector propio QS-Hex"
     bridge_required = False
 
-    def __init__(self):
+    def __init__(self, *, clock=None):
         self.transport = None
+        self._clock = clock or time.monotonic
+        self._failures = 0
+        self._retry_at = 0
+
+    @property
+    def retry_after_seconds(self):
+        return max(0, self._retry_at - self._clock())
 
     def read(self):
+        if self.retry_after_seconds:
+            raise TelemetryError("USB en reconexión automática; próximo intento tras el plazo de espera.")
         if forza_monitor_running():
             raise TelemetryError("El colector ForzaTracker está activo. Detén ese lector antes de usar USB directo para evitar consultas simultáneas.")
         try:
@@ -49,14 +59,21 @@ class NativeHidAdapter:
                 if any(type(value) is not int for value in report_sizes) or report_sizes != (9, 9, 0):
                     raise TelemetryError("El descriptor HID no coincide con el validado para este UPS.")
                 self.transport = StatusTransport(device["path"])
-            return parse_qs(self.transport.query_status())
-        except (OSError, ValueError) as exc:
+            sample = parse_qs(self.transport.query_status())
+            self._failures = 0
+            self._retry_at = 0
+            return sample
+        except (OSError, ValueError, TelemetryError) as exc:
             self.transport = None
+            self._failures += 1
+            self._retry_at = self._clock() + min(30, 2 ** min(self._failures, 5))
             raise TelemetryError("No se recibió una respuesta USB válida: " + str(exc)) from exc
 
 
 def make_adapter(source, forza_url):
-    from .adapters import ForzaBridge
+    from .adapters import ForzaBridge, SimulationAdapter
+    if source == "simulation":
+        return SimulationAdapter()
     if source not in ("auto", "native", "bridge"):
         raise ValueError("Fuente de datos no válida.")
     if source == "auto":

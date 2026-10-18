@@ -44,7 +44,7 @@ class ServiceTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             service.service_command("data", port=0)
 
-    def test_service_target_is_headless_native_and_always_dry_run(self):
+    def test_service_target_is_headless_native_and_dry_run_by_default(self):
         api = FakeHostAPI()
         target = Mock()
         target.side_effect = lambda argv, **kw: kw["ready_callback"]()
@@ -57,6 +57,46 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual([state["state"] for state in api.states], [2, 4, 1])
         self.assertEqual(api.states[1]["accepted"], 5)
         self.assertIs(target.call_args.kwargs["stop_event"], host.stop_event)
+
+    def test_explicit_capability_is_registered_and_passed_to_service_target_only(self):
+        vector = service.service_command("data", allow_power_actions=True)
+        self.assertIn("--allow-power-actions", vector)
+        api, target = FakeHostAPI(), Mock()
+        target.side_effect = lambda argv, **kw: kw["ready_callback"]()
+        host = service.ServiceHost(self.args(allow_power_actions=True), api=api, target=target)
+        host._main(0, None)
+        launched = target.call_args.args[0]
+        self.assertIn("--headless", launched)
+        self.assertNotIn("--dry-run", launched)
+        self.assertNotIn("--allow-power-actions", launched)  # consumed by SCM host
+        self.assertNotIn("--enabled", launched)  # saved policy is an independent gate
+        self.assertEqual(api.states[-1]["exit_code"], 0)
+
+    def test_self_test_rejects_power_capability_before_touching_scm(self):
+        with self.assertRaisesRegex(ValueError, "no admite"):
+            service.service_command("data", self_test=True, allow_power_actions=True)
+        with patch.object(service, "_apis") as apis:
+            with self.assertRaisesRegex(ValueError, "no admite"):
+                service.manage("install", self_test=True, allow_power_actions=True)
+            args = self.args(allow_power_actions=True)
+            args.self_test = True
+            with self.assertRaisesRegex(ValueError, "no admite"):
+                service.ServiceHost(args)
+            apis.assert_not_called()
+
+    def test_power_capability_cannot_be_changed_by_start_or_status(self):
+        with patch.object(service, "_apis") as apis:
+            for command in ("start", "status", "stop", "remove"):
+                with self.assertRaisesRegex(ValueError, "registrar"):
+                    service.manage(command, allow_power_actions=True)
+            apis.assert_not_called()
+
+    def test_cli_rejects_self_test_power_capability_combination(self):
+        with patch.object(service, "ServiceHost") as host, patch("sys.stderr", new_callable=io.StringIO):
+            with self.assertRaises(SystemExit) as result:
+                service.main(["run", "--self-test", "--allow-power-actions"])
+        self.assertEqual(result.exception.code, 2)
+        host.assert_not_called()
 
     def test_scm_stop_notifies_target_and_reports_clean_stop_without_windows_action(self):
         api = FakeHostAPI()
@@ -144,6 +184,29 @@ class ServiceTests(unittest.TestCase):
         self.assertIsNone(failure.reboot)
         self.assertEqual(api.CloseServiceHandle.call_count, 2)
 
+    def test_registration_power_capability_requires_explicit_opt_in(self):
+        for enabled in (False, True):
+            with self.subTest(allow_power_actions=enabled):
+                api = Mock()
+                api.OpenSCManagerW.return_value = 1
+                api.OpenServiceW.return_value = None
+                api.CreateServiceW.return_value = 2
+                with patch.object(ctypes, "get_last_error", return_value=1060, create=True), \
+                        patch.object(service, "_query", return_value={"state": "stopped"}):
+                    result = service.manage("install", api=api, allow_power_actions=enabled)
+                self.assertEqual("--allow-power-actions" in api.CreateServiceW.call_args.args[7], enabled)
+                self.assertEqual(result["allow_power_actions"], enabled)
+
+    def test_status_reports_power_capability_without_mutating_registration(self):
+        api = Mock()
+        api.OpenSCManagerW.return_value, api.OpenServiceW.return_value = 1, 2
+        with patch.object(service, "_configuration", return_value={
+                "binary_path": "Elipro.exe service run --allow-power-actions"}), \
+                patch.object(service, "_query", return_value={"state": "running"}):
+            result = service.manage("status", api=api)
+        self.assertTrue(result["allow_power_actions"])
+        api.ChangeServiceConfigW.assert_not_called()
+
     def test_upgrade_rejects_another_program_even_if_it_uses_same_service_name(self):
         api = Mock()
         api.OpenSCManagerW.return_value, api.OpenServiceW.return_value = 1, 2
@@ -173,7 +236,7 @@ class ServiceTests(unittest.TestCase):
                                    dry_run=True, observe_hours=0)
             monitor = Mock()
             monitor.engine.policy = {"enabled": False}
-            monitor.thread = monitor.supervisor_thread = None
+            monitor.thread = monitor.supervisor_thread = monitor.processor_thread = None
             monitor.stop_event = threading.Event()
             stopped, ready = threading.Event(), Mock()
             stopped.set()

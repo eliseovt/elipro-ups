@@ -165,13 +165,15 @@ class MonitorHealthTests(unittest.TestCase):
             release.set()
             worker.join(2)
 
-    def test_start_owns_two_workers_and_stop_finishes_both(self):
+    def test_start_owns_polling_consumer_supervisor_and_stop_finishes_all(self):
         self.adapter.read = lambda: {"timestamp": iso_utc(), "on_battery": False}
         self.monitor.start()
         self.assertTrue(self.monitor.thread.is_alive())
+        self.assertTrue(self.monitor.processor_thread.is_alive())
         self.assertTrue(self.monitor.supervisor_thread.is_alive())
         self.monitor.stop()
         self.assertFalse(self.monitor.thread.is_alive())
+        self.assertFalse(self.monitor.processor_thread.is_alive())
         self.assertFalse(self.monitor.supervisor_thread.is_alive())
         self.assertEqual(self.monitor.health_status()["state"], "stopped")
         self.assertFalse(self.monitor.engine.policy["enabled"])

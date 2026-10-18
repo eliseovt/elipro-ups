@@ -139,7 +139,7 @@ class AgentTests(unittest.TestCase):
         client.poll.return_value = {"cursor": 7, "persistent": {"battery_low": {"title": "Baja", "message": "Activa"}},
                                     "messages": [{"title": "Corte", "message": "Batería", "severity": "warning", "sound": True}],
                                     "running": True}
-        agent = Agent(client, notifier)
+        agent = Agent(client, notifier, session_state=lambda: "active")
         agent.step()
         client.connect.assert_called_once()
         self.assertEqual(agent.cursor, 7)
