@@ -136,6 +136,8 @@ Las capturas muestran una configuración de ejemplo; la protección automática 
 
 La sección **Webhooks**, después de Sistema, permite enviar alertas a n8n u otros receptores mediante **POST JSON, sin HMAC ni cabeceras de firma**. El interruptor general está fuera del campo URL y viene apagado. **Guardar webhooks** conserva `webhook_enabled`, `webhook_url` y `webhook_events` en el mismo store SQLite de ajustes; desactivar conserva la URL y la selección.
 
+En escritorio, los cinco eventos se muestran en una sola fila de tarjetas compactas. En ventanas de 1920 × 1080 o 1440 × 900, la configuración y las entregas permanecen visibles en una pantalla; el historial tiene desplazamiento interno. Las ventanas pequeñas conservan la distribución adaptable.
+
 Los únicos eventos configurables son `power_lost` (Corte de energía), `power_restored` (Suministro recuperado), `battery_low` (Batería baja), `overload` (Sobrecarga) y `ups_fault` (Falla del UPS). Solo corte de energía y batería baja están seleccionados por defecto. Se encola un envío al aparecer cada transición, si el interruptor está activo, hay URL y el evento está seleccionado. Los avisos de escritorio conservan su comportamiento.
 
 Cada payload incluye `event`, `severity`, `timestamp` en UTC, `message`, `hostname` y las mediciones disponibles del sample actual, por ejemplo:
