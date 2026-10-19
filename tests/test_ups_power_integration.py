@@ -2,6 +2,7 @@
 import copy
 import io
 import json
+from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 import tempfile
@@ -16,8 +17,12 @@ from ups_monitor.ups_power import NT2402PRO_CANDIDATE_PROFILE, UpsPowerCoordinat
 DEVICE = {**NT2402PRO_CANDIDATE_PROFILE, "path": r"\\?\hid#vid_0665&pid_5161#isolated-test"}
 
 
-def sample(**changes):
-    return {"timestamp": iso_utc(), "connected": True, "on_battery": True, "low_battery": False,
+def sample(*, after=None, **changes):
+    # An observed post-submission sample needs an explicitly later timestamp;
+    # adjacent UTC reads can share one clock tick on Windows runners.
+    timestamp = ((datetime.fromisoformat(after.replace("Z", "+00:00")) + timedelta(milliseconds=1))
+                 .isoformat().replace("+00:00", "Z") if after is not None else iso_utc())
+    return {"timestamp": timestamp, "connected": True, "on_battery": True, "low_battery": False,
             "fault": False, "raw_status": "Battery mode", "output_voltage": 220,
             "raw_flags": {"status_hex": "89"}, "runtime_seconds": 600, **changes}
 
@@ -31,6 +36,13 @@ def profile():
 
 class UpsPowerIntegrationTests(unittest.TestCase):
     def setUp(self):
+        # Keep every ordinary clock read on the same tick so these tests also
+        # exercise fast/coarse-clock CI runners without relying on sleeps.
+        self.utc_tick = iso_utc()
+        for target in (__name__ + ".iso_utc", "ups_monitor.ups_power._stamp"):
+            clock_patch = patch(target, return_value=self.utc_tick)
+            clock_patch.start()
+            self.addCleanup(clock_patch.stop)
         self.directory = tempfile.TemporaryDirectory(dir=Path(__file__).parent)
         self.store = Store(":memory:")
         self.transport = Mock()
@@ -177,7 +189,8 @@ class UpsPowerIntegrationTests(unittest.TestCase):
     def test_windows_rejection_cancels_only_after_correlated_fresh_shutdown(self):
         self.monitor.set_policy({"enabled": True, "ups_poweroff": True})
         self.action.side_effect = RuntimeError("Windows rejected")
-        self.adapter.read.side_effect = lambda: sample(on_battery=None, raw_status="Shutdown mode", raw_flags={"status_hex": "8B"})
+        self.adapter.read.side_effect = lambda: sample(after=self.coordinator.status()["submitted_at"],
+            on_battery=None, raw_status="Shutdown mode", raw_flags={"status_hex": "8B"})
         with self.assertRaises(RuntimeError):
             self.monitor._act("shutdown")
         self.transport.cancel_shutdown.assert_called_once_with()
@@ -196,7 +209,8 @@ class UpsPowerIntegrationTests(unittest.TestCase):
     def test_windows_timeout_stays_unconfirmed_and_uses_only_safe_owned_emergency_cancel(self):
         self.monitor.set_policy({"enabled": True, "ups_poweroff": True})
         self.action.side_effect = WindowsActionUnconfirmed("No se confirmó la solicitud")
-        self.adapter.read.side_effect = lambda: sample(on_battery=None, raw_status="Shutdown mode", raw_flags={"status_hex": "8B"})
+        self.adapter.read.side_effect = lambda: sample(after=self.coordinator.status()["submitted_at"],
+            on_battery=None, raw_status="Shutdown mode", raw_flags={"status_hex": "8B"})
         with self.assertRaises(WindowsActionUnconfirmed):
             self.monitor._act("hibernate")
         self.assertEqual(self.monitor.ups_power_status()["windows_request"], "unconfirmed")
@@ -204,6 +218,19 @@ class UpsPowerIntegrationTests(unittest.TestCase):
         self.transport.submit_shutdown.assert_called_once_with(180)
         self.action.assert_called_once_with("hibernate")
         self.assertIn("windows_action_unconfirmed", [event["kind"] for event in self.store.events()])
+
+    def test_windows_timeout_never_cancels_with_shutdown_evidence_at_submission_timestamp(self):
+        self.monitor.set_policy({"enabled": True, "ups_poweroff": True})
+        self.action.side_effect = WindowsActionUnconfirmed("No se confirmó la solicitud")
+        self.adapter.read.side_effect = lambda: sample(timestamp=self.coordinator.status()["submitted_at"],
+            on_battery=None, raw_status="Shutdown mode", raw_flags={"status_hex": "8B"})
+        with self.assertRaises(WindowsActionUnconfirmed):
+            self.monitor._act("hibernate")
+        self.assertEqual(self.monitor.ups_power_status()["windows_request"], "unconfirmed")
+        self.assertEqual(self.coordinator.status()["state"], "submitted")
+        self.transport.cancel_shutdown.assert_not_called()
+        self.transport.submit_shutdown.assert_called_once_with(180)
+        self.action.assert_called_once_with("hibernate")
 
     def test_windows_timeout_after_suspend_resume_never_sends_cancel_or_repeats_request(self):
         self.monitor.set_policy({"enabled": True, "ups_poweroff": True})
@@ -236,7 +263,8 @@ class UpsPowerIntegrationTests(unittest.TestCase):
         self.monitor.set_policy({"enabled": True, "ups_poweroff": True})
         self.monitor._act("shutdown")
         previous = self.monitor.engine.status()["state"]
-        self.monitor._process_sample(sample(on_battery=None, raw_status="Shutdown mode", raw_flags={"status_hex": "8B"}))
+        self.monitor._process_sample(sample(after=self.coordinator.status()["submitted_at"],
+            on_battery=None, raw_status="Shutdown mode", raw_flags={"status_hex": "8B"}))
         self.assertEqual(self.monitor.engine.status()["state"], previous)
         self.assertEqual(self.coordinator.status()["state"], "armed")
         self.action.assert_called_once()
