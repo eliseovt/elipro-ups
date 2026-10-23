@@ -8,7 +8,7 @@ import threading
 import time
 import uuid
 
-from .ups_cancel_test import (candidate_profile, load_test_operation, _date, _elapsed,
+from .ups_cancel_test import (candidate_profile, load_test_operation, _date, _elapsed, _monotonic_start,
                              _now, _online, _output_active, _stamp, _unreported_pending)
 from .ups_power import OperationJournal, UpsPowerBlocked, _fresh_sample, _observed_after, _qs_shutdown_bit
 from .ups_test_authorization import (BATTERY_AUTHORIZATION_FILENAME as AUTH_FILENAME,
@@ -56,7 +56,7 @@ def load_battery_test_operation(path):
     uuid.UUID(value["operation_id"])
     uuid.UUID(hex=value["authorization_id"])
     _date(value["created_at"])
-    _elapsed(value)
+    _monotonic_start(value)
     _cancel_evidence(value.get("cancellation_evidence"), value.get("profile"))
     return value
 

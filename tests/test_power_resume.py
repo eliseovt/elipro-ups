@@ -90,7 +90,7 @@ class PowerResumeTests(unittest.TestCase):
 
     def test_old_queued_fresh_sample_cannot_finish_a_pre_sleep_countdown(self):
         self.monitor.set_policy({"enabled": True, "countdown_seconds": 10})
-        battery = {**self.sample(), "on_battery": True, "low_battery": True}
+        battery = {**self.sample(), "on_battery": True}
         self.monitor._process_sample(battery)
         self.assertEqual(self.monitor.engine.status()["countdown_remaining"], 10)
         self.monitor.telemetry.publish(battery, captured_at=100, power_generation=0)
@@ -100,7 +100,7 @@ class PowerResumeTests(unittest.TestCase):
         self.assertIsNone(self.monitor.engine.status()["countdown_remaining"])
         self.monitor._process_sample(battery, power_generation=0)
         self.assertIsNone(self.monitor.sample, "A still-fresh timestamp does not cross a sleep boundary")
-        self.adapter.read.side_effect = lambda: {**self.sample(), "on_battery": True, "low_battery": True}
+        self.adapter.read.side_effect = lambda: {**self.sample(), "on_battery": True}
         self.monitor.tick()
         self.assertEqual(self.monitor.engine.status()["countdown_remaining"], 10)
         self.action.assert_not_called()
@@ -150,7 +150,7 @@ class PowerResumeTests(unittest.TestCase):
 
     def test_manual_cancellation_stays_suppressed_after_resume_on_battery(self):
         self.monitor.set_policy({"enabled": True, "countdown_seconds": 10})
-        self.adapter.read.side_effect = lambda: {**self.sample(), "on_battery": True, "low_battery": True}
+        self.adapter.read.side_effect = lambda: {**self.sample(), "on_battery": True}
         self.monitor.tick()
         self.monitor.cancel()
         self.sleep_and_resume()

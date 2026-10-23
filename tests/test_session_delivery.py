@@ -4,13 +4,16 @@ import json
 from email.message import Message
 from pathlib import Path
 from types import SimpleNamespace
+from urllib.error import HTTPError
 import unittest
 from unittest.mock import MagicMock, Mock, patch
 
 from ups_monitor.core import Store
+from ups_monitor import session_agent
 from ups_monitor.server import Handler, Monitor
 from ups_monitor.session_agent import Agent, LocalClient
 from ups_monitor.session_broker import SessionBroker
+from ups_monitor.windows_notifications import DEFAULT_EXIT_LABEL, DEFAULT_EXIT_MESSAGE, WindowsNotifier
 
 
 CLIENT = "a" * 32
@@ -156,13 +159,106 @@ class AgentTests(unittest.TestCase):
         self.assertIn("No se pudo confirmar", notifier.notify.call_args.args[1])
         self.assertEqual(notifier.notify.call_args.kwargs["severity"], "warning")
 
-    def test_agent_exit_callback_only_sets_own_stop_event(self):
+    def test_agent_exit_waits_for_monitor_stop_before_closing_tray(self):
         client, notifier = Mock(), Mock()
         agent = Agent(client, notifier)
+        def confirm_stop():
+            self.assertFalse(agent.stop_event.is_set())
+            return {"stopped": True}
+        client.stop_monitor.side_effect = confirm_stop
         notifier.exit_callback()
         self.assertTrue(agent.stop_event.is_set())
-        client.assert_not_called()
+        client.stop_monitor.assert_called_once_with()
         client.cancel.assert_not_called()
+        notifier.notify.assert_not_called()
+        notifier.exit_callback()
+        client.stop_monitor.assert_called_once_with()
+
+    def test_agent_exit_failure_preserves_tray_and_reports_reason(self):
+        for error in (OSError("No hay conexión local"), ValueError("La prueba del UPS sigue pendiente")):
+            with self.subTest(error=error):
+                client, notifier = Mock(), Mock()
+                client.stop_monitor.side_effect = error
+                agent = Agent(client, notifier)
+                notifier.exit_callback()
+                self.assertFalse(agent.stop_event.is_set())
+                self.assertIn(str(error), notifier.notify.call_args.args[1])
+                self.assertEqual(notifier.notify.call_args.kwargs, {"severity": "warning", "sound": True})
+                client.stop_monitor.side_effect = None
+                client.stop_monitor.return_value = {"stopping": True}
+                notifier.exit_callback()
+                self.assertTrue(agent.stop_event.is_set())
+
+    def test_installed_agent_uses_shared_exit_label_and_confirmation(self):
+        notifier = WindowsNotifier("http://127.0.0.1:8765")
+        kernel, ownership = Mock(), Mock()
+        with patch.object(session_agent, "_WindowsOwnership", return_value=ownership), \
+                patch.object(session_agent, "_kernel", return_value=kernel), \
+                patch.object(session_agent, "WindowsNotifier", return_value=notifier) as constructor, \
+                patch.object(session_agent, "Agent") as agent:
+            self.assertEqual(session_agent.main([]), 0)
+        constructor.assert_called_once_with("http://127.0.0.1:8765")
+        self.assertEqual(notifier.exit_label, DEFAULT_EXIT_LABEL)
+        self.assertEqual(notifier.exit_message, DEFAULT_EXIT_MESSAGE)
+        agent.assert_called_once()
+        ownership.close.assert_called_once()
+
+    def test_installer_stop_remains_local_agent_only(self):
+        with patch.object(session_agent, "stop_current_session", return_value=0) as stop, \
+                patch.object(session_agent, "LocalClient") as client, \
+                patch.object(session_agent, "WindowsNotifier") as notifier:
+            self.assertEqual(session_agent.main(["--stop"]), 0)
+        stop.assert_called_once_with()
+        client.assert_not_called()
+        notifier.assert_not_called()
+
+    def test_client_stop_authenticates_and_posts_only_to_fixed_service_endpoint(self):
+        client = LocalClient(8765)
+        response = Mock()
+        response.read.side_effect = [
+            json.dumps({"csrf_token": "a" * 40, "meta": {"runtime_mode": "service"}}).encode(),
+            b'{"stopped":true}',
+        ]
+        client.opener = MagicMock()
+        client.opener.open.return_value.__enter__.return_value = response
+        self.assertEqual(client.stop_monitor(), {"stopped": True})
+        requests = [call.args[0] for call in client.opener.open.call_args_list]
+        self.assertEqual(requests[0].full_url, "http://127.0.0.1:8765/api/status")
+        self.assertEqual(requests[1].full_url, "http://127.0.0.1:8765/api/service/stop")
+        self.assertEqual(requests[1].get_method(), "POST")
+        self.assertEqual(requests[1].headers["X-ups-token"], "a" * 40)
+        self.assertEqual(requests[1].headers["Origin"], "http://127.0.0.1:8765")
+        self.assertEqual(json.loads(requests[1].data), {})
+
+    def test_client_stop_requires_explicit_boolean_service_confirmation(self):
+        client = LocalClient()
+        client.token = "a" * 40
+        for response in ({}, None, [], {"stopped": False}, {"stopping": False},
+                         {"stopped": 1}, {"stopping": "true"}):
+            with self.subTest(response=response), patch.object(client, "_request", return_value=response):
+                with self.assertRaisesRegex(ValueError, "no confirmó"):
+                    client.stop_monitor()
+        for response in ({"stopped": True}, {"stopping": True}):
+            with self.subTest(response=response), patch.object(client, "_request", return_value=response):
+                self.assertEqual(client.stop_monitor(), response)
+
+    def test_client_stop_reports_bounded_server_reason_or_generic_refusal(self):
+        client = LocalClient()
+        client.token = "a" * 40
+        for body, expected in ((b'{"error":"Prueba pendiente"}', "Prueba pendiente"),
+                               (b"not json", "rechazó"), (b"[]", "rechazó"),
+                               (b'x' * 1_000_001, "rechazó")):
+            with self.subTest(body=body[:80]):
+                stream = io.BytesIO(body)
+                error = HTTPError(client.url, 400, "Bad Request", {}, stream)
+                with patch.object(client, "_request", side_effect=error):
+                    with self.assertRaisesRegex(ValueError, expected):
+                        client.stop_monitor()
+                self.assertTrue(stream.closed)
+        with patch.object(client, "_request", return_value={"error": "X" * 1000}):
+            with self.assertRaises(ValueError) as result:
+                client.stop_monitor()
+            self.assertEqual(len(str(result.exception)), 300)
 
     def test_client_refuses_source_monitor_to_avoid_duplicate_desktop_delivery(self):
         client = LocalClient()

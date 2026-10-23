@@ -21,9 +21,10 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from .battery_estimation import BATTERY_ESTIMATE_METHOD
+
 DEFAULT_POLICY = {
     "enabled": False,
-    "on_battery_seconds": 300,
     "low_battery_percent": 20,
     "min_runtime_seconds": 180,
     "countdown_seconds": 15,
@@ -42,8 +43,9 @@ SAMPLE_FIELDS = (
 def battery_estimate_fields(sample):
     """Keep a derived percentage only with its bounded method provenance.
 
-    Estimates are optional display/history metadata, never a replacement for
-    reported battery_percent or low_battery telemetry. No value is inferred.
+    Keep estimates distinct from reported battery_percent and low_battery.
+    The explicitly labelled percentage policy may use the known estimate;
+    neither native field is rewritten. No value is inferred here.
     """
     percent = sample.get("battery_percent_estimate")
     method = sample.get("battery_estimate_method")
@@ -51,6 +53,20 @@ def battery_estimate_fields(sample):
              and isinstance(method, str) and 1 <= len(method) <= 80 and bool(method.strip()))
     return {"battery_percent_estimate": percent if valid else None,
             "battery_estimate_method": method if valid else None}
+
+
+def battery_percentage(sample):
+    """Prefer a reported percentage; only the known unit estimate may trigger policy."""
+    if not isinstance(sample, dict):
+        return None, None
+    reported = sample.get("battery_percent")
+    if type(reported) in (int, float) and math.isfinite(reported) and 0 <= reported <= 100:
+        return reported, "reported_percentage"
+    estimate = battery_estimate_fields(sample)
+    if (estimate["battery_estimate_method"] == BATTERY_ESTIMATE_METHOD
+            and estimate["battery_percent_estimate"] is not None):
+        return estimate["battery_percent_estimate"], "estimated_percentage"
+    return None, None
 
 
 def utc_now():
@@ -97,7 +113,6 @@ def validate_policy(value):
     if type(result["ups_poweroff"]) is not bool:
         raise ValueError("ups_poweroff debe ser booleano")
     limits = {
-        "on_battery_seconds": (0, 86400),
         "low_battery_percent": (0, 100),
         "min_runtime_seconds": (0, 86400),
         "countdown_seconds": (10, 120),
@@ -111,6 +126,45 @@ def validate_policy(value):
     if result["action"] not in ("shutdown", "hibernate"):
         raise ValueError("action debe ser shutdown o hibernate")
     return result
+
+
+def migrate_saved_policy(value):
+    """Convert stored two-stage timers without silently advancing an action.
+
+    This is deliberately separate from API validation: removed fields must not
+    be accepted by new settings requests. Historical hardware journals are not
+    policy settings and are never rewritten by this migration.
+    """
+    if not isinstance(value, dict):
+        return validate_policy(value), None
+    legacy_wait = value.get("on_battery_seconds", 0)
+    countdown = value.get("countdown_seconds", DEFAULT_POLICY["countdown_seconds"])
+    if type(legacy_wait) is not int or not 0 <= legacy_wait <= 86400:
+        raise ValueError("La espera guardada debe ser un entero entre 0 y 86400")
+    if type(countdown) is not int or not 10 <= countdown <= 3600:
+        raise ValueError("El tiempo guardado antes de actuar no es válido")
+    candidate = {key: item for key, item in value.items() if key != "on_battery_seconds"}
+    total = legacy_wait + countdown
+    candidate["countdown_seconds"] = min(total, 120)
+    result = validate_policy(candidate)
+    if total > 120:
+        result["enabled"] = False
+    if "on_battery_seconds" not in value and countdown <= 120:
+        return result, None
+    return result, {"previous_total_seconds": total, "requires_review": total > 120}
+
+
+def load_saved_policy(store):
+    """Persist the original policy before replacing its obsolete timer schema."""
+    original = store.get_setting("policy", DEFAULT_POLICY)
+    policy, migration = migrate_saved_policy(original)
+    if migration is not None:
+        stamp = iso_utc()
+        settings = {"policy_migration_backup": {"timestamp": stamp, "policy": original}, "policy": policy}
+        if migration["requires_review"]:
+            settings["policy_migration_review"] = {**migration, "timestamp": stamp}
+        store.set_settings(settings)
+    return policy
 
 
 class Store:
@@ -149,6 +203,9 @@ class Store:
                         key TEXT PRIMARY KEY, value TEXT NOT NULL);
                     CREATE TABLE IF NOT EXISTS webhook_deliveries (
                         id TEXT PRIMARY KEY, ts REAL NOT NULL, payload TEXT NOT NULL);
+                    CREATE TABLE IF NOT EXISTS notifications (
+                        id INTEGER PRIMARY KEY, timestamp TEXT NOT NULL,
+                        acknowledged_at TEXT, payload TEXT NOT NULL);
                 """)
             self._last_prune = 0.0
             self._prune()
@@ -166,6 +223,11 @@ class Store:
         with self._transaction():
             self._db.execute("DELETE FROM samples WHERE ts < ?", (cutoff,))
             self._db.execute("DELETE FROM events WHERE ts < ?", (cutoff,))
+            # Unread notices never expire with telemetry retention.
+            self._db.execute("DELETE FROM notifications WHERE acknowledged_at IS NOT NULL AND acknowledged_at < ? "
+                             "AND (json_extract(payload,'$.resolved_at') IS NOT NULL OR json_extract(payload,'$.kind') "
+                             "NOT IN ('power_lost','connection_lost','monitor_error','battery_low','battery_low_percentage','overload','ups_fault','policy_countdown','policy_migration_review'))",
+                             (iso_utc(datetime.fromtimestamp(cutoff, timezone.utc)),))
             self._last_prune = now
 
     def add_sample(self, sample):
@@ -212,7 +274,7 @@ class Store:
         Public hooks remain in the path for instrumented/custom stores.
         """
         entries = list(entries)
-        if any(kind not in ("sample", "event", "webhook_delivery") for kind, _ in entries):
+        if any(kind not in ("sample", "event", "webhook_delivery", "notification") for kind, _ in entries):
             raise ValueError("Tipo de escritura desconocido")
         self._prune()
         results = []
@@ -224,6 +286,8 @@ class Store:
                         results.append(self.add_sample(value))
                     elif kind == "webhook_delivery":
                         results.append(self.add_webhook_delivery(value))
+                    elif kind == "notification":
+                        results.append(self.put_notification(value))
                     else:
                         results.append(self.add_event(value["kind"], value["message"], value["data"],
                                                       timestamp=value["timestamp"]))
@@ -237,9 +301,58 @@ class Store:
         return json.loads(row[0]) if row else default
 
     def set_setting(self, key, value):
-        payload = json.dumps(value, allow_nan=False)
+        self.set_settings({key: value})
+
+    def set_settings(self, values):
+        """Commit related settings together, including policy review metadata."""
+        rows = [(key, json.dumps(value, allow_nan=False)) for key, value in values.items()]
         with self._lock, self._db:
-            self._db.execute("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, payload))
+            self._db.executemany("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", rows)
+
+    @staticmethod
+    def _notification(record):
+        value = copy.deepcopy(record)
+        if (not isinstance(value, dict) or type(value.get("id")) is not int or
+                not 0 < value["id"] <= 2**53 - 1):
+            raise ValueError("Identificador de aviso inválido.")
+        for key in ("kind", "title", "message", "severity"):
+            if not isinstance(value.get(key), str) or not value[key]:
+                raise ValueError("Registro de aviso inválido.")
+        value["timestamp"] = iso_utc(_timestamp(value.get("timestamp")))
+        for key in ("resolved_at", "acknowledged_at"):
+            value[key] = iso_utc(_timestamp(value[key])) if value.get(key) is not None else None
+        json.dumps(value, allow_nan=False)
+        return value
+
+    def put_notification(self, record):
+        """Upsert a stable notice; delayed writes cannot undo a user ACK."""
+        value = self._notification(record)
+        with self._transaction():
+            row = self._db.execute("SELECT acknowledged_at,payload FROM notifications WHERE id=?", (value["id"],)).fetchone()
+            if row and row[0] is not None:
+                value["acknowledged_at"] = row[0]
+            if row:
+                previous = json.loads(row[1])
+                if previous.get("resolved_at") is not None:
+                    value["resolved_at"] = previous["resolved_at"]
+            self._db.execute("INSERT INTO notifications(id,timestamp,acknowledged_at,payload) VALUES(?,?,?,?) "
+                             "ON CONFLICT(id) DO UPDATE SET acknowledged_at=excluded.acknowledged_at,payload=excluded.payload",
+                             (value["id"], value["timestamp"], value["acknowledged_at"], json.dumps(value, allow_nan=False)))
+        return value
+
+    def pending_notifications(self):
+        with self._lock:
+            rows = self._db.execute("SELECT payload FROM notifications WHERE acknowledged_at IS NULL ORDER BY timestamp,id").fetchall()
+        return [json.loads(row[0]) for row in rows]
+
+    def notification_incidents(self):
+        with self._lock:
+            rows = self._db.execute("SELECT payload FROM notifications ORDER BY timestamp,id").fetchall()
+        return [item for row in rows if (item := json.loads(row[0])).get("resolved_at") is None]
+
+    def acknowledge_notifications(self, records):
+        # Include not-yet-flushed records so an immediate click is atomic too.
+        return self.write_batch(("notification", value) for value in records)
 
     @staticmethod
     def _webhook_delivery(record):
@@ -917,6 +1030,8 @@ class PolicyEngine:
         self._clock, self._utc_clock = clock, utc_clock
         self.stale_after = stale_after
         self._battery_since = self._deadline = self._last_fresh_at = None
+        self._effective_countdown_seconds = None
+        self._emergency_source = self._emergency_percent = None
         self._suppressed = self._fired = False
         self._state, self._reason = "disabled", None
 
@@ -932,6 +1047,8 @@ class PolicyEngine:
         self.policy = value
         if changed:
             self._deadline = self._battery_since = self._last_fresh_at = None
+            self._effective_countdown_seconds = None
+            self._emergency_source = self._emergency_percent = None
             self._fired = False
             if not value["enabled"]:
                 self._suppressed = False
@@ -966,18 +1083,26 @@ class PolicyEngine:
         now = self._clock()
         if not self.policy["enabled"]:
             self._deadline = self._battery_since = self._last_fresh_at = None
+            self._effective_countdown_seconds = None
+            self._emergency_source = self._emergency_percent = None
             self._transition("disabled")
             return self.status()
         if not self._fresh(sample):
             self._deadline = self._battery_since = self._last_fresh_at = None
+            self._effective_countdown_seconds = None
+            self._emergency_source = self._emergency_percent = None
             self._transition("unknown", "Sin datos recientes y confirmados del UPS")
             return self.status()
         # Calling evaluate infrequently must not count unobserved time as safe.
         if self._last_fresh_at is not None and now - self._last_fresh_at > self.stale_after:
             self._deadline = self._battery_since = None
+            self._effective_countdown_seconds = None
+            self._emergency_source = self._emergency_percent = None
         self._last_fresh_at = now
         if sample["on_battery"] is False:
             self._deadline = self._battery_since = None
+            self._effective_countdown_seconds = None
+            self._emergency_source = self._emergency_percent = None
             self._suppressed = self._fired = False
             self._transition("online", "Suministro eléctrico disponible")
             return self.status()
@@ -988,22 +1113,30 @@ class PolicyEngine:
         if self._suppressed:
             self._transition("cancelled", "Cancelado hasta el próximo corte de energía")
             return self.status()
-        reasons = []
-        if now - self._battery_since >= self.policy["on_battery_seconds"]:
-            reasons.append("Tiempo configurado en batería alcanzado")
-        if sample.get("low_battery") is True:
-            reasons.append("El UPS indica batería baja")
-        battery = sample.get("battery_percent")
-        if self._number(battery) and battery <= self.policy["low_battery_percent"]:
-            reasons.append("Carga de batería en el umbral configurado")
-        runtime = sample.get("runtime_seconds")
-        if self._number(runtime) and runtime <= self.policy["min_runtime_seconds"]:
-            reasons.append("Autonomía en el umbral configurado")
-        if self._deadline is None and reasons:
+        percent, source = battery_percentage(sample)
+        threshold = self.policy["low_battery_percent"]
+        hardware_critical = sample.get("low_battery") is True
+        percentage_low = threshold > 0 and percent is not None and percent <= threshold
+        starting_countdown = self._deadline is None
+        if starting_countdown:
             self._deadline = now + self.policy["countdown_seconds"]
-            self._transition("countdown", reasons[0])
-        elif self._deadline is None:
-            self._transition("on_battery", "UPS alimentando desde batería")
+            self._effective_countdown_seconds = self.policy["countdown_seconds"]
+        if hardware_critical or percentage_low:
+            urgent_deadline = now if hardware_critical else now + 10
+            if urgent_deadline < self._deadline:
+                self._deadline = urgent_deadline
+            self._effective_countdown_seconds = min(self.policy["countdown_seconds"],
+                max(0 if hardware_critical else 10, math.floor(self._deadline - self._battery_since + 1e-6)))
+            if hardware_critical:
+                self._emergency_source, self._emergency_percent = "ups_critical_alarm", percent
+                reason = "El UPS reporta batería crítica: se solicita la protección de Windows inmediatamente."
+            else:
+                self._emergency_source, self._emergency_percent = source, percent
+                origin = "estimado" if source == "estimated_percentage" else "reportado"
+                reason = f"Batería baja: {percent:g} % {origin} (umbral {threshold} %). Protección prioritaria en un máximo de 10 segundos."
+            self._transition("countdown", reason)
+        elif starting_countdown:
+            self._transition("countdown", "Corte de energía detectado")
         if self._deadline is not None and now >= self._deadline:
             self._fired = True
             self._deadline = None
@@ -1024,5 +1157,10 @@ class PolicyEngine:
             "countdown_remaining": max(0, math.ceil(self._deadline - now)) if self._deadline is not None else None,
             "on_battery_seconds": max(0, int(now - self._battery_since)) if self._battery_since is not None else 0,
             "action": self.policy["action"], "suppressed": self._suppressed,
+            "configured_countdown_seconds": self.policy["countdown_seconds"],
+            "effective_countdown_seconds": self._effective_countdown_seconds,
+            "emergency": {"active": self._emergency_source is not None, "source": self._emergency_source,
+                          "percent": self._emergency_percent, "threshold_percent": self.policy["low_battery_percent"],
+                          "seconds_limit": 10, "immediate": self._emergency_source == "ups_critical_alarm"},
             "policy": dict(self.policy),
         }

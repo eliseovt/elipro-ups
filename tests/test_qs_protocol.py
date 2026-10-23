@@ -2,6 +2,7 @@ import unittest
 from datetime import datetime, timezone
 
 from ups_monitor.qs_protocol import MAX_FRAME_BYTES, QsProtocolError, parse_qs
+from ups_monitor.ups_power import OPERATIONAL_LIMITS, operational_sample_admission
 
 
 # Anonymized measurement bytes recovered from an existing vendor log, not USB.
@@ -119,9 +120,29 @@ class QsProtocolTests(unittest.TestCase):
     def test_denominator_and_implausible_measurements_are_rejected(self):
         for index, value in ((5, b"\x00\x00"), (6, b"\x00\x00\x00"),
                              (0, b"\xff\xff"), (4, b"\xff"),
-                             (7, b"\x00"), (8, b"\xff")):
+                             (8, b"\xff")):
             with self.subTest(index=index), self.assertRaises(QsProtocolError):
                 parse_qs(field_frame(index, value))
+
+    def test_zero_battery_voltage_preserves_power_and_critical_flags_without_voltage_blocking(self):
+        for flags, on_battery, critical in ((0x09, False, False), (0x89, True, False), (0xC9, True, True)):
+            for zero_field in (7, 8):
+                with self.subTest(flags=flags, zero_field=zero_field):
+                    fields = LOG_SAMPLE[1:-1].split(b" ")
+                    fields[zero_field], fields[9] = b"\x00", bytes([flags])
+                    sample = parse_qs(b"#" + b" ".join(fields) + b"\r")
+                    self.assertEqual(sample["battery_voltage"], 0)
+                    self.assertIs(sample["on_battery"], on_battery)
+                    self.assertIs(sample["low_battery"], critical)
+                    self.assertIs(sample["fault"], False)
+                    self.assertEqual(sample["raw_flags"]["status_hex"], f"{flags:02X}")
+                    self.assertGreater(sample["output_voltage"], 0)
+                    admission = operational_sample_admission(sample, OPERATIONAL_LIMITS)
+                    voltage = next(item for item in admission["checks"] if item["key"] == "battery_voltage")
+                    self.assertTrue(voltage["passed"])
+                    self.assertFalse(voltage["blocking"])
+                    self.assertEqual(admission["available"], not critical)
+                    self.assertEqual(admission["reason_code"], "low_battery" if critical else None)
 
     def test_zero_input_is_valid_only_for_confirmed_battery_or_inhibited_modes(self):
         zero_input = field_frame(0, b"\x00\x00")

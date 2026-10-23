@@ -27,6 +27,11 @@ NT2402PRO_CANDIDATE_PROFILE = {
     "input_report_bytes": 9, "output_report_bytes": 9, "feature_report_bytes": 0,
 }
 OBSERVED_UNIT_FINGERPRINT = "7df095c878742cf146a631909fd5f39946926b787720d9932263d2805e59399b"
+# These are operational telemetry/status checks, not measurements of autonomy.
+# Keep the physical trial and its point readings below unchanged for traceability.
+OPERATIONAL_LIMITS = {"source": "device_status", "version": 2,
+    "load_percent": "informational", "battery_voltage": "informational",
+    "low_battery_alarm": "windows_only_immediate_cut_risk"}
 VALIDATED_PROFILES = {"nt2402pro-qs-t-rev3": {
     **NT2402PRO_CANDIDATE_PROFILE, "device_fingerprint": OBSERVED_UNIT_FINGERPRINT,
     "restart_behavior": "automatic_on_mains", "restart_behavior_verified": True, "cancel_verified": True,
@@ -42,6 +47,7 @@ VALIDATED_PROFILES = {"nt2402pro-qs-t-rev3": {
     "operation_configuration": {"source": "user_configurable", "min_delay_seconds": 60,
         "max_delay_seconds": 540, "max_countdown_seconds": 120, "poll_margin_seconds": 10,
         "requires_on_battery_seconds": 0},
+    "operational_limits": OPERATIONAL_LIMITS.copy(),
     "action_validation": {"hibernate": {
         "completion_evidence": {"trial_count": 2, "observed_range_seconds": [10, 15]},
         "reserve_mode": "observed_sequence",
@@ -68,6 +74,22 @@ def _operation_configuration(profile, action):
     if action != "hibernate" or value != expected or any(type(value.get(key)) is not int for key in expected if key != "source"):
         raise UpsPowerBlocked("La configuración operativa del UPS no corresponde al perfil permitido.")
     return copy.deepcopy(value)
+
+
+def _operational_limits(profile, action):
+    value = profile.get("operational_limits")
+    if value is None:
+        return None
+    if (action != "hibernate" or _operation_configuration(profile, action) is None
+            or not operational_limits_valid(value)):
+        raise UpsPowerBlocked("Los criterios operativos del UPS no corresponden al perfil permitido.")
+    return copy.deepcopy(value)
+
+
+def operational_limits_valid(value):
+    """Reject type-coerced or partial criteria in both UI admission and USB."""
+    return (isinstance(value, dict) and value == OPERATIONAL_LIMITS
+        and all(type(value.get(key)) is type(expected) for key, expected in OPERATIONAL_LIMITS.items()))
 
 
 def configured_delay_seconds(profile, action, selected=None):
@@ -204,6 +226,7 @@ def _profile_evidence(profile, action):
     delay = minimum_delay_seconds(validation.get("completion_evidence", validation.get("completion_seconds")))
     if validation.get("reserve_mode") == "observed_sequence":
         _sequence_configuration(validation, action, delay)
+        _operational_limits(profile, action)
         return delay, None
     if validation.get("reserve_mode", "measured_reserve") != "measured_reserve":
         raise UpsPowerBlocked("Modo de evidencia de batería no admitido.")
@@ -278,6 +301,106 @@ def _qs_shutdown_bit(sample):
     return bool(int(flags, 16) & 2)
 
 
+def _diagnostic_value(value):
+    """Keep failure diagnostics JSON-safe even for malformed telemetry."""
+    if type(value) is float and not math.isfinite(value):
+        return repr(value)
+    if isinstance(value, dict):
+        return {str(key): _diagnostic_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_diagnostic_value(item) for item in value]
+    if value is None or type(value) in (str, int, float, bool):
+        return value
+    return repr(value)
+
+
+def operational_sample_admission(sample, limits, *, expected_battery=None):
+    """One status/telemetry criterion for the tracker and final USB preflight.
+
+    Battery voltage is informational. A previous trial's voltage is not a
+    low-battery threshold or a claim that today's battery has measured runtime.
+    Only the current sample is checked; a previous AC reading is not required.
+    """
+    sample = sample if isinstance(sample, dict) else {}
+    checks = []
+
+    def check(key, label, passed, value, expected, reason):
+        checks.append({"key": key, "label": label, "passed": bool(passed),
+            "value": _diagnostic_value(value), "expected": expected, "reason": None if passed else reason,
+            "category": ("operation" if key in ("battery_test", "shutdown_pending") else
+                "controlled_shutdown" if key in ("low_battery", "fault", "output_voltage") else "connection")})
+
+    valid_limits = operational_limits_valid(limits)
+    check("operational_profile", "Criterios operativos", valid_limits, limits, "device_status v2",
+        "El perfil carece de criterios operativos de estado del UPS válidos.")
+    fresh = _fresh_sample(sample)
+    check("sample_fresh", "Lectura USB reciente", fresh, sample.get("timestamp"),
+        "máximo 15 s",
+        "La lectura USB falta, está desconectada o está vencida; se requiere una nueva lectura válida.")
+    raw = sample.get("raw_flags")
+    flags = raw.get("status_hex") if isinstance(raw, dict) else None
+    valid_flags = isinstance(flags, str) and re.fullmatch(r"[0-9A-Fa-f]{2}", flags) is not None
+    bits = int(flags, 16) if valid_flags else None
+    check("qs_status", "Estado QS confirmado", valid_flags, flags, "dos dígitos hexadecimales",
+        "La lectura no incluye un estado QS válido para controlar el UPS.")
+    critical = sample.get("low_battery") is True or bits is not None and bool(bits & 0x40)
+    check("low_battery", "Sin alarma crítica de batería del UPS", sample.get("low_battery") is False
+        and bits is not None and not bits & 0x40, sample.get("low_battery"), False,
+        "El UPS reporta batería crítica; una orden podría cortar inmediatamente. Se prioriza hibernar Windows."
+        if critical else "El estado de batería crítica no está confirmado o contradice la lectura QS.")
+    if critical:
+        checks[-1].update(blocking=True, severity="critical")
+    if bits is None or not bits & 0x40:
+        checks[-1]["category"] = "connection" if not checks[-1]["passed"] else "controlled_shutdown"
+    check("fault", "Sin falla del UPS", sample.get("fault") is False and bits is not None
+        and not bits & 0x10, sample.get("fault"), False,
+        "El UPS indica una falla o su ausencia no está confirmada; solo se protege Windows.")
+    if bits is None or not bits & 0x10:
+        checks[-1]["category"] = "connection" if not checks[-1]["passed"] else "controlled_shutdown"
+    check("battery_test", "Sin prueba de batería activa", bits is not None and not bits & 0x04,
+        None if bits is None else bool(bits & 0x04), False,
+        "Hay una prueba de batería activa o su estado no se puede confirmar.")
+    check("shutdown_pending", "Sin otra orden de apagado activa", bits is not None and not bits & 0x02,
+        None if bits is None else bool(bits & 0x02), False,
+        "El UPS informa un apagado pendiente o no permite descartarlo; no se repetirá la orden.")
+    battery = sample.get("on_battery")
+    state_ok = (type(battery) is bool and bits is not None and bool(bits & 0x80) == battery
+        and sample.get("raw_status") in (("Battery mode",) if battery else ("Line mode", "AVR mode"))
+        and (expected_battery is None or battery is expected_battery))
+    check("power_state", "Fuente de energía confirmada", state_ok,
+        {"on_battery": battery, "raw_status": sample.get("raw_status")},
+        "batería" if expected_battery is True else "red eléctrica" if expected_battery is False else "red o batería confirmadas",
+        "El estado de energía no confirma " + ("el uso de batería." if expected_battery is True else
+            "la red eléctrica previa." if expected_battery is False else "red o batería sin estados contradictorios."))
+    # The QS parser intentionally leaves on_battery unknown in these modes.
+    # A coherent device-reported fault/test/pending order is not loss of USB.
+    if battery is None and bits is not None:
+        for mode, flag, category in (("Fault mode", 0x10, "controlled_shutdown"),
+                ("Battery test mode", 0x04, "operation"), ("Shutdown mode", 0x02, "operation")):
+            if sample.get("raw_status") == mode and bits & flag:
+                checks[-1]["category"] = category
+                break
+    voltage = sample.get("battery_voltage")
+    check("battery_voltage", "Voltaje de batería informativo", True, voltage,
+        "solo información; no bloquea el apagado", None)
+    checks[-1].update(blocking=False, severity="info", category=None)
+    load = sample.get("load_percent")
+    check("load_percent", "Carga del UPS informativa", True, load,
+        "solo información; una carga elevada por sí sola no bloquea el apagado", None)
+    checks[-1].update(blocking=False, severity="info", category=None)
+    check("output_voltage", "Salida del UPS activa", _output_active(sample), sample.get("output_voltage"), "finito y mayor que 0 V",
+        "La salida del UPS no está activa o su voltaje no es válido.")
+    if not fresh or not valid_flags:
+        # Missing/stale/undecodable telemetry cannot establish a current device
+        # fault or an operation in progress. Report its actual connection cause.
+        for item in checks:
+            if not item["passed"]:
+                item["category"] = "connection"
+    failures = [item for item in checks if not item["passed"]]
+    return {"available": not failures, "reason_code": failures[0]["key"] if failures else None,
+        "reason": " ".join(item["reason"] for item in failures) or None, "checks": checks}
+
+
 def _shutdown_active(sample):
     return isinstance(sample, dict) and sample.get("raw_status") == "Shutdown mode" and _qs_shutdown_bit(sample) is True
 
@@ -345,8 +468,13 @@ def validate_production_start_preflight(profile, operation, sample, *, now_monot
     current = time.monotonic() if now_monotonic is None else now_monotonic
     started = operation.get("started_monotonic")
     remaining = operation.get("reserve_seconds")
-    load_limit = profile["action_validation"][operation["action"]].get("validated_max_load_percent")
     load = sample.get("load_percent") if isinstance(sample, dict) else None
+    limits = _operational_limits(profile, operation["action"])
+    load_limit = None if limits is not None else profile["action_validation"][operation["action"]].get("validated_max_load_percent")
+    if limits is not None:
+        admission = operational_sample_admission(sample, limits, expected_battery=True)
+        if not admission["available"]:
+            raise UpsPowerBlocked(admission["reason"])
     if (operation.get("owner") != "elipro-ups-power" or operation.get("state") != "arming"
             or operation.get("interrupted") is True or operation.get("submission_complete") is True
             or type(operation.get("owner_pid")) is not int or operation["owner_pid"] not in (os.getpid(), os.getppid())
@@ -354,7 +482,8 @@ def validate_production_start_preflight(profile, operation, sample, *, now_monot
             or operation.get("device_fingerprint") != profile["device_fingerprint"]
             or operation.get("delay_seconds") != delay or type(started) not in (int, float) or not math.isfinite(started)
             or type(current) not in (int, float) or not math.isfinite(current) or not 0 <= current - started <= 10
-            or not _fresh_sample(sample) or sample.get("on_battery") is not True or sample.get("low_battery") is not False
+            or not _fresh_sample(sample) or sample.get("on_battery") is not True
+            or limits is None and sample.get("low_battery") is not False
             or sample.get("fault") is not False or sample.get("raw_status") != "Battery mode" or not _output_active(sample)
             or load_limit is not None and (type(load) not in (int, float) or not math.isfinite(load) or not 0 <= load <= load_limit)):
         raise UpsPowerBlocked("La lectura inmediata no permite completar Windows y cortar el UPS con reserva validada.")
@@ -369,13 +498,33 @@ def validate_production_start_preflight(profile, operation, sample, *, now_monot
 
 
 def validate_observed_sequence_preflight(profile, action, sample, evidence, *, now_monotonic=None):
-    """Validate the observed sequence; no battery runtime is inferred here."""
+    """Validate continuity and operational status; never infer battery runtime."""
     delay, reserve = _profile_evidence(profile, action)
     if reserve is not None or not isinstance(evidence, dict):
         raise UpsPowerBlocked("Falta evidencia continua de la secuencia de hibernación observada.")
     sequence = _sequence_configuration(profile["action_validation"][action], action, delay)
     operating = _operation_configuration(profile, action)
+    limits = _operational_limits(profile, action)
     current = time.monotonic() if now_monotonic is None else now_monotonic
+    if limits is not None:
+        # Production operates from the current battery countdown, including
+        # service startup or USB reconnection while mains is still absent.
+        # Historical trial readings remain traceability, never runtime gates.
+        times = [evidence.get(key) for key in ("battery_started_monotonic", "last_sample_monotonic")]
+        countdown = evidence.get("countdown_seconds")
+        if (evidence.get("kind") != "battery_countdown" or type(evidence.get("version")) is not int
+                or evidence["version"] != 2
+                or evidence.get("profile_id") != profile["profile_id"]
+                or evidence.get("device_fingerprint") != profile["device_fingerprint"]
+                or any(type(value) not in (int, float) or not math.isfinite(value) or value < 0 for value in [current, *times])
+                or not times[0] <= times[1] <= current or current - times[1] > 15
+                or type(countdown) is not int or not 10 <= countdown <= operating["max_countdown_seconds"]
+                or current - times[0] < countdown):
+            raise UpsPowerBlocked("Falta una cuenta atrás cumplida con lecturas USB recientes vinculadas a esta unidad.")
+        admission = operational_sample_admission(sample, limits, expected_battery=True)
+        if not admission["available"]:
+            raise UpsPowerBlocked(admission["reason"])
+        return True
     times = [evidence.get(key) for key in ("last_mains_monotonic", "battery_started_monotonic", "last_sample_monotonic")]
     if (any(type(value) not in (int, float) or not math.isfinite(value) or value < 0 for value in [current, *times])
             or not times[0] <= times[1] <= times[2] <= current
@@ -387,7 +536,7 @@ def validate_observed_sequence_preflight(profile, action, sample, evidence, *, n
             or current - times[1] < evidence["countdown_seconds"]
             or not 0 <= current - times[0] <= (evidence["countdown_seconds"] + operating["poll_margin_seconds"]
                 if operating else sequence["max_seconds_since_mains"])):
-        raise UpsPowerBlocked("La operación requiere una cuenta atrás de 10 a 120 segundos, sin espera previa ni huecos de lectura.")
+        raise UpsPowerBlocked("La operación requiere un tiempo antes de actuar de 10 a 120 segundos y lecturas continuas.")
     mains = evidence.get("last_mains_sample")
     for reading, online in ((mains, True), (sample, False)):
         # The historical CA sample is retained throughout the countdown. Its
@@ -512,6 +661,7 @@ class UpsPowerCoordinator:
                 delay_hardware_validated=type(selected) is int and selected == delay,
                 delay_protocol_supported=type(selected) is int and 60 <= selected <= 540 and selected % 60 == 0,
                 operation_configuration=_operation_configuration(profile, action))
+            result["operational_limits"] = _operational_limits(profile, action)
             configured_delay_seconds(profile, action, selected)
             if device is None:
                 raise UpsPowerBlocked("Falta identificar la unidad USB físicamente validada.")
@@ -642,8 +792,13 @@ class UpsPowerCoordinator:
             delay = configured_delay_seconds(profile, action, delay_seconds)
             if not profile_matches_device(profile, device):
                 raise UpsPowerBlocked("La identidad del UPS no coincide con el perfil validado.")
+            limits = _operational_limits(profile, action)
+            if limits is not None:
+                admission = operational_sample_admission(sample, limits, expected_battery=True)
+                if not admission["available"]:
+                    raise UpsPowerBlocked(admission["reason"])
             if (not _fresh_sample(sample) or sample.get("on_battery") is not True
-                    or sample.get("low_battery") is not False or sample.get("fault") is not False
+                    or limits is None and sample.get("low_battery") is not False or sample.get("fault") is not False
                     or sample.get("raw_status") != "Battery mode"):
                 raise UpsPowerBlocked("El corte del UPS requiere batería confirmada, sin batería baja ni falla.")
             if measured_reserve is None:
@@ -653,7 +808,7 @@ class UpsPowerCoordinator:
             elif (type(reserve_seconds) not in (int, float) or not math.isfinite(reserve_seconds)
                     or reserve_seconds < delay or measured_reserve < delay):
                 raise UpsPowerBlocked("No hay reserva de batería validada para completar Windows antes del corte.")
-            load_limit = profile["action_validation"][action].get("validated_max_load_percent")
+            load_limit = None if limits is not None else profile["action_validation"][action].get("validated_max_load_percent")
             load = sample.get("load_percent")
             if load_limit is not None and (type(load) not in (int, float) or not math.isfinite(load) or not 0 <= load <= load_limit):
                 raise UpsPowerBlocked("La carga actual no está dentro de la reserva de batería físicamente validada.")

@@ -36,11 +36,16 @@ def _date(value):
     return result
 
 
-def _elapsed(operation):
+def _monotonic_start(operation):
+    """Validate a persisted tick without comparing clocks from different boots."""
     tick = operation.get("started_monotonic")
     if type(tick) not in (int, float) or not math.isfinite(tick) or tick < 0:
         raise UpsPowerBlocked("La operación no tiene un reloj monotónico válido.")
-    elapsed = time.monotonic() - tick
+    return tick
+
+
+def _elapsed(operation):
+    elapsed = time.monotonic() - _monotonic_start(operation)
     if elapsed < 0:
         raise UpsPowerBlocked("El reloj de la operación cambió; requiere revisión.")
     return elapsed
@@ -101,7 +106,7 @@ def load_test_operation(path):
     _date(operation["created_at"])
     if type(operation.get("service_pid")) is not int or operation["service_pid"] <= 0:
         raise ValueError("La operación no identifica su proceso propietario.")
-    _elapsed(operation)
+    _monotonic_start(operation)
     profile = operation.get("profile")
     if (not isinstance(profile, dict) or any(profile.get(key) != value for key, value in NT2402PRO_CANDIDATE_PROFILE.items())
             or not isinstance(profile.get("device_fingerprint"), str) or len(profile["device_fingerprint"]) != 64):

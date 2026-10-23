@@ -11,18 +11,32 @@ El perfil `nt2402pro-qs-t-rev3` separa la configuración operativa elegida por e
 | Ajuste o condición operativa | Valor o límite |
 | --- | --- |
 | Acción de Windows | Hibernar sin forzar aplicaciones |
-| Espera previa en batería | 0 segundos |
-| Tiempo para cancelar | De 10 a 120 segundos; predeterminado: 15 segundos |
+| Tiempo antes de hibernar | De 10 a 120 segundos desde detectar el corte; predeterminado: 15 segundos |
 | Tiempo para apagar el UPS | De 1 a 9 minutos enteros; predeterminado: 3 minutos |
-| Carga observada, incluida la lectura inmediata del trabajador | Como máximo 11 % |
-| Voltaje de batería en la lectura previa de CA | Al menos 27,41 V |
-| Voltaje de batería durante la secuencia | Al menos 25,41 V |
+| Porcentaje bajo para protección prioritaria | Umbral editable de 0 a 100 %; predeterminado 20 %. Cero desactiva la prioridad por porcentaje |
+| Carga del UPS, incluida la lectura inmediata del trabajador | Informativa; alcanzar o superar el 100 % no bloquea por sí solo |
+| Voltaje de batería | Informativo; no bloquea ni aporta un umbral de protección |
 | Orden UPS | `S01R0000\r` a `S09R0000\r`, según el tiempo elegido, una sola vez |
 | Retorno de salida esperado | Automático al regresar CA |
 
-El tiempo del UPS comienza cuando se envía su orden, al iniciar la solicitud de hibernación; no comienza al detectar el corte ni espera confirmación de que Windows haya terminado. Con los valores predeterminados se muestran quince segundos para cancelar; después se programa el UPS a tres minutos y se solicita hibernar la PC. Los tiempos son independientes.
+El aviso aparece al detectar el corte y toda la cuenta puede cancelarse. No existe una espera adicional antes del aviso. El tiempo del UPS comienza cuando se envía su orden, al iniciar la solicitud de hibernación; no comienza al detectar el corte ni espera confirmación de que Windows haya terminado. Con los valores predeterminados se muestran quince segundos para cancelar; después se programa el UPS a tres minutos y se solicita hibernar la PC. Los tiempos son independientes.
+
+Desde 0.9.17, si el porcentaje disponible alcanza el umbral guardado mientras se usa batería, la cuenta restante se reduce a un máximo de **10 segundos**, sin prolongar una cuenta que ya tiene menos tiempo ni cambiar el retardo del UPS. Se prefiere el porcentaje reportado; esta unidad QS/T no lo entrega y utiliza la estimación identificada `nt2402pro-pmv-qs-v1`, siempre etiquetada como estimada. La estimación no se copia a `battery_percent` ni se convierte en una alarma del dispositivo.
+
+La alarma crítica real del UPS es una condición distinta: se solicita la protección de Windows inmediatamente. No se envía `S<n>` en ese estado porque el protocolo permite que el equipo corte inmediatamente por batería baja, sin respetar el retardo. Esa excepción evita cortar antes de la hibernación y genera un motivo explícito y un aviso pendiente de Entendido. El control no usa mínimos de voltaje de batería, ni siquiera cuando la lectura es cero o no está disponible; la frescura, identidad, estado QS, salida activa, ausencia de falla y continuidad siguen siendo necesarios.
 
 Todos los ajustes y las notas de funcionamiento permanecen visibles. Hay un único botón **Cancelar protección** durante el aviso inicial: detiene esta actuación de Windows y del UPS hasta el próximo corte. Después de programar el UPS no aparece otra cuenta cancelable. El temporizador posterior es informativo; no se ofrece una cancelación genérica del UPS al usuario.
+
+Desde **0.9.19**, los bloqueos efectivos se agrupan en las mismas cuatro categorías en el backend y el panel:
+
+| Categoría | Motivos concretos |
+| --- | --- |
+| `connection`: UPS sin comunicación o incompatible | Falta de USB directo, identidad o protocolo incompatible, datos antiguos, estado QS desconocido o incoherente. |
+| `windows`: Windows no está preparado para hibernar | Hibernación no disponible, permiso de acciones reales ausente o monitor que no puede solicitar la acción. |
+| `operation`: Otra operación de energía está pendiente | Prueba en curso, corte pendiente, resultado incierto o registro propio sin resolver; protege contra órdenes duplicadas. |
+| `controlled_shutdown`: El UPS no puede ejecutar un apagado controlado | Falla, alarma crítica real que permite corte inmediato o salida inactiva/no confirmada. |
+
+Los estados QS coherentes de falla, prueba o corte pendiente se atribuyen a su motivo específico; no se presentan además como una pérdida de comunicación. El porcentaje bajo configurado adelanta la protección y no constituye un bloqueo. Una carga elevada conserva sus alertas, sin impedir por sí sola la orden. Los parámetros fuera de rango se rechazan al guardar.
 
 La evidencia histórica se mantiene sin modificar:
 
@@ -34,16 +48,21 @@ La evidencia histórica se mantiene sin modificar:
 | Tiempo desde la última CA hasta el inicio registrado | 15,016 segundos |
 | Tiempo desde la última CA hasta completar el envío | 15,353 segundos |
 | Retardo UPS solicitado y observado | 180 segundos solicitados; el usuario informó aproximadamente tres minutos |
+| Carga y tensión de la observación histórica | 11 %, 27,41 V con CA y 25,41 V con batería; son datos conservados, no límites operativos actuales |
 
-Cambiar la configuración a quince segundos o elegir otro retardo no cambia esos datos ni acredita una prueba física nueva. Los voltajes delimitan condiciones de operación; no se convierten en porcentaje de carga o autonomía. `action_validation.hibernate.sequence_validation` conserva el ensayo original y `operation_configuration` permite explícitamente la configuración de usuario: cuenta de hasta 120 segundos, retardo de 60 a 540 segundos, espera previa de cero y margen de sondeo/envío de diez segundos después de la cuenta. Ese margen es un límite de continuidad operativa, no una reserva de batería medida.
+Cambiar la configuración a quince segundos o elegir otro retardo no cambia esos datos ni acredita una prueba física nueva. `action_validation.hibernate.sequence_validation` conserva el ensayo original y `operation_configuration` permite la configuración de usuario: cuenta de hasta 120 segundos y retardo de 60 a 540 segundos. `operational_limits` versión 2 considera informativos el voltaje y la carga. La producción ya no exige una CA previa ni impone la ventana histórica desde esa CA; los campos históricos siguen conservados para trazabilidad y compatibilidad de registros.
 
-El identificador `reserve_mode: observed_sequence` se conserva para este perfil, sin `reserve_seconds` ni un supuesto tiempo de recarga. El valor predeterminado de quince segundos no se rechaza por confundirlo con el límite histórico de diez. Permanecen las comprobaciones de unidad, fuente nativa, lectura fresca, carga, voltaje y continuidad; huecos, reinicio, suspensión, pérdida de identidad, batería baja o falla impiden armar el corte. Si no se admite el control del UPS antes de enviarlo, se conserva el camino de protección de Windows cuando sus propias condiciones permiten actuar.
+El identificador `reserve_mode: observed_sequence` se conserva para este perfil, sin `reserve_seconds` ni un supuesto tiempo de recarga. El tracker genera evidencia `kind: battery_countdown`, `version: 2`, vinculada a la unidad y a la cuenta efectiva. El trabajador exige que esa cuenta haya transcurrido, que la última observación tenga como máximo 15 segundos y que su lectura QS inmediata siga siendo válida. No usa carga máxima, tensión mínima ni una edad desde la última CA para admitir la orden.
+
+Al iniciar en batería o recuperar USB tras un hueco, las nuevas lecturas válidas permiten comenzar una cuenta completa aunque no haya vuelto la electricidad. Un cambio de unidad o datos inválidos descarta la continuidad anterior. Una falla temporal o una prueba reportada bloquean mientras están presentes; una lectura posterior válida no exige volver a CA. La cuenta nunca concede autonomía medida. Una operación ya enviada, incierta o interrumpida continúa requiriendo revisión y no se reenvía automáticamente. Si no se admite el control del UPS, se conserva la protección de Windows y se publica el motivo con sus mediciones, comprobaciones, tiempos y fecha.
 
 El retardo operativo debe superar el mayor tiempo de hibernación observado en al menos 45 segundos: con el máximo informado de 15 segundos, el mínimo configurable es un minuto. Es un margen operativo elegido, no una medición nueva de autonomía ni una garantía ante bloqueos de Windows.
 
 ### Contrato de política y estado
 
-`policy.countdown_seconds` es un entero de 10 a 120, predeterminado 15. `policy.ups_poweroff_delay_seconds` es un entero de 60 a 540 y múltiplo de 60, predeterminado 180. Este segundo campo guarda segundos aunque el formulario muestre minutos. No se admite ni se redondea silenciosamente un valor de diez minutos: la documentación específica QS-Hex limita este comando a nueve. La actualización conserva ajustes guardados; la activación explícita puede establecer los nuevos valores acordados.
+`policy.countdown_seconds` es el único tiempo antes de actuar en Windows: entero de 10 a 120, predeterminado 15. `policy.ups_poweroff_delay_seconds` es un entero de 60 a 540 y múltiplo de 60, predeterminado 180. Este segundo campo guarda segundos aunque el formulario muestre minutos. No se admite ni se redondea silenciosamente un valor de diez minutos: la documentación específica QS-Hex limita este comando a nueve.
+
+Desde 0.9.16, `policy.on_battery_seconds` dejó de ser una opción del API y del formulario. Al cargar ajustes antiguos se conserva la suma de espera y cuenta cuando cabe en el rango admitido. Una suma mayor de 120 segundos requiere revisar y volver a habilitar la política: se conserva la configuración original como respaldo y no se adelanta una actuación activa silenciosamente. Los campos equivalentes en la evidencia del trabajador USB describen el contrato histórico y no añaden una espera configurable.
 
 Las capacidades distinguen:
 
@@ -53,6 +72,8 @@ Las capacidades distinguen:
 - `delay_hardware_validated`: verdadero solo cuando el retardo elegido coincide con los 180 segundos físicamente observados. No certifica una nueva combinación de cuenta atrás, carga o autonomía.
 
 El servidor transmite el retardo seleccionado al coordinador. El diario conserva ese valor en `delay_seconds` y la evidencia continua de la operación antes de escribir USB; el trabajador vuelve a comprobar ambos. Los plazos de cancelación de emergencia y revisión se calculan con el valor realmente enviado, sin reutilizar tres minutos fijos cuando se eligió otro tiempo. La simulación también usa los dos tiempos guardados y nunca envía controles.
+
+El panel expone `operational_limits`, `checks`, `reason_code` y `last_block`. Un bloqueo de la orden crea un aviso persistente hasta Entendido y conserva el último motivo histórico aunque después haya condiciones disponibles. El evento guarda la lectura y el criterio aplicado. El límite de repetición de ventanas no elimina avisos nuevos. `protection.emergency` identifica porcentaje reportado, estimado o alarma crítica y el tiempo efectivo total conserva la continuidad al abreviar una cuenta en curso.
 
 ## Evidencia del protocolo
 
@@ -94,7 +115,7 @@ Cada cancelación se intenta una sola vez y exige un envío propio completo. La 
 
 La excepción de señal pendiente se documenta en `pending_signal_evidence`, con la misma huella y observaciones de corte, ausencia de señal y cancelación sin corte. Para un perfil de retorno automático se exige `automatic_return_observed: true`, sin pedir `manual_start_observed`; los perfiles manuales antiguos conservan esta última evidencia. Las capacidades y los diarios distinguen `restart_behavior` y `manual_restart`: este último es falso cuando el retorno esperado es automático. Un diario antiguo sin el campo nuevo solo se acepta con su condición manual original. La orden sigue siendo `S03R0000\r` cuando el retardo validado es de tres minutos; no se añade un comando de reinicio.
 
-Los controles usan un evento nativo por operación, conservado por el proceso propietario y señalado inmediatamente cuando Windows anuncia suspensión. El trabajador lo comprueba antes y después de consultar QS y antes de cada fragmento de control. También vuelve a comprobar la continuidad y la ventana operativa antes de completar la orden. Un evento ausente o señalado bloquea la escritura; no se completa una orden pausada al reanudar. Después de un posible envío, la solicitud de Windows se ejecuta antes de actualizar el diario o leer el estado. El hecho de envío completo queda en memoria antes del callback y no se pierde si este inicia la hibernación.
+Los controles usan un evento nativo por operación, conservado por el proceso propietario y señalado inmediatamente cuando Windows anuncia suspensión. El trabajador lo comprueba antes y después de consultar QS y antes de cada fragmento de control. También comprueba de nuevo la cuenta cumplida, la frescura de la lectura y la antigüedad de la operación recién creada antes de completar la orden. Esta vigencia de envío no es una ventana desde la última CA. Un evento ausente o señalado bloquea la escritura; no se completa una orden pausada al reanudar. Después de un posible envío, la solicitud de Windows se ejecuta antes de actualizar el diario o leer el estado. El hecho de envío completo queda en memoria antes del callback y no se pierde si este inicia la hibernación.
 
 La reserva medida, cuando un perfil la documente, se sigue independientemente del temporizador de la política. Sin autonomía real del hardware, esa modalidad requiere una condición de recarga (`reserve_baseline.recharge_seconds`, `min_battery_voltage`) y un límite de carga validados. Una vuelta breve de electricidad no repone la reserva completa. Arranque, suspensión, huecos, pérdida de identidad y carga desconocida o excesiva invalidan la reserva medida. El lector QS actual no informa autonomía real y su porcentaje estimado nunca concede reserva. La configuración operativa del perfil actual no inventa esa autonomía ni una condición de recarga.
 
@@ -122,4 +143,4 @@ El usuario realizó exactamente dos pruebas normales de hibernación, informó e
 
 Los avisos de comunicación al volver coincidieron con controles de salud que contaron la pausa de Windows como retraso del lector y, en una prueba, con una lectura USB que agotó su plazo durante la reanudación. El servicio debe tratar la suspensión como una pausa esperada y conceder hasta 15 segundos de recuperación al reanudar, manteniendo bloqueadas las acciones hasta obtener telemetría nueva. Si la comunicación no se recupera después de ese plazo, corresponde una alarma de fallo persistente. Los datos anteriores a la suspensión no deben reactivar una cuenta atrás.
 
-Los dos ensayos normales de hibernación conservaron encendido el UPS y no enviaron controles de salida. Los ensayos físicos separados conservan sus resultados observados. Los tiempos configurables no se etiquetan como ensayos nuevos ni aprueban otras unidades, cargas fuera de los límites o acciones no admitidas.
+Los dos ensayos normales de hibernación conservaron encendido el UPS y no enviaron controles de salida. Los ensayos físicos separados conservan sus resultados observados. Los tiempos configurables no se etiquetan como ensayos nuevos ni acreditan otras unidades, autonomía para otras cargas o acciones no admitidas. La comprobación física de diez segundos antes de hibernar y sesenta segundos de retardo UPS sigue pendiente de observación; las pruebas automatizadas no la sustituyen.

@@ -20,7 +20,7 @@ class MonitorHealthTests(unittest.TestCase):
         self.alerts = Mock()
         self.alerts.status.return_value = {}
         self.adapter = SimpleNamespace(source="test", read=lambda: {
-            "timestamp": iso_utc(), "on_battery": True, "low_battery": True})
+            "timestamp": iso_utc(), "on_battery": True, "low_battery": False})
         self.monitor = Monitor(self.store, self.adapter, action_callback=self.action,
                                alerts=self.alerts, health_clock=self.clock)
         self.engine_clock = Mock(return_value=100.0)
@@ -61,7 +61,7 @@ class MonitorHealthTests(unittest.TestCase):
         def stalled_read():
             entered.set()
             release.wait(5)
-            return {"timestamp": iso_utc(), "on_battery": True, "low_battery": True}
+            return {"timestamp": iso_utc(), "on_battery": True, "low_battery": False}
 
         def on_event(kind, *_args):
             if kind == "monitor_error":

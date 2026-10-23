@@ -7,9 +7,10 @@ value. It is seeded from the first valid observation, never from an assumed full
 battery. A minimum three-second update interval approximates the observed OEM
 cadence at the native reader's two-second poll rate; exact display times differ.
 
-This is not a calibrated state of charge measurement and must never populate
-battery_percent or low_battery, or participate in shutdown decisions. No USB I/O,
-runtime calculation, battery control, or proprietary runtime is used here.
+This is not a calibrated state of charge measurement and never populates
+battery_percent or low_battery. The separately labelled low-percentage policy
+may use this estimate to expedite an already enabled Windows protection.
+No USB I/O, runtime calculation, battery control, or proprietary runtime is used here.
 """
 from __future__ import annotations
 

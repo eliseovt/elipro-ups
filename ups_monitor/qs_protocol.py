@@ -74,8 +74,8 @@ def parse_qs(frame: bytes, *, preserve_battery_precision=False) -> dict:
     output_voltage = _bounded("Voltaje de salida", (output_raw * output_scale // 51) / 256, 0, 400)
     frequency = 0.0 if output_is_off and (divisor == 0 or dividend == 0) else _bounded("Frecuencia", dividend / divisor, 40, 70)
     battery_voltage = _bounded("Voltaje de batería", battery_raw * battery_scale / 510, 0, 100)
-    if battery_voltage == 0:
-        raise QsProtocolError("Voltaje de batería QS no verificable.")
+    # Battery voltage is informational. A zero reading must not hide otherwise
+    # valid power-state/critical-alarm flags or cancel the configured protection.
     _bounded("Carga", load, 0, 200)
 
     utility_failed = bool(flags & 0x80)

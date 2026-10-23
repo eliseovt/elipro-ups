@@ -51,15 +51,19 @@ class SimulationTests(unittest.TestCase):
         monitor.engine._clock = clock
         try:
             self.assertTrue(monitor.dry_run)
-            monitor.set_policy({"enabled": True, "on_battery_seconds": 86400, "countdown_seconds": 10})
-            for value, expected in ((100, "online"), (106, "on_battery"), (112, "countdown"),
+            monitor.set_policy({"enabled": True, "countdown_seconds": 10})
+            for value, expected in ((100, "online"), (106, "countdown"), (112, "action_started"),
                                     (123, "action_started"), (130, "online")):
                 clock.return_value = value
                 monitor.tick()
                 self.assertEqual(monitor.engine.status()["state"], expected)
+                if value == 112:
+                    self.assertTrue(monitor.engine.status()["emergency"]["immediate"])
+                    self.assertEqual(sum(event["kind"] == "simulation" for event in store.events()), 1)
             kinds = {event["kind"] for event in store.events()}
             self.assertTrue({"power_lost", "battery_low", "simulation", "power_restored"} <= kinds)
             self.assertNotIn("policy_action_started", kinds)
+            self.assertEqual(sum(event["kind"] == "simulation" for event in store.events()), 1)
             snapshot = monitor.snapshot()
             self.assertEqual(snapshot["meta"]["source"], "simulation")
             self.assertTrue(snapshot["meta"]["dry_run"])
@@ -120,7 +124,7 @@ class SimulationServiceTests(unittest.TestCase):
             data_dir = Path(directory)
             saved = Store(data_dir / "monitor.sqlite3")
             saved.set_setting("policy", {**DEFAULT_POLICY, "enabled": True,
-                                         "on_battery_seconds": 86400, "countdown_seconds": 10})
+                                         "countdown_seconds": 10})
             saved.close()
             clock = Mock(return_value=100)
             adapter = SimulationAdapter(clock=clock)

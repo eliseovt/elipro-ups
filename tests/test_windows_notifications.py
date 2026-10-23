@@ -747,6 +747,49 @@ class NativeShellTests(unittest.TestCase):
         self.assertIsNotNone(notifier.status()["last_popup_hidden_at"])
         self.assertIsNone(self.backend.last_notice)
 
+    def test_durable_notice_close_does_not_ack_and_understood_waits_for_disk(self):
+        notifier = self.configure_popup()
+        entered, release = threading.Event(), threading.Event()
+        def acknowledge(ids):
+            self.assertEqual(ids, [123])
+            entered.set()
+            release.wait(1)
+        notifier.acknowledge_callback = acknowledge
+        notifier.sync_persistent({"notice:123": {"title": "Corte", "message": "Red recuperada; aviso pendiente"}})
+        self.backend.sync_persistent()
+        hwnd = self.backend.popup_hwnd
+        self.backend._window_proc(hwnd, wn.WM_CLOSE, 0, 0)
+        self.assertFalse(entered.is_set())
+        self.assertEqual(self.backend.popup_persistent_key, "notice:123")
+        self.backend._window_proc(hwnd, wn.WM_COMMAND, 102, 0)
+        self.assertTrue(entered.wait(1))
+        self.assertFalse(notifier._persistent_acknowledged("notice:123"))
+        self.assertEqual(self.backend.popup_persistent_key, "notice:123")
+        release.set()
+        deadline = time.monotonic() + 1
+        while time.monotonic() < deadline and not notifier._persistent_acknowledged("notice:123"):
+            time.sleep(.005)
+        self.assertTrue(notifier._persistent_acknowledged("notice:123"))
+        self.backend.sync_persistent()
+        self.assertIsNone(self.backend.popup_persistent_key)
+
+    def test_failed_durable_ack_keeps_popup_and_next_notice_waits_its_turn(self):
+        notifier = self.configure_popup()
+        notifier.acknowledge_callback = Mock(side_effect=OSError("No se pudo guardar"))
+        notifier.sync_persistent({"notice:1": {"title": "Corte", "message": "Corte registrado"},
+                                  "notice:2": {"title": "Red", "message": "Red recuperada"}})
+        self.backend.sync_persistent()
+        self.assertEqual(self.backend.popup_persistent_key, "notice:1")
+        self.assertFalse(self.backend._show_popup("Red", "Red recuperada", persistent=True, key="notice:2"))
+        self.backend._window_proc(self.backend.popup_hwnd, wn.WM_COMMAND, 102, 0)
+        deadline = time.monotonic() + 1
+        while time.monotonic() < deadline and "No se guardó" not in (notifier.status()["last_error"] or ""):
+            time.sleep(.005)
+        self.assertIn("No se guardó", notifier.status()["last_error"])
+        self.assertFalse(notifier._persistent_acknowledged("notice:1"))
+        self.backend.sync_persistent()
+        self.assertEqual(self.backend.popup_persistent_key, "notice:1")
+
     def test_persistent_warning_respects_windows_quiet_state(self):
         notifier = self.configure_popup()
         notifier.sync_persistent({"overload": {"title": "Carga", "message": "Sobrecarga"}})

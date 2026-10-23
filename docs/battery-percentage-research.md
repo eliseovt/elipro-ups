@@ -240,10 +240,13 @@ seconds; at the native two-second polling rate this normally produces a
 four-second filter update. Exact display timestamps can differ from Forza's
 three-second sleep plus its communication delays.
 
-The fields `battery_percent_estimate` and `battery_estimate_method` are optional
-display/history metadata. They never replace `battery_percent`, low-battery
-telemetry, shutdown conditions or alert conditions. The profile calculates no
-remaining runtime and performs no additional USB transaction. Legacy samples
+The fields `battery_percent_estimate` and `battery_estimate_method` retain their
+own provenance and never replace `battery_percent` or the real low-battery flag.
+Since 0.9.17, an explicitly labelled, user-authorized low-percentage protection
+may use this known estimate to shorten an enabled Windows countdown to at most
+10 seconds. Reported percentages take precedence. Unknown estimate methods do
+not trigger the priority. The profile calculates no remaining runtime and
+performs no additional USB transaction. Legacy samples
 are never retroactively estimated. CSV exports append both fields after all
 existing columns, including `watts_is_estimate`.
 

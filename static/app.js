@@ -81,6 +81,7 @@
     criticalKnown: new Map(),
     criticalAcknowledged: new Set(),
     criticalItems: new Map(),
+    pendingNotifications: new Map(),
     criticalOpen: false,
     criticalFocusTarget: null,
     criticalBatterySources: new Set(),
@@ -105,6 +106,9 @@
   const finite = (value) => typeof value === "number" && Number.isFinite(value);
   const percentage = (value) => finite(value) && value >= 0 && value <= 100;
   const estimatedBattery = (sample) => percentage(sample?.battery_percent_estimate) && typeof sample?.battery_estimate_method === "string" && sample.battery_estimate_method.trim().length > 0;
+  const batteryCharge = (sample) => percentage(sample?.battery_percent) ? { value: sample.battery_percent, source: "reported" }
+    : estimatedBattery(sample) && sample.battery_estimate_method === "nt2402pro-pmv-qs-v1" ? { value: sample.battery_percent_estimate, source: "estimated" } : null;
+  const lowBatteryThreshold = () => percentage(state.status?.policy?.low_battery_percent) ? state.status.policy.low_battery_percent : 20;
   const numeric = (value, decimals = 0) => finite(value) ? new Intl.NumberFormat("es-PE", { maximumFractionDigits: decimals }).format(value) : "—";
   const parseDate = (value) => {
     if (!value) return null;
@@ -118,16 +122,21 @@
     { kind: "overload", title: "Sobrecarga del UPS", active: (sample) => finite(sample.load_percent) ? sample.load_percent >= 100 : null,
       message: (sample) => `Carga reportada: ${numeric(sample.load_percent)} %. La capacidad del UPS está al límite o se ha superado.` },
     { kind: "battery_low", title: "Batería baja", active: (sample) => {
-      const reported = percentage(sample.battery_percent);
+      const charge = batteryCharge(sample);
+      const threshold = lowBatteryThreshold();
+      const percentageLow = threshold > 0 && charge && charge.value <= threshold
+        && (charge.source === "reported" || sample.on_battery === true);
       if (sample.low_battery === true) state.criticalBatterySources.add("signal");
-      if (reported && sample.battery_percent <= 20) state.criticalBatterySources.add("reported");
-      if (sample.low_battery === true || (reported && sample.battery_percent <= 20)) return true;
+      if (percentageLow) state.criticalBatterySources.add("percent");
+      if (sample.low_battery === true || percentageLow) return true;
       if (state.criticalBatterySources.size) {
-        return [...state.criticalBatterySources].every((source) => source === "signal" ? sample.low_battery === false : reported && sample.battery_percent > 20) ? false : null;
+        return [...state.criticalBatterySources].every((source) => source === "signal" ? sample.low_battery === false
+          : threshold === 0 || charge && (charge.value > threshold || charge.source === "estimated" && sample.on_battery === false)) ? false : null;
       }
-      return sample.low_battery === false || (reported && sample.battery_percent > 20) ? false : null;
+      return sample.low_battery === false || charge && charge.value > threshold ? false : null;
     },
-      message: (sample) => sample.low_battery === true ? "El UPS ha enviado la señal de batería baja." : `Carga reportada de batería: ${numeric(sample.battery_percent)} %.` },
+      message: (sample) => sample.low_battery === true ? "El UPS ha enviado la señal de batería baja."
+        : `Carga ${batteryCharge(sample)?.source === "estimated" ? "estimada" : "reportada"} de batería: ${numeric(batteryCharge(sample)?.value)} %. Umbral configurado: ${numeric(lowBatteryThreshold())} %.` },
   ];
   const criticalKinds = new Set(criticalDefinitions.map((definition) => definition.kind));
 
@@ -151,28 +160,105 @@
     return { sample, quality: "live", mode: sample.fault === true ? "fault" : sample.on_battery === true ? "battery" : sample.on_battery === false ? "line" : "unknown" };
   }
 
-  function acknowledgeCritical(closeDialog = true) {
+  function captureCriticalAcknowledgment() {
+    const protection = state.status?.protection;
+    return {
+      kinds: [...state.criticalItems.keys()],
+      resultKey: protectionResultKey(protection),
+      countdown: protection?.state === "countdown" ? {
+        deadline: parseDate(protection.deadline)?.getTime() ?? null,
+        remaining: finite(protection.countdown_remaining) ? protection.countdown_remaining : null,
+        simulation: !!protection.simulation,
+        action: state.status?.policy?.action,
+        phase: protection.phase || "windows_countdown",
+      } : null,
+    };
+  }
+
+  function finishCriticalAcknowledgment(acknowledgment) {
     if (!state.criticalOpen) return;
     const protection = state.status?.protection;
-    state.criticalResultAcknowledged = protectionResultKey(protection);
-    if (protection?.state === "countdown") state.criticalCountdownAcknowledged = {
-      deadline: parseDate(protection.deadline)?.getTime() ?? null,
-      remaining: finite(protection.countdown_remaining) ? protection.countdown_remaining : null,
-      simulation: !!protection.simulation,
-      action: state.status?.policy?.action,
-      phase: protection.phase || "windows_countdown",
-    };
-    for (const kind of state.criticalItems.keys()) {
+    if (acknowledgment.resultKey === protectionResultKey(protection)) state.criticalResultAcknowledged = acknowledgment.resultKey;
+    const currentCountdown = captureCriticalAcknowledgment().countdown;
+    const seenCountdown = acknowledgment.countdown;
+    const sameCountdown = currentCountdown && seenCountdown && currentCountdown.simulation === seenCountdown.simulation
+      && currentCountdown.action === seenCountdown.action && currentCountdown.phase === seenCountdown.phase
+      && (currentCountdown.deadline !== null && seenCountdown.deadline !== null
+        ? Math.abs(currentCountdown.deadline - seenCountdown.deadline) <= 2000
+        : currentCountdown.deadline === seenCountdown.deadline && currentCountdown.remaining <= seenCountdown.remaining + 2);
+    if (sameCountdown) state.criticalCountdownAcknowledged = seenCountdown;
+    for (const kind of acknowledgment.kinds) {
       if (state.criticalKnown.get(kind) === true) state.criticalAcknowledged.add(kind);
+      state.criticalItems.delete(kind);
     }
-    state.criticalItems.clear();
+    // A new persisted notice or physical condition arriving with the response still needs its own acknowledgment.
+    const currentResult = protectionResultKey(protection);
+    if (state.pendingNotifications.size || state.criticalItems.size || currentCountdown && !sameCountdown
+        || currentResult !== null && state.criticalResultAcknowledged !== currentResult) { refreshTelemetry(); return; }
     state.criticalOpen = false;
     const dialog = $("critical-dialog");
-    if (closeDialog && dialog.open) dialog.close();
+    if (dialog.open) dialog.close();
     const previous = state.criticalFocusTarget;
     state.criticalFocusTarget = null;
     const focusable = previous && previous !== document.body && previous.isConnected !== false && !previous.disabled && !previous.closest?.("[hidden], [inert]");
     (focusable ? previous : $("page-title"))?.focus?.({ preventScroll: true });
+  }
+
+  async function acknowledgeCritical() {
+    if (!state.criticalOpen || state.mutation) return;
+    const acknowledgment = captureCriticalAcknowledgment();
+    const ids = [...state.pendingNotifications.keys()];
+    if (!ids.length) { finishCriticalAcknowledgment(acknowledgment); return; }
+    if (!state.serviceAvailable || !state.token) {
+      setText("critical-feedback", "Recupera la conexión con el monitor para confirmar Entendido. Los avisos siguen pendientes.");
+      $("critical-feedback").hidden = false;
+      return;
+    }
+    state.mutation = "ack-notifications";
+    state.statusGeneration += 1;
+    $("critical-feedback").hidden = true;
+    updateMutationControls();
+    try {
+      // The API bounds each commit to 200 IDs. Snapshot the displayed IDs once
+      // so notices arriving during a large acknowledgment remain unread.
+      for (let offset = 0; offset < ids.length; offset += 200) {
+        const batch = ids.slice(offset, offset + 200);
+        const result = await post("/api/notifications/ack", { ids: batch });
+        if (!Array.isArray(result.notifications?.pending) || result.notifications.pending.some((item) => batch.includes(item.id))) {
+          throw new Error("El monitor no confirmó Entendido para los avisos seleccionados.");
+        }
+        applyStatus(result);
+      }
+      finishCriticalAcknowledgment(acknowledgment);
+    } catch (error) {
+      if (error.communicationFailure) serviceUnavailable(error);
+      setText("critical-feedback", `No se confirmó Entendido. ${error.message} Los avisos siguen pendientes.`);
+      $("critical-feedback").hidden = false;
+    } finally {
+      state.mutation = null;
+      updateMutationControls();
+    }
+  }
+
+  function syncPendingNotifications() {
+    const pending = state.status?.notifications?.pending;
+    if (state.serviceAvailable && Array.isArray(pending)) {
+      const next = new Map();
+      for (const notice of pending) {
+        if (!Number.isSafeInteger(notice?.id) || notice.id <= 0) continue;
+        const item = state.pendingNotifications.get(notice.id) || { notificationId: notice.id };
+        item.definition = { kind: String(notice.kind || "notification"), title: String(notice.title || eventLabel(notice.kind)) };
+        item.status = notice.resolved_at || /^(power|connection)_restored$/.test(notice.kind) ? "resolved" : "active";
+        const timestamp = parseDate(notice.timestamp);
+        const resolved = parseDate(notice.resolved_at);
+        item.message = `${String(notice.message || eventLabel(notice.kind))}${timestamp ? ` Registrado: ${recordDateFormat.format(timestamp)}.` : ""}${resolved ? ` Recuperado: ${recordDateFormat.format(resolved)}.` : ""}`;
+        next.set(notice.id, item);
+      }
+      state.pendingNotifications = next;
+    }
+    if (!state.serviceAvailable) {
+      for (const item of state.pendingNotifications.values()) if (item.status !== "resolved") item.status = "unconfirmed";
+    }
   }
 
   function renderCriticalCountdown() {
@@ -207,7 +293,17 @@
   }
 
   function renderCriticalAlerts(sample, live) {
-    if (live && sample) {
+    const previousPendingNotifications = [...state.pendingNotifications.values()];
+    const hadPendingNotifications = previousPendingNotifications.length > 0;
+    syncPendingNotifications();
+    const acknowledgedCountdownElsewhere = previousPendingNotifications.some((item) => item.definition.kind === "policy_countdown"
+      && item.status !== "resolved" && !state.pendingNotifications.has(item.notificationId));
+    // The monitor owns incident episodes and durable acknowledgments. Older
+    // versions without an inbox retain the existing telemetry-only fallback.
+    const hasInbox = Array.isArray(state.status?.notifications?.pending);
+    if (hasInbox) {
+      state.criticalItems.clear();
+    } else if (live && sample) {
       for (const definition of criticalDefinitions) {
         const active = definition.active(sample);
         if (active === null) {
@@ -247,15 +343,26 @@
     const newDeadline = deadline !== null && finite(acknowledged?.deadline) && Math.abs(deadline - acknowledged.deadline) > 2000;
     const increasedRemaining = deadline === null && finite(protection.countdown_remaining) && finite(acknowledged?.remaining) && protection.countdown_remaining > acknowledged.remaining + 2;
     if (countdown && state.serviceAvailable && acknowledged && (newDeadline || increasedRemaining || acknowledged.simulation !== !!protection.simulation || acknowledged.action !== state.status?.policy?.action)) state.criticalCountdownAcknowledged = null;
-    if (!state.criticalItems.size && (!countdown || state.criticalCountdownAcknowledged) && !resultAttention && !state.criticalOpen) {
+    if (hadPendingNotifications && !state.pendingNotifications.size && state.mutation !== "ack-notifications"
+        && !state.criticalItems.size && (!countdown || acknowledgedCountdownElsewhere) && !resultAttention) {
+      // Entendido in the native window is the same explicit action as in this panel.
+      finishCriticalAcknowledgment(captureCriticalAcknowledgment());
+    }
+    if (!state.criticalItems.size && !state.pendingNotifications.size && (!countdown || state.criticalCountdownAcknowledged) && !resultAttention && !state.criticalOpen) {
       renderCriticalCountdown();
       return;
     }
-    const items = criticalDefinitions.map((definition) => state.criticalItems.get(definition.kind)).filter(Boolean);
+    const pending = [...state.pendingNotifications.values()];
+    const pendingKinds = new Set(pending.map((item) => item.definition.kind));
+    const items = [...criticalDefinitions.filter((definition) => !pendingKinds.has(definition.kind)).map((definition) => state.criticalItems.get(definition.kind)).filter(Boolean), ...pending];
     const active = items.filter((item) => item.status === "active");
     const unconfirmed = items.some((item) => item.status === "unconfirmed");
     let title = active.length ? active[0].definition.title : unconfirmed ? "Estado sin confirmar" : "Alerta resuelta";
     let description = active.length ? "El UPS requiere tu atención. Revisa las condiciones detectadas." : unconfirmed ? "No hay información suficiente para confirmar las condiciones detectadas. Revisa el estado y la conexión con el monitor." : "El UPS ya no reporta estas condiciones. El incidente permanece en el registro.";
+    if (pending.length) {
+      title = active.length ? active[0].definition.title : unconfirmed ? "Estado sin confirmar" : "Avisos pendientes de Entendido";
+      description = "Los avisos permanecen aquí hasta que marques Entendido, aunque vuelva la electricidad. Confirmar su lectura no cancela la protección ni borra el historial.";
+    }
     if (!items.length) {
       const simulation = protection.simulation === true;
       if (countdown) {
@@ -269,7 +376,7 @@
     setText("critical-title", title);
     setText("critical-description", description);
     const list = $("critical-list");
-    const signature = items.map((item) => `${item.definition.kind}:${item.status}:${item.message}`).join("|");
+    const signature = items.map((item) => `${item.notificationId ?? item.definition.kind}:${item.status}:${item.message}`).join("|");
     if (list.dataset.signature !== signature) {
       list.dataset.signature = signature;
       list.replaceChildren(...items.map((item) => {
@@ -283,10 +390,11 @@
         }
         const row = item.element;
         row.dataset.kind = item.definition.kind;
+        if (item.notificationId) row.dataset.notificationId = String(item.notificationId);
         row.dataset.state = item.status;
         item.titleElement.textContent = item.definition.title;
         item.messageElement.textContent = item.message;
-        item.stateElement.textContent = { active: "Activa", resolved: "Resuelta", unconfirmed: "Sin confirmar" }[item.status];
+        item.stateElement.textContent = `${{ active: "Activa", resolved: "Resuelta", unconfirmed: "Sin confirmar" }[item.status]}${item.notificationId ? " · Pendiente de Entendido" : ""}`;
         return row;
       }));
     }
@@ -345,6 +453,8 @@
       button.setAttribute("aria-current", active ? "page" : "false");
     });
     document.body.dataset.view = selected;
+    $("protection-master").hidden = selected !== "protection";
+    $("protection-master").inert = selected !== "protection";
     setText("view-title", view.title);
     setText("view-description", view.description);
     $("view-description").hidden = !view.description;
@@ -461,15 +571,19 @@
     $("save-policy").disabled = unavailable || busy || physicalTest;
     $("critical-cancel").disabled = unavailable || busy || state.status?.protection?.state !== "countdown"
       || state.status?.protection?.cancelable === false || simulationPhase() === "ups_delay";
+    $("critical-ack").disabled = busy;
+    setText("critical-ack", state.mutation === "ack-notifications" ? "Confirmando…" : "Entendido");
     $("test-shutdown").disabled = unavailable || busy || enabled || state.policyDirty || !!transition || physicalTest;
     $("policy-form").querySelectorAll("input, select").forEach((field) => { field.disabled = busy || physicalTest; });
+    $("policy-enabled").disabled = busy || physicalTest;
     const canConfigureUps = typeof state.status?.ups_poweroff?.can_configure === "boolean" ? state.status.ups_poweroff.can_configure : state.status?.ups_poweroff?.available === true;
     $("policy-ups-poweroff").disabled = unavailable || busy || physicalTest || (!canConfigureUps && !$("policy-ups-poweroff").checked);
     $("ups-power-review-ack").disabled = !upsPowerCanReview();
     $("ups-power-review-submit").disabled = !upsPowerCanReview() || !$("ups-power-review-ack").checked;
     const notificationSettingsMissing = !state.status?.notifications?.settings;
     $("notifications-form").querySelectorAll("input").forEach((field) => { field.disabled = unavailable || busy || notificationSettingsMissing; });
-    $("notifications-persistent").disabled = unavailable || busy || typeof state.status?.notifications?.settings?.persistent_critical !== "boolean";
+    $("notifications-persistent").disabled = unavailable || busy || Array.isArray(state.status?.notifications?.pending)
+      || typeof state.status?.notifications?.settings?.persistent_critical !== "boolean";
     $("save-notifications").disabled = unavailable || busy || notificationSettingsMissing;
     const delivery = state.status?.notifications?.delivery;
     $("test-notifications").disabled = unavailable || busy || notificationSettingsMissing || delivery?.available === false || delivery?.ready === false;
@@ -661,14 +775,24 @@
     $("battery-track").dataset.available = String(finite(battery));
     $("battery-note").hidden = false;
     setText("battery-note", reported ? "Carga reportada" : estimated ? "Carga estimada" : "No disponible");
-    $("battery-note").title = estimated ? `Estimación informativa · ${data.battery_estimate_method}. La protección usa la alerta real del UPS y los límites configurados.` : "";
+    const protectionCharge = batteryCharge(data);
+    const informationalEstimate = estimated && !protectionCharge;
+    $("battery-note").title = estimated ? informationalEstimate
+      ? `Estimación informativa · ${data.battery_estimate_method}. Este método no se usa en la protección por porcentaje.`
+      : `Carga estimada · ${data.battery_estimate_method}. Se usa para la protección por porcentaje; el UPS también puede enviar su alarma de batería baja.` : "";
     setText("load-percent", numeric(data.load_percent));
     setText("frequency", numeric(data.frequency_hz, 1));
     setText("battery-voltage", numeric(data.battery_voltage, 2));
     setText("runtime", runtimeLabel(data.runtime_seconds));
     $("battery-runtime").hidden = !finite(data.runtime_seconds) || data.runtime_seconds <= 0;
     $("battery-bar").style.height = finite(battery) ? `${battery}%` : "0%";
-    $("battery-bar").classList.toggle("low", data.low_battery === true || (reported && battery <= 20));
+    $("battery-bar").classList.toggle("low", data.low_battery === true || lowBatteryThreshold() > 0 && protectionCharge && protectionCharge.value <= lowBatteryThreshold());
+    setText("policy-battery-source", finite(battery)
+      ? `Actual: ${numeric(battery)} % ${estimated ? "estimado" : "reportado por el UPS"}${informationalEstimate ? ". Estimación informativa: este método no se usa en la protección por porcentaje." : ""}`
+      : "Porcentaje de batería no disponible. La alarma de batería baja del UPS sigue atendida.");
+    $("policy-battery-source").title = estimated ? "El UPS no mide directamente este porcentaje. También se atiende su alarma de batería baja."
+      : "También se atiende la alarma de batería baja del UPS.";
+    renderBatteryProtectionNote();
     $("load-bar").style.height = finite(data.load_percent) ? `${Math.max(0, Math.min(100, data.load_percent))}%` : "0%";
     $("load-bar").classList.toggle("high", finite(data.load_percent) && data.load_percent >= 80);
     const meter = $("load-meter");
@@ -754,7 +878,8 @@
     } else if (notify) {
       const fresh = sorted.filter((event) => !state.seenEvents.has(eventKey(event)));
       state.seenEvents = new Set(sorted.map(eventKey));
-      const relevant = fresh.filter((event) => !criticalKinds.has(event.kind) && /power|connection|policy_countdown|policy_unknown|policy_action_failed/.test(String(event.kind || "")));
+      const persistentKinds = new Set([...state.pendingNotifications.values()].map((item) => item.definition.kind));
+      const relevant = fresh.filter((event) => !criticalKinds.has(event.kind) && !persistentKinds.has(event.kind) && /power|connection|policy_countdown|policy_unknown|policy_action_failed/.test(String(event.kind || "")));
       if (relevant.length) {
         const newest = relevant[0];
         const severity = String(newest.severity || "");
@@ -815,16 +940,16 @@
 
   function renderPolicy(policy) {
     const native = state.status?.meta?.source === "native";
-    $("policy-battery-field").hidden = native;
+    $("policy-battery-field").hidden = false;
     $("policy-runtime-field").hidden = native;
     $("policy-fields").classList.toggle("native-policy", native);
     const enabled = !!policy.enabled;
     const blocked = state.status?.meta?.dry_run === true || state.status?.meta?.simulation_source === true;
+    renderBatteryProtectionNote();
     renderUpsPoweroff();
     updateMutationControls();
     if (state.policyInitialized && state.policyDirty) return;
     $("policy-enabled").checked = enabled;
-    $("policy-on-battery").value = finite(policy.on_battery_seconds) ? policy.on_battery_seconds / 60 : 0;
     $("policy-low-battery").value = finite(policy.low_battery_percent) ? policy.low_battery_percent : 20;
     $("policy-runtime").value = finite(policy.min_runtime_seconds) ? policy.min_runtime_seconds : 180;
     $("policy-countdown").value = finite(policy.countdown_seconds) ? policy.countdown_seconds : 15;
@@ -840,7 +965,7 @@
     const capability = state.status?.ups_poweroff;
     const automaticRestartObserved = capability?.restart_behavior === "automatic_on_mains" && capability?.restart_behavior_observed === true;
     const observedSequence = capability?.reserve_mode === "observed_sequence";
-    const reason = friendlyUpsReason(capability?.reason);
+    const reason = upsReason(capability?.reason);
     const fallback = !capability ? "Este monitor no informa si puede apagar el UPS."
       : observedSequence && capability.can_configure === true ? "Disponible para configurar; se comprobarán las condiciones antes de actuar."
       : capability.available === true ? "Disponible para esta configuración."
@@ -848,17 +973,22 @@
       : capability.validation === "pending" ? "Pendiente de validación física. Esta opción todavía no puede activarse."
       : "El apagado del UPS no está disponible en esta configuración.";
     setText("ups-power-capability", !state.serviceAvailable ? "Sin comunicación con el monitor. La capacidad del UPS no está confirmada." : reason || fallback);
-    const operationState = capability?.operation?.state || capability?.state || "idle";
-    $("ups-power-capability").hidden = state.serviceAvailable && capability?.available === true && ["idle", "finished", "completed", "cancelled"].includes(operationState);
+    $("ups-power-capability").hidden = state.serviceAvailable && capability?.available === true
+      && capability?.sequence_admission?.available !== false;
     $("ups-power-capability").classList.toggle("ups-power-unavailable", (capability?.can_configure ?? capability?.available) !== true || !state.serviceAvailable);
     setText("ups-power-restart", automaticRestartObserved ? "El UPS enciende sus salidas automáticamente cuando vuelve la luz."
       : capability?.manual_restart_verified === true && capability?.manual_restart === true ? "En esta unidad se verificó el encendido manual de las salidas."
       : "El comportamiento de las salidas al regresar la electricidad todavía no está confirmado para esta unidad.");
+    setText("ups-power-restart-summary", automaticRestartObserved ? "Retorno automático al volver la luz."
+      : capability?.manual_restart_verified === true && capability?.manual_restart === true ? "Retorno manual de las salidas."
+      : "Retorno de las salidas pendiente de confirmar.");
     const policy = protectionDraft();
-    setText("ups-power-delay", `De 1 a 9 min, contados desde ${policy.action === "shutdown" ? "la solicitud de apagado" : "el inicio de la hibernación"}.`);
-    const admissionReason = !state.policyDirty && capability?.sequence_admission?.available === false ? friendlyUpsReason(capability.sequence_admission.reason) : "";
+    setText("ups-power-enabled-label", policy.ups_poweroff === true ? "Activado" : "Desactivado");
+    setText("ups-power-delay", `De 1 a 9 min, desde la solicitud de ${policy.action === "shutdown" ? "apagado" : "hibernación"}.`);
+    const admissionReason = capability?.sequence_admission?.available === false ? upsReason(capability.sequence_admission.reason) : "";
     $("ups-power-sequence-warning").hidden = !admissionReason || admissionReason === reason;
     setText("ups-power-sequence-warning", admissionReason && admissionReason !== reason ? admissionReason : "");
+    renderUpsPowerConditions(capability);
     renderProtectionPreview();
     const states = {
       blocked: observedSequence && capability.can_configure === true ? "La opción del UPS puede guardarse. Antes de programarlo se comprobarán las condiciones recientes." : "El apagado del UPS está bloqueado; se conserva la protección de Windows.",
@@ -893,11 +1023,65 @@
       && finite(telemetry.sample.output_voltage) && telemetry.sample.output_voltage > 0;
   }
 
-  function friendlyUpsReason(value) {
-    if (typeof value !== "string" || !value.trim()) return "";
-    return /lectura, carga o tensión.*fuera.*secuencia observada|carga o tensión.*fuera.*secuencia observada/i.test(value)
-      ? "El UPS no está listo para un corte automático: revisa la carga y la batería."
-      : value;
+  function upsReason(value) {
+    return typeof value === "string" ? value.trim() : "";
+  }
+
+  function renderUpsPowerConditions(capability) {
+    const admission = capability?.sequence_admission;
+    const available = state.serviceAvailable && capability?.available === true && admission?.available !== false;
+    const confirmed = state.serviceAvailable && typeof capability?.available === "boolean";
+    const status = $("ups-power-availability");
+    status.dataset.state = !confirmed ? "unknown" : available ? "available" : "blocked";
+    status.textContent = !confirmed ? "Sin confirmar" : available ? "Disponible ahora" : "Bloqueado ahora";
+    setText("ups-power-conditions-note", "Solo estas cuatro condiciones pueden bloquear la orden. El voltaje y la carga no bloquean el apagado; el porcentaje bajo de batería adelanta la protección.");
+    const categories = [
+      { key: "connection", label: "UPS conectado y compatible", checks: ["native_source", "source", "identity", "usb_identity", "profile", "connection", "communication", "monitor_running", "operational_profile", "sample_fresh", "qs_status", "power_state"], action: "Comprueba la conexión USB y el estado del monitor." },
+      { key: "windows", label: protectionDraft().action === "shutdown" ? "Windows preparado para apagar" : "Windows preparado para hibernar", checks: ["real_actions", "windows", "windows_action", "windows_ready"], action: "Revisa la acción de Windows y los permisos del servicio." },
+      { key: "operation", label: "Sin otra operación de energía pendiente", checks: ["manual_tests", "operation", "previous_operation", "battery_test", "shutdown_pending"], action: "Espera a que termine la operación o revisa su estado antes de iniciar otra." },
+      { key: "controlled_shutdown", label: "Apagado controlado disponible", checks: ["low_battery", "fault"], action: "Revisa la alarma indicada por el UPS. Se mantiene la protección de Windows." },
+    ];
+    const checks = Array.isArray(capability?.checks) ? capability.checks : Array.isArray(admission?.checks) ? admission.checks : [];
+    const blockers = Array.isArray(capability?.blockers) ? capability.blockers : [];
+    const list = $("ups-power-checks");
+    const rows = categories.map((category) => {
+      const blocker = blockers.find((item) => item?.key === category.key);
+      const legacyFailures = checks.filter((check) => check && category.checks.includes(check.key || check.code)
+        && check.passed === false && check.blocking !== false && check.severity !== "info");
+      const blocked = blocker ? blocker.blocked === true : legacyFailures.length > 0;
+      const confirmedCheck = state.serviceAvailable && (typeof blocker?.blocked === "boolean" || available || blocked);
+      const row = document.createElement("li");
+      row.dataset.state = !confirmedCheck ? "unknown" : blocked ? "blocked" : "passed";
+      row.dataset.check = category.key;
+      const label = document.createElement("span");
+      label.textContent = category.label;
+      const result = document.createElement("strong");
+      result.textContent = !confirmedCheck ? "Sin confirmar" : blocked ? "Bloqueado" : "Listo";
+      row.append(label, result);
+      const reasons = blocker ? (Array.isArray(blocker.reasons) ? blocker.reasons : []) : legacyFailures.map((check) => check.reason);
+      const details = [...new Set(reasons.map(upsReason).filter(Boolean))];
+      const summary = upsReason(blocker?.reason);
+      if (summary && !details.includes(summary) && summary !== details.join(" ")) details.push(summary);
+      const reason = details.join(" ");
+      if (confirmedCheck && blocked && reason) {
+        const detail = document.createElement("small");
+        detail.textContent = reason;
+        row.append(detail);
+        const action = document.createElement("small");
+        action.className = "ups-power-resolution";
+        action.textContent = category.action;
+        row.append(action);
+      }
+      return row;
+    });
+    list.replaceChildren(...rows);
+    list.hidden = false;
+    const block = capability?.last_block;
+    const blockReason = upsReason(block?.reason || block?.message);
+    const stamp = parseDate(block?.timestamp);
+    $("ups-power-block-history").hidden = false;
+    $("ups-power-last-block").hidden = !blockReason;
+    setText("ups-power-last-block", blockReason ? `Último bloqueo registrado${stamp ? ` (${recordDateFormat.format(stamp)})` : ""}: ${blockReason}` : "");
   }
 
   function upsCancelTestActive() {
@@ -948,8 +1132,8 @@
   function protectionDraft() {
     const policy = state.status?.policy || {};
     if (!state.policyDirty) return policy;
-    return { ...policy, action: $("policy-action").value, countdown_seconds: Number($("policy-countdown").value),
-      on_battery_seconds: Math.round(Number($("policy-on-battery").value) * 60), ups_poweroff: $("policy-ups-poweroff").checked,
+    return { ...policy, action: $("policy-action").value, countdown_seconds: Number($("policy-countdown").value), low_battery_percent: Number($("policy-low-battery").value),
+      ups_poweroff: $("policy-ups-poweroff").checked,
       ups_poweroff_delay_seconds: Number($("policy-ups-delay").value) * 60 };
   }
 
@@ -967,16 +1151,38 @@
 
   function renderProtectionPreview() {
     const policy = protectionDraft();
-    const wait = finite(policy.on_battery_seconds) ? Math.max(0, policy.on_battery_seconds) : 0;
     const countdown = finite(policy.countdown_seconds) ? policy.countdown_seconds : 15;
     const delay = configuredUpsDelay(policy);
     const hibernate = policy.action !== "shutdown";
-    setText("protection-preview-countdown", "Se detecta el corte");
-    setText("protection-preview-wait", `${wait === 0 ? "" : `Tras ${runtimeLabel(wait)} con batería: `}${numeric(countdown)} s para cancelar toda la protección.`);
-    setText("protection-preview-action", hibernate ? "La PC empieza a hibernar" : "Windows empieza a apagarse");
-    setText("protection-preview-action-detail", hibernate ? "Conserva tu sesión sin cerrar aplicaciones." : "Windows solicita el cierre de las aplicaciones.");
-    setText("protection-preview-ups", policy.ups_poweroff === true ? `Unos ${runtimeLabel(delay)} después` : "El UPS permanece encendido");
-    setText("protection-preview-ups-detail", policy.ups_poweroff === true ? "El UPS corta la energía de sus salidas." : "No se programa un corte adicional.");
+    renderBatteryProtectionNote();
+    setText("protection-preview-countdown", "Corte detectado");
+    setText("protection-preview-wait", "Aviso inmediato.");
+    setText("protection-preview-action", `A los ${numeric(countdown)} s`);
+    setText("protection-preview-action-detail", hibernate ? "Se solicita hibernar Windows" : "Se solicita apagar Windows");
+    setText("policy-countdown-label", hibernate ? "Tiempo antes de hibernar" : "Tiempo antes de apagar");
+    setText("policy-countdown-note", `Puedes cancelar durante estos ${numeric(countdown)} segundos.`);
+    setText("protection-preview-ups", policy.ups_poweroff === true ? `+${runtimeLabel(delay)}` : "El UPS permanece encendido");
+    const capability = state.status?.ups_poweroff;
+    const currentlyBlocked = state.serviceAvailable && (capability?.available === false || capability?.sequence_admission?.available === false);
+    setText("protection-preview-ups-detail", policy.ups_poweroff !== true ? "No se programa un corte adicional."
+      : currentlyBlocked ? "Ahora está bloqueado. Revisa las condiciones del UPS."
+      : "Corte programado del UPS.");
+  }
+
+  function renderBatteryProtectionNote() {
+    const policy = protectionDraft();
+    const informational = estimatedBattery(state.status?.sample) && !batteryCharge(state.status?.sample);
+    setText("battery-protection-subtitle", policy.action === "shutdown" ? "Adelantar el apagado de Windows" : "Adelantar la hibernación");
+    setText("policy-battery-help", policy.low_battery_percent === 0
+      ? "La prioridad por porcentaje está desactivada. La alarma crítica del UPS mantiene la protección inmediata de Windows."
+      : informational ? "La prioridad por porcentaje requiere una medición reportada o una estimación validada. La estimación actual es solo informativa. 0 desactiva la prioridad por porcentaje."
+        : "Si estás usando batería y se alcanza el umbral, la espera restante se reduce a 10 s como máximo. El retardo del UPS no cambia.");
+    const emergency = state.status?.protection?.emergency;
+    $("policy-battery-emergency").hidden = emergency?.active !== true;
+    setText("policy-battery-emergency", emergency?.active !== true ? ""
+      : emergency.source === "ups_critical_alarm"
+        ? "El UPS reporta batería crítica: Windows tiene prioridad inmediata. No se programa el corte del UPS porque esa orden podría cortar la energía antes de completar la hibernación."
+        : `Protección prioritaria por carga ${emergency.source === "reported_percentage" ? "reportada" : "estimada"}: ${numeric(emergency.percent)} %, umbral de ${numeric(emergency.threshold_percent)} %. La cuenta de Windows se limita a ${numeric(emergency.seconds_limit || 10)} s; se conserva el retardo configurado del UPS.`);
   }
 
   function renderProtection(protection) {
@@ -1006,6 +1212,9 @@
     const delivery = notifications?.delivery || {};
     const tag = $("notifications-state");
     const error = delivery.last_error || notifications?.last_error;
+    const hasInbox = Array.isArray(notifications?.pending);
+    $("notifications-persistent-option").hidden = hasInbox;
+    $("notifications-inbox-note").hidden = !hasInbox;
     const ready = state.serviceAvailable && settings && delivery.available !== false && delivery.ready === true;
     setText("notifications-state-label", !state.serviceAvailable ? state.stopAcknowledged ? "Detenidos" : "Sin conexión" : !settings || delivery.available === false ? "No disponible" : ready ? "Listos" : "Iniciando");
     tag.classList.toggle("good", !!ready);
@@ -1034,7 +1243,6 @@
     $("notifications-sound").checked = settings.sound_enabled === true;
     $("notifications-repeat").value = finite(settings.repeat_seconds) ? settings.repeat_seconds : 30;
     const supportsPersistent = typeof settings.persistent_critical === "boolean";
-    $("notifications-persistent-option").hidden = false;
     setText("notifications-persistent-note", supportsPersistent ? "Hasta cerrarlos o resolverse la alerta." : "No disponible en esta versión del monitor.");
     $("notifications-persistent").checked = settings.persistent_critical === true;
     state.notificationsInitialized = true;
@@ -1673,16 +1881,18 @@
     state.eventFilter = $("events-filter").value;
     renderEvents(state.events, false);
   });
-  $("policy-form").addEventListener("input", (event) => {
+  function policyInput(event) {
     if (event.target === $("ups-power-review-ack")) return;
     state.policyDirty = true;
-    setText("enabled-label", $("policy-enabled").checked ? state.status?.meta?.dry_run ? "Prueba al guardar" : "Activada al guardar" : "Desactivada al guardar");
+    setText("enabled-label", $("policy-enabled").checked ? state.status?.meta?.dry_run ? "Modo de prueba" : "Activada" : "Desactivada");
     setText("settings-feedback", "Cambios sin guardar");
     $("settings-feedback").classList.remove("error");
     updateMutationControls();
     renderManualUpsTestNotices();
     renderUpsPoweroff();
-  });
+  }
+  $("policy-form").addEventListener("input", policyInput);
+  $("policy-enabled").addEventListener("input", policyInput);
   $("webhooks-form").addEventListener("input", () => {
     state.webhooksDirty = !webhookSettingsMatch(webhookDraft(), state.status?.webhooks?.settings);
     setText("webhooks-feedback", state.webhooksDirty ? "Cambios sin guardar" : "");
@@ -1765,7 +1975,8 @@
       sound_enabled: $("notifications-sound").checked,
       repeat_seconds: Number($("notifications-repeat").value),
     };
-    if (typeof state.status.notifications.settings.persistent_critical === "boolean") settings.persistent_critical = $("notifications-persistent").checked;
+    if (typeof state.status.notifications.settings.persistent_critical === "boolean") settings.persistent_critical = Array.isArray(state.status.notifications.pending)
+      ? state.status.notifications.settings.persistent_critical : $("notifications-persistent").checked;
     state.mutation = "save-notifications";
     state.statusGeneration += 1;
     updateMutationControls();
@@ -1822,13 +2033,19 @@
     if (!$("policy-form").reportValidity()) return;
     const countdownSeconds = Number($("policy-countdown").value);
     if (!Number.isInteger(countdownSeconds) || countdownSeconds < 10 || countdownSeconds > 120) {
-      setText("settings-feedback", "El tiempo para cancelar debe ser un entero de 10 a 120 segundos.");
+      setText("settings-feedback", "El tiempo antes de actuar debe ser un entero de 10 a 120 segundos.");
       $("settings-feedback").classList.add("error");
       return;
     }
     const upsDelayMinutes = Number($("policy-ups-delay").value);
     if (!Number.isInteger(upsDelayMinutes) || upsDelayMinutes < 1 || upsDelayMinutes > 9) {
       setText("settings-feedback", "El retardo del UPS debe ser un entero de 1 a 9 minutos.");
+      $("settings-feedback").classList.add("error");
+      return;
+    }
+    const lowBatteryPercent = Number($("policy-low-battery").value);
+    if (!Number.isInteger(lowBatteryPercent) || lowBatteryPercent < 0 || lowBatteryPercent > 100) {
+      setText("settings-feedback", "El umbral de batería baja debe ser un porcentaje entero de 0 a 100.");
       $("settings-feedback").classList.add("error");
       return;
     }
@@ -1839,8 +2056,7 @@
     button.textContent = "Guardando…";
     const policy = {
       enabled: $("policy-enabled").checked,
-      on_battery_seconds: Math.round(Number($("policy-on-battery").value) * 60),
-      low_battery_percent: state.status?.meta?.source === "native" ? state.status.policy.low_battery_percent : Number($("policy-low-battery").value),
+      low_battery_percent: lowBatteryPercent,
       min_runtime_seconds: state.status?.meta?.source === "native" ? state.status.policy.min_runtime_seconds : Number($("policy-runtime").value),
       countdown_seconds: countdownSeconds,
       action: $("policy-action").value,
@@ -1925,7 +2141,7 @@
       const result = await post("/api/protection/cancel", {});
       applyStatus(result);
       if (["countdown", "executed"].includes(result.protection.state)) throw new Error("El monitor aún reporta una cuenta atrás o una acción enviada a Windows.");
-      if (state.criticalOpen && !state.criticalItems.size) acknowledgeCritical();
+      if (state.criticalOpen && !state.criticalItems.size && !state.pendingNotifications.size) finishCriticalAcknowledgment(captureCriticalAcknowledgment());
       toast(simulation ? "El monitor confirmó la cancelación de la prueba." : result.protection.state === "cancelled" ? "Cuenta atrás cancelada. La protección volverá a evaluarse en el próximo corte." : "El monitor confirma que no hay una cuenta atrás activa.");
       if (state.criticalOpen) {
         setText("critical-feedback", "El monitor confirmó que no hay una cuenta atrás activa.");
@@ -1948,9 +2164,11 @@
     refreshTelemetry();
   });
   $("critical-cancel").addEventListener("click", cancelProtection);
-  $("critical-ack").addEventListener("click", () => acknowledgeCritical());
-  $("critical-dialog").addEventListener("cancel", (event) => { event.preventDefault(); acknowledgeCritical(); });
-  $("critical-dialog").addEventListener("close", () => acknowledgeCritical(false));
+  $("critical-ack").addEventListener("click", acknowledgeCritical);
+  $("critical-dialog").addEventListener("cancel", (event) => { event.preventDefault(); $("critical-ack").focus(); });
+  $("critical-dialog").addEventListener("close", () => {
+    if (state.criticalOpen) $("critical-dialog").showModal();
+  });
   $("critical-dialog").addEventListener("keydown", (event) => {
     if (event.key !== "Tab" || !state.criticalOpen) return;
     const buttons = [!$("critical-countdown").hidden && !$("critical-cancel").disabled ? $("critical-cancel") : null, $("critical-ack")].filter(Boolean);

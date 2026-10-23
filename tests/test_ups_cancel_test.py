@@ -9,7 +9,8 @@ from unittest.mock import Mock, patch
 import uuid
 
 from ups_monitor.ups_cancel_test import (AUTH_FILENAME, JOURNAL_FILENAME, UpsCancellationTest,
-                                        candidate_profile, validate_test_worker_request, validate_cancel_test_preflight)
+                                        candidate_profile, load_test_operation, validate_test_worker_request,
+                                        validate_cancel_test_preflight)
 from ups_monitor.ups_power import NT2402PRO_CANDIDATE_PROFILE, VALIDATED_PROFILES, UpsPowerBlocked
 
 
@@ -170,6 +171,76 @@ class UpsCancellationTestTests(unittest.TestCase):
         with self.assertRaises(UpsPowerBlocked):
             restarted.start(device=self.device, sample=self.sample(), policy_enabled=False, blocked=False, acknowledge_risk=True)
         self.transport.submit_test.assert_called_once()
+
+    def test_finished_observation_survives_a_reboot_without_rewriting_evidence(self):
+        self.start()
+        self.observe_pending()
+        self.test.cancel(device=self.device, sample=self.pending_sample())
+        self.advance(220)
+        finished = self.test.confirm_observation(device=self.device, sample=self.sample(),
+            operation_id=self.test._operation["operation_id"], outputs_stayed_on=True, independent_load_observed=True)
+        saved = self.path.read_bytes()
+        operation = json.loads(saved)
+        self.tick = 1
+        self.factory.reset_mock()
+
+        restarted = UpsCancellationTest(self.path, transport_factory=self.factory)
+        status = restarted.status(device=self.device, sample=self.sample())
+        self.assertEqual(status["state"], "finished")
+        self.assertEqual(status["operation_id"], finished["operation_id"])
+        self.assertEqual(status["result"], "cancel_observed_by_user")
+        self.assertEqual(restarted._operation, operation)
+        self.assertFalse(restarted.pending())
+        self.assertIsNone(status["remaining"])
+        self.assertFalse(status["can_cancel"])
+        self.assertFalse(status["production_validated"])
+        self.assertEqual(load_test_operation(self.path), operation)
+        self.assertEqual(self.path.read_bytes(), saved)
+        self.factory.assert_not_called()
+
+    def test_pending_operation_survives_clock_reset_as_review_without_replay_or_cancel(self):
+        started = self.start()
+        saved = self.path.read_bytes()
+        self.tick = 1
+        self.factory.reset_mock()
+
+        restarted = UpsCancellationTest(self.path, transport_factory=self.factory)
+        restarted.observe(device=self.device, sample=self.sample())
+        status = restarted.status(device=self.device, sample=self.sample())
+        self.assertEqual(status["state"], "review_required")
+        self.assertEqual(status["operation_id"], started["operation_id"])
+        self.assertTrue(restarted.pending())
+        self.assertIsNone(status["remaining"])
+        self.assertFalse(status["can_cancel"])
+        self.assertFalse(status["can_close"])
+        self.assertFalse(status["can_confirm_observation"])
+        with self.assertRaises(UpsPowerBlocked):
+            restarted.start(device=self.device, sample=self.sample(), policy_enabled=False, blocked=False, acknowledge_risk=True)
+        with self.assertRaises(UpsPowerBlocked):
+            restarted.cancel(device=self.device, sample=self.pending_sample())
+        self.assertEqual(self.path.read_bytes(), saved)
+        self.factory.assert_not_called()
+
+    def test_loader_still_rejects_malformed_persisted_ticks(self):
+        self.start()
+        operation = json.loads(self.path.read_text(encoding="utf-8"))
+        for state in ("submitted", "finished"):
+            for tick in (None, True, "100", -1, float("nan"), float("inf")):
+                with self.subTest(state=state, tick=tick):
+                    self.path.write_text(json.dumps({**operation, "state": state, "started_monotonic": tick}), encoding="utf-8")
+                    with self.assertRaises(UpsPowerBlocked):
+                        load_test_operation(self.path)
+
+    def test_workers_still_reject_a_reset_clock_for_start_and_cancel(self):
+        self.start()
+        operation = json.loads(self.path.read_text(encoding="utf-8"))
+        self.tick = 1
+        for selector, state in (("start", "arming"), ("cancel", "cancelling")):
+            with self.subTest(selector=selector):
+                self.path.write_text(json.dumps({**operation, "state": state}), encoding="utf-8")
+                self.assertEqual(load_test_operation(self.path)["operation_id"], operation["operation_id"])
+                with self.assertRaisesRegex(UpsPowerBlocked, "El reloj de la operación cambió"):
+                    validate_test_worker_request(self.auth_path, self.path, operation["operation_id"], selector)
 
     def test_suspend_or_communication_loss_cannot_finish_the_observation(self):
         self.start()

@@ -1,4 +1,5 @@
 import io
+import json
 from email.message import Message
 import threading
 import unittest
@@ -111,6 +112,44 @@ class NotificationIntegrationTests(unittest.TestCase):
             self.monitor.tick()
         self.assertEqual(self.monitor.connection, "connected")
         self.assertTrue(self.monitor.sample["on_battery"])
+        self.action.assert_not_called()
+
+    def test_brief_outage_acknowledgement_only_removes_the_displayed_notices(self):
+        self.monitor.tick()
+        self.sample["on_battery"] = True
+        self.monitor.tick()
+        self.sample["on_battery"] = False
+        self.monitor.tick()
+        before = self.monitor.snapshot()
+        pending = before["notifications"]["pending"]
+        self.assertTrue(any(item["kind"] == "power_lost" for item in pending))
+        self.assertTrue(any(item["kind"] == "power_restored" for item in pending))
+        displayed_ids = [item["id"] for item in pending]
+        # A second incident arriving after rendering must not be acknowledged
+        # by an earlier dialog's confirmation.
+        self.alerts.on_event("ups_fault", "Nueva falla pendiente")
+        handler = self.handler("/api/notifications/ack", json.dumps({"ids": displayed_ids}).encode())
+        handler.do_POST()
+        result = handler._json.call_args.args[0]
+        self.assertEqual(result["policy"], before["policy"])
+        self.assertEqual(result["protection"], before["protection"])
+        self.assertEqual([item["kind"] for item in result["notifications"]["pending"]], ["ups_fault"])
+        self.action.assert_not_called()
+
+    def test_acknowledgement_requires_token_and_strict_explicit_ids(self):
+        self.alerts.on_event("power_lost", "Corte de energía")
+        pending = self.alerts.status()["pending"]
+        body = json.dumps({"ids": [pending[0]["id"]]}).encode()
+        handler = self.handler("/api/notifications/ack", body, token=False)
+        handler.do_POST()
+        self.assertEqual(handler._json.call_args.args[1], 403)
+        for invalid in ({}, {"ids": "all"}, {"ids": [True]}, {"ids": [-1]},
+                        {"ids": [pending[0]["id"]], "all": True}):
+            with self.subTest(invalid=invalid):
+                handler = self.handler("/api/notifications/ack", json.dumps(invalid).encode())
+                handler.do_POST()
+                self.assertEqual(handler._json.call_args.args[1], 400)
+        self.assertEqual(self.alerts.status()["pending"], pending)
         self.action.assert_not_called()
 
 

@@ -27,7 +27,7 @@ class IsolatedMonitorTests(unittest.TestCase):
         self.directory = tempfile.TemporaryDirectory(dir=TEST_ROOT)
         self.root = Path(self.directory.name)
         self.backend = Store(self.root / "monitor.sqlite3", busy_timeout_ms=100)
-        self.backend.set_setting("policy", {**DEFAULT_POLICY, "on_battery_seconds": 420})
+        self.backend.set_setting("policy", dict(DEFAULT_POLICY))
         self.backend.set_setting("notification_settings", {**DEFAULT_NOTIFICATION_SETTINGS, "sound_enabled": False})
         self.store = ResilientStore.open(self.root / "monitor.sqlite3", store_factory=lambda path: self.backend,
                                          retry_seconds=0.01, max_retry_seconds=0.02)

@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from .alerts import CRITICAL_HISTORY_EVENTS, DEFAULT_NOTIFICATION_SETTINGS, validate_notification_settings
 from .webhooks import DEFAULT_WEBHOOK_SETTINGS, validate_webhook_settings
 from .core import (DEFAULT_POLICY, SAMPLE_FIELDS, IncidentCursorExpired, RecordCursorExpired, Store, _timestamp,
-                   battery_estimate_fields, iso_utc, validate_policy)
+                   battery_estimate_fields, iso_utc, load_saved_policy)
 
 
 class HistoryUnavailable(RuntimeError):
@@ -80,6 +80,7 @@ class ResilientStore:
         self._queue, self._events = deque(), deque(maxlen=event_limit)
         self._settings = {}
         self._webhook_deliveries = {}
+        self._notifications = {}
         self._next_event_id = -1
         self._backend = self._thread = None
         self._inflight = ()
@@ -132,7 +133,8 @@ class ResilientStore:
                 self._failed(exc, "events")
         # Capture settings exactly once. Recovery must not silently enable a
         # previously unreadable policy while the monitor is already running.
-        self._load_setting("policy", DEFAULT_POLICY, validate_policy)
+        self._load_setting("policy", DEFAULT_POLICY)
+        self._load_setting("policy_migration_review", None)
         self._load_setting("notification_settings", DEFAULT_NOTIFICATION_SETTINGS,
                            validate_notification_settings)
         self._load_setting("webhooks", DEFAULT_WEBHOOK_SETTINGS, validate_webhook_settings)
@@ -143,12 +145,27 @@ class ResilientStore:
                     self._webhook_deliveries[value["id"]] = value
             except Exception:
                 self._configuration_warnings.append("No se pudo cargar el historial de entregas de webhooks.")
+        if self._backend is not None:
+            self._reload_notifications()
+
+    def _reload_notifications(self):
+        if not callable(getattr(type(self._backend), "pending_notifications", None)):
+            return
+        try:
+            records = self._backend.pending_notifications() + self._backend.notification_incidents()
+            with self._condition:
+                for item in records:
+                    self._notifications.setdefault(item["id"], item)
+            self._succeeded("notifications")
+        except Exception as exc:
+            self._failed(exc, "notifications")
 
     def _load_setting(self, key, default, validator=None):
         value = copy.deepcopy(default)
         if self._backend is not None:
             try:
-                value = self._backend.get_setting(key, copy.deepcopy(default))
+                value = (load_saved_policy(self._backend) if key == "policy" else
+                         self._backend.get_setting(key, copy.deepcopy(default)))
                 if validator:
                     value = validator(value)
             except Exception as exc:
@@ -179,8 +196,14 @@ class ResilientStore:
         return self._load_setting(key, default)
 
     def set_setting(self, key, value):
+        self._set_settings({key: value}, single=True)
+
+    def set_settings(self, values):
+        self._set_settings(values)
+
+    def _set_settings(self, values, *, single=False):
         # Validate serializability before touching storage or cached settings.
-        json.dumps(value, allow_nan=False)
+        json.dumps(values, allow_nan=False)
         if not self._io_lock.acquire(blocking=False):
             raise HistoryUnavailable("El historial está ocupado; no se guardó la configuración. Inténtalo de nuevo.")
         try:
@@ -189,12 +212,16 @@ class ResilientStore:
                     raise HistoryUnavailable("El historial no está disponible; no se guardó la configuración.")
                 backend = self._backend
             try:
-                backend.set_setting(key, value)
+                if single:
+                    key, value = next(iter(values.items()))
+                    backend.set_setting(key, value)
+                else:
+                    backend.set_settings(values)
             except Exception as exc:
                 self._failed(exc, "settings")
                 raise HistoryUnavailable("No se guardó la configuración: " + str(exc)[:300]) from exc
             with self._condition:
-                self._settings[key] = copy.deepcopy(value)
+                self._settings.update(copy.deepcopy(values))
             self._succeeded("settings")
         finally:
             self._io_lock.release()
@@ -209,10 +236,13 @@ class ResilientStore:
                 # never evict an entry currently being written.
                 candidate = next((value for value in self._queue
                                   if value.kind == "sample" and value not in self._inflight), None)
-                if candidate is None and entry.kind == "event":
-                    candidate = next((value for value in self._queue if value not in self._inflight), None)
+                if candidate is None and entry.kind in ("event", "notification"):
+                    candidate = next((value for value in self._queue
+                                      if value.kind != "notification" and value not in self._inflight), None)
                 self._dropped += 1
                 if candidate is None:
+                    if entry.kind == "notification":
+                        raise HistoryUnavailable("No se pudo guardar el aviso: la cola del historial está llena.")
                     return
                 self._queue.remove(candidate)
             self._queue.append(entry)
@@ -272,6 +302,47 @@ class ResilientStore:
             ordered = sorted(self._webhook_deliveries.values(),
                              key=lambda item: (item["timestamp"], item["id"]), reverse=True)
             return copy.deepcopy(ordered[:limit])
+
+    def pending_notifications(self):
+        with self._condition:
+            return copy.deepcopy(sorted((item for item in self._notifications.values()
+                                         if item.get("acknowledged_at") is None),
+                                        key=lambda item: (item["timestamp"], item["id"])))
+
+    def notification_incidents(self):
+        with self._condition:
+            return copy.deepcopy([item for item in self._notifications.values() if item.get("resolved_at") is None])
+
+    def put_notification(self, record):
+        value = Store._notification(record)
+        with self._condition:
+            previous = self._notifications.get(value["id"])
+            if previous and previous.get("acknowledged_at") is not None:
+                value["acknowledged_at"] = previous["acknowledged_at"]
+            self._enqueue(_Write("notification", copy.deepcopy(value), self._clock(), urgent=True))
+            self._notifications[value["id"]] = value
+        return copy.deepcopy(value)
+
+    def acknowledge_notifications(self, records):
+        values = [Store._notification(item) for item in records]
+        if not self._io_lock.acquire(timeout=0.1):
+            raise HistoryUnavailable("El historial está ocupado; no se guardó Entendido. Inténtalo de nuevo.")
+        try:
+            with self._condition:
+                if self._closing or self._backend is None:
+                    raise HistoryUnavailable("El historial no está disponible; no se guardó Entendido.")
+                backend = self._backend
+            try:
+                backend.acknowledge_notifications(values)
+            except Exception as exc:
+                self._failed(exc, "notifications")
+                raise HistoryUnavailable("No se guardó Entendido: " + str(exc)[:300]) from exc
+            with self._condition:
+                for value in values:
+                    self._notifications[value["id"]] = value
+            self._succeeded("notifications")
+        finally:
+            self._io_lock.release()
 
     def _read(self, method, *args, **kwargs):
         if not self._io_lock.acquire(timeout=0.1):
@@ -416,6 +487,8 @@ class ResilientStore:
                                                  timestamp=value["timestamp"])
             elif entry.kind == "webhook_delivery":
                 result = self._backend.add_webhook_delivery(value)
+            elif entry.kind == "notification":
+                result = self._backend.put_notification(value)
             else:
                 result = self._backend.add_sample(value)
             self._acknowledge((entry,), (result,))
@@ -431,7 +504,7 @@ class ResilientStore:
                             self._dropped += len(self._queue)
                             self._queue.clear()
                         return
-                    needed = self._queue or self._backend is None or self._needs_probe
+                    needed = self._queue or self._backend is None or self._needs_probe or "notifications" in self._errors
                     if not needed:
                         self._condition.wait()
                         continue
@@ -456,6 +529,9 @@ class ResilientStore:
                             with self._condition:
                                 self._backend = backend
                             self._succeeded("open")
+                            self._reload_notifications()
+                        if "notifications" in self._errors:
+                            self._reload_notifications()
                         if not entries:
                             self._backend.events(1)
                             self._succeeded("events")

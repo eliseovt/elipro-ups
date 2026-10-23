@@ -98,7 +98,7 @@ class AcquisitionTests(unittest.TestCase):
         self.action.assert_not_called()
 
     def test_old_low_alarm_is_recorded_historically_and_never_fires_after_recovery(self):
-        self.monitor.set_policy({"enabled": True, "on_battery_seconds": 0, "countdown_seconds": 10})
+        self.monitor.set_policy({"enabled": True, "countdown_seconds": 10})
         self.monitor.telemetry.publish(sample(True, True), captured_at=100)
         self.monitor.telemetry.publish(sample(False), captured_at=100)
         self.monitor.telemetry.publish(sample(False), captured_at=100)
@@ -111,18 +111,18 @@ class AcquisitionTests(unittest.TestCase):
         self.action.assert_not_called()
 
     def test_overflow_restarts_countdown_from_current_sample_not_unobserved_time(self):
-        self.monitor.set_policy({"enabled": True, "on_battery_seconds": 0, "countdown_seconds": 10})
-        self.adapter.read = lambda: sample(True, True)
+        self.monitor.set_policy({"enabled": True, "countdown_seconds": 10})
+        self.adapter.read = lambda: sample(True)
         self.monitor.tick()
         self.clock.return_value = 111
         for _ in range(20):
-            self.monitor.telemetry.publish(sample(True, True), captured_at=111)
+            self.monitor.telemetry.publish(sample(True), captured_at=111)
         self.monitor._consume_once()
         self.assertEqual(self.monitor.engine.status()["countdown_remaining"], 10)
         self.action.assert_not_called()
 
     def test_monotonic_delivery_age_blocks_fresh_looking_delayed_timestamp(self):
-        self.monitor.set_policy({"enabled": True, "on_battery_seconds": 0, "countdown_seconds": 10})
+        self.monitor.set_policy({"enabled": True, "countdown_seconds": 10})
         self.monitor.telemetry.publish(sample(True, True), captured_at=100)
         self.clock.return_value = 116
         self.monitor._consume_once()
@@ -131,8 +131,8 @@ class AcquisitionTests(unittest.TestCase):
         self.action.assert_not_called()
 
     def test_superseded_delivery_cannot_reset_cancellation_or_invoke_action(self):
-        self.monitor.set_policy({"enabled": True, "on_battery_seconds": 0, "countdown_seconds": 10})
-        self.adapter.read = lambda: sample(True, True)
+        self.monitor.set_policy({"enabled": True, "countdown_seconds": 10})
+        self.adapter.read = lambda: sample(True)
         self.monitor.tick()
         self.monitor.cancel()
         self.monitor._processing_sequence = self.monitor.telemetry.publish(sample(False), captured_at=100)
@@ -145,11 +145,11 @@ class AcquisitionTests(unittest.TestCase):
         self.action.assert_not_called()
 
     def test_online_sample_arriving_during_evaluation_blocks_old_battery_action(self):
-        self.monitor.set_policy({"enabled": True, "on_battery_seconds": 0, "countdown_seconds": 10})
-        self.adapter.read = lambda: sample(True, True)
+        self.monitor.set_policy({"enabled": True, "countdown_seconds": 10})
+        self.adapter.read = lambda: sample(True)
         self.monitor.tick()
         self.clock.return_value = 111
-        self.monitor.telemetry.publish(sample(True, True), captured_at=111)
+        self.monitor.telemetry.publish(sample(True), captured_at=111)
         original_act = self.monitor.engine._action_callback
 
         def raced_action(action):

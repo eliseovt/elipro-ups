@@ -52,6 +52,51 @@ class PersistenceTests(unittest.TestCase):
             snapshot["webhook_events"].clear()
             self.assertEqual(store.get_setting("webhooks"), saved)
 
+    def test_legacy_policy_is_migrated_before_cache_validation_and_review_is_primed(self):
+        for wait, countdown, expected, enabled in ((0, 30, 30, True), (30, 30, 60, True), (300, 30, 120, False)):
+            with self.subTest(wait=wait):
+                backend = Store(":memory:", busy_timeout_ms=100)
+                original = {**DEFAULT_POLICY, "enabled": True, "on_battery_seconds": wait,
+                            "countdown_seconds": countdown, "action": "hibernate", "ups_poweroff": True}
+                backend.set_setting("policy", original)
+                store = ResilientStore.open(":memory:", store_factory=lambda path: backend)
+                self.backends.append(store)
+                policy = store.get_setting("policy")
+                self.assertEqual(policy["countdown_seconds"], expected)
+                self.assertEqual(policy["enabled"], enabled)
+                self.assertNotIn("on_battery_seconds", policy)
+                self.assertEqual(backend.get_setting("policy_migration_backup")["policy"], original)
+                store.start()
+                with patch.object(backend, "get_setting", side_effect=AssertionError("No SQL on a monitor tick")):
+                    review = store.get_setting("policy_migration_review")
+                    self.assertEqual(review is not None, not enabled)
+
+    def test_failed_migration_starts_disabled_and_keeps_original_without_partial_metadata(self):
+        backend = Store(":memory:", busy_timeout_ms=100)
+        original = {**DEFAULT_POLICY, "enabled": True, "on_battery_seconds": 300, "countdown_seconds": 30}
+        backend.set_setting("policy", original)
+        with patch.object(backend, "set_settings", side_effect=sqlite3.OperationalError("disk full")):
+            store = ResilientStore.open(":memory:", store_factory=lambda path: backend)
+        self.backends.append(store)
+        self.assertEqual(store.get_setting("policy"), DEFAULT_POLICY)
+        self.assertEqual(backend.get_setting("policy"), original)
+        self.assertIsNone(backend.get_setting("policy_migration_backup"))
+        self.assertIsNone(backend.get_setting("policy_migration_review"))
+
+    def test_failed_policy_review_bundle_keeps_policy_and_review_cache_unchanged(self):
+        store, backend = self.memory()
+        review = {"requires_review": True, "previous_total_seconds": 330}
+        store.set_setting("policy_migration_review", review)
+        policy = {**DEFAULT_POLICY, "enabled": True, "countdown_seconds": 60}
+        with patch.object(backend, "set_settings", side_effect=sqlite3.OperationalError("disk full")):
+            with self.assertRaises(HistoryUnavailable):
+                store.set_settings({"policy": policy, "policy_migration_review": None})
+        self.assertFalse(store.get_setting("policy")["enabled"])
+        self.assertEqual(store.get_setting("policy_migration_review"), review)
+        store.set_settings({"policy": policy, "policy_migration_review": None})
+        self.assertEqual(store.get_setting("policy"), policy)
+        self.assertIsNone(store.get_setting("policy_migration_review"))
+
     def test_invalid_saved_webhooks_start_disabled_with_configuration_warning(self):
         backend = Store(":memory:", busy_timeout_ms=100)
         backend.set_setting("webhooks", {"webhook_enabled": True, "webhook_url": "file:///private"})

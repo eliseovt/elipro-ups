@@ -85,42 +85,49 @@ class AlertTests(unittest.TestCase):
         self.manager.update_settings({"sound_enabled": False})
         self.assertTrue(self.new_manager().status()["settings"]["persistent_critical"])
 
-    def test_persistent_conditions_published_before_notice_and_removed_on_recovery(self):
+    def test_persistent_conditions_remain_after_recovery_until_user_understood(self):
         self.persistent_notifier()
         self.manager.on_event("battery_low", "Batería baja")
-        self.assertIn("battery_low", self.notifier.live)
+        notice = self.manager.status()["pending"][0]
+        key = "notice:" + str(notice["id"])
+        self.assertIn(key, self.notifier.live)
         self.assertTrue(self.notifier.messages[-1]["persistent"])
-        self.assertEqual(self.notifier.messages[-1]["key"], "battery_low")
+        self.assertEqual(self.notifier.messages[-1]["key"], key)
         self.update(low_battery=True)
-        self.assertIn("battery_low", self.notifier.live)
+        self.assertIn(key, self.notifier.live)
         self.update()
+        self.assertIn(key, self.notifier.live)
+        self.assertIsNotNone(self.manager.status()["pending"][0]["resolved_at"])
+        self.manager.acknowledge([notice["id"]])
         self.assertEqual(self.notifier.live, {})
 
-    def test_persistent_countdown_updates_without_sound_and_clears_on_cancel_or_stale(self):
+    def test_countdown_becomes_historical_without_sound_after_cancel_or_stale(self):
         self.persistent_notifier()
         protection = {"state": "countdown", "countdown_remaining": 60, "action": "shutdown"}
         self.update(protection, on_battery=True)
-        self.assertIn("60 segundos", self.notifier.live["policy_countdown"]["message"])
+        key = next(iter(self.notifier.live))
+        self.assertIn("activa", self.notifier.live[key]["message"])
         self.clock.advance(2)
         protection["countdown_remaining"] = 58
         self.update(protection, on_battery=True)
         self.assertEqual(len(self.notifier.messages), 1)
-        self.assertIn("58 segundos", self.notifier.live["policy_countdown"]["message"])
+        self.assertIn("tiempo actual", self.notifier.live[key]["message"])
         self.manager.on_event("policy_cancelled", "Cancelado")
-        self.assertEqual(self.notifier.live, {})
+        self.assertIn("anterior", self.notifier.live[key]["message"])
         self.update(protection, on_battery=True)
         self.manager.update(protection, "disconnected", None)
-        self.assertEqual(self.notifier.live, {})
+        self.assertIn("anterior", self.notifier.live[key]["message"])
 
-    def test_loss_of_data_or_disabling_notices_removes_all_persistent_conditions(self):
+    def test_loss_of_data_preserves_pending_and_disabled_desktop_retains_inbox(self):
         self.persistent_notifier()
         self.update(low_battery=True, fault=True, load_percent=100)
-        self.assertEqual(set(self.notifier.live), {"battery_low", "ups_fault", "overload"})
+        self.assertEqual(len(self.notifier.live), 3)
         self.manager.on_event("connection_lost", "USB desconectado")
-        self.assertEqual(self.notifier.live, {})
+        self.assertEqual(len(self.notifier.live), 4)
         self.update(fault=True)
         self.manager.update_settings({"enabled": False})
         self.assertEqual(self.notifier.live, {})
+        self.assertGreaterEqual(len(self.manager.status()["pending"]), 4)
 
     def test_simulation_and_visual_test_are_never_persistent(self):
         self.persistent_notifier()

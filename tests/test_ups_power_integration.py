@@ -106,7 +106,7 @@ class UpsPowerIntegrationTests(unittest.TestCase):
 
     def test_cancel_before_countdown_finishes_has_no_hardware_writes(self):
         self.monitor.set_policy({"enabled": True, "ups_poweroff": True})
-        self.monitor.engine.evaluate(sample(low_battery=True))
+        self.monitor.engine.evaluate(sample(low_battery=False))
         self.monitor.cancel()
         self.monitor.engine.evaluate(sample())
         self.factory.assert_not_called()

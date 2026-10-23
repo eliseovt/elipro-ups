@@ -22,7 +22,7 @@ class ProtectionIsolationTests(unittest.TestCase):
         self.alerts = Mock()
         self.alerts.status.return_value = {}
         self.adapter = SimpleNamespace(source="test", read=lambda: {
-            "timestamp": iso_utc(), "on_battery": True, "low_battery": True})
+            "timestamp": iso_utc(), "on_battery": True, "low_battery": False})
         self.monitor = Monitor(self.store, self.adapter, action_callback=self.action, alerts=self.alerts)
         self.clock = Mock(return_value=100)
         self.monitor.engine._clock = self.clock

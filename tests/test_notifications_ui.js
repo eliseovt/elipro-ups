@@ -83,7 +83,7 @@ function snapshot(settings = {}) {
     csrf_token: "test-token",
     connection: { state: "connected" }, sample: liveSample(), events: [],
     meta: { source: "native" },
-    policy: { enabled: false, on_battery_seconds: 300, countdown_seconds: 60, action: "shutdown" },
+    policy: { enabled: false, countdown_seconds: 60, action: "shutdown" },
     protection: { state: "idle" },
     webhooks: {
       settings: { webhook_enabled: false, webhook_url: "", webhook_events: ["power_lost", "battery_low"] },
@@ -123,7 +123,7 @@ function harness(historyOptions = {}) {
     assert.ok(elements.has(id), `HTML must include #${id}`);
     return elements.get(id);
   };
-  const policyFields = ["policy-enabled", "policy-on-battery", "policy-low-battery", "policy-runtime", "policy-countdown", "policy-action", "policy-ups-poweroff", "policy-ups-delay"];
+  const policyFields = ["policy-low-battery", "policy-runtime", "policy-countdown", "policy-action", "policy-ups-poweroff", "policy-ups-delay"];
   get("policy-form").fields = policyFields.map(get);
   get("notifications-form").fields = ["notifications-enabled", "notifications-sound", "notifications-repeat", "notifications-persistent"].map(get);
   get("webhooks-form").fields = ["webhook-enabled", "webhook-url", ...["power_lost", "power_restored", "battery_low", "overload", "ups_fault"].map((event) => "webhook-event-" + event)].map(get);
@@ -301,19 +301,19 @@ test("late status GET cannot overwrite a confirmed notification save", async () 
 
 test("saving notices preserves unsaved protection and saving protection preserves unsaved notices", async () => {
   const ui = await connected();
-  ui.get("policy-on-battery").value = 12;
+  ui.get("policy-countdown").value = 90;
   ui.get("policy-form").emit("input");
   ui.get("notifications-sound").checked = false;
   ui.get("notifications-form").emit("input");
   let pending = ui.get("notifications-form").emit("submit");
   ui.calls.at(-1).respond(snapshot({ sound_enabled: false }));
   await pending;
-  assert.equal(ui.get("policy-on-battery").value, 12);
+  assert.equal(ui.get("policy-countdown").value, 90);
   ui.get("notifications-repeat").value = 60;
   ui.get("notifications-form").emit("input");
   pending = ui.get("policy-form").emit("submit");
   const data = snapshot({ sound_enabled: false });
-  data.policy.on_battery_seconds = 720;
+  data.policy.countdown_seconds = 90;
   ui.calls.at(-1).respond(data);
   await pending;
   assert.equal(ui.get("notifications-repeat").value, 60);
@@ -1010,6 +1010,24 @@ test("persistent critical notices stay visible and are configurable when support
   assert.equal(ui.get("policy-enabled").checked, false);
 });
 
+test("durable notices require Entendido and hide the obsolete persistence switch while preserving its stored setting", async () => {
+  const ui = harness();
+  const data = snapshot({ persistent_critical: true });
+  data.notifications.pending = [];
+  ui.calls[0].respond(data); await flush();
+  assert.equal(ui.get("notifications-persistent-option").hidden, true);
+  assert.equal(ui.get("notifications-persistent").disabled, true);
+  assert.equal(ui.get("notifications-inbox-note").hidden, false);
+  assert.match(ui.get("notifications-inbox-note").textContent || html, /Los avisos de energía permanecen hasta pulsar Entendido/);
+  ui.get("notifications-persistent").checked = false;
+  ui.get("notifications-sound").checked = false;
+  ui.get("notifications-form").emit("input");
+  const saving = ui.get("notifications-form").emit("submit");
+  assert.equal(JSON.parse(ui.calls.at(-1).options.body).persistent_critical, true);
+  ui.calls.at(-1).respond(data); await saving;
+  assert.equal(ui.get("notifications-persistent-option").hidden, true);
+});
+
 test("section navigation defaults to Resumen and keeps one status polling loop", async () => {
   const ui = harness({ navigation: true });
   assert.equal(ui.location.hash, "#resumen");
@@ -1055,7 +1073,7 @@ test("unsaved protection and notice edits survive navigation and status updates"
   ui.calls[0].respond(snapshot());
   await flush();
   ui.open("protection");
-  ui.get("policy-on-battery").value = 17;
+  ui.get("policy-countdown").value = 75;
   ui.get("policy-form").emit("input");
   ui.open("system");
   ui.get("notifications-sound").checked = false;
@@ -1065,12 +1083,52 @@ test("unsaved protection and notice edits survive navigation and status updates"
   ui.calls.at(-1).respond(snapshot());
   await flush();
   ui.open("protection");
-  assert.equal(ui.get("policy-on-battery").value, 17);
+  assert.equal(ui.get("policy-countdown").value, 75);
   assert.equal(ui.get("settings-feedback").textContent, "Cambios sin guardar");
   ui.open("system");
   assert.equal(ui.get("notifications-sound").checked, false);
   assert.equal(ui.get("notifications-feedback").textContent, "Cambios sin guardar");
   assert.equal(ui.calls.some((call) => call.options.method === "POST"), false);
+});
+
+test("the protection switch outside the form preserves unsaved changes through navigation and saves through its associated form", async () => {
+  const { ui, data } = await currentUi({}, { navigation: true });
+  data.policy = { ...data.policy, enabled: false, action: "hibernate", countdown_seconds: 10,
+    low_battery_percent: 20, ups_poweroff: true, ups_poweroff_delay_seconds: 60 };
+  data.ups_poweroff = observedSequenceCapability({ available: true, sequence_admission: { available: true } });
+  await pushStatus(ui, data);
+  ui.open("protection");
+  const master = ui.get("policy-enabled");
+  assert.equal(master.getAttribute("form"), "policy-form");
+  assert.equal(ui.get("protection-master").hidden, false);
+  assert.equal(ui.get("enabled-label").textContent, "Desactivada");
+  master.checked = true;
+  master.emit("input");
+  assert.equal(ui.get("enabled-label").textContent, "Activada");
+  assert.equal(ui.get("settings-feedback").textContent, "Cambios sin guardar");
+  assert.equal(ui.calls.some((call) => call.options.method === "POST"), false);
+  ui.open("overview");
+  assert.equal(ui.get("protection-master").hidden, true);
+  assert.equal(ui.get("protection-master").inert, true);
+  await pushStatus(ui, data);
+  ui.open("protection");
+  assert.equal(ui.get("protection-master").inert, false);
+  assert.equal(master.checked, true);
+  assert.equal(ui.get("enabled-label").textContent, "Activada");
+  const save = ui.get("policy-form").emit("submit");
+  assert.equal(master.disabled, true, "saving disables the associated switch even though it is outside the form");
+  const request = ui.calls.at(-1);
+  const body = JSON.parse(request.options.body);
+  assert.equal(body.enabled, true);
+  assert.equal(body.action, "hibernate");
+  assert.equal(body.countdown_seconds, 10);
+  assert.equal(body.low_battery_percent, 20);
+  assert.equal(body.ups_poweroff_delay_seconds, 60);
+  request.respond({ ...data, policy: { ...data.policy, enabled: true } });
+  await save;
+  assert.equal(master.disabled, false);
+  assert.equal(master.checked, true);
+  assert.equal(ui.get("enabled-label").textContent, "Activada");
 });
 
 test("sidebar monitoring and critical protection controls remain accurate across all five sections", async () => {
@@ -1293,7 +1351,7 @@ test("switching theme preserves the active section, dirty forms, focus and monit
   ui.calls[0].respond(snapshot());
   await flush();
   ui.open("protection");
-  ui.get("policy-on-battery").value = 17;
+  ui.get("policy-countdown").value = 75;
   ui.get("policy-form").emit("input");
   ui.open("system");
   ui.get("notifications-sound").checked = false;
@@ -1304,7 +1362,7 @@ test("switching theme preserves the active section, dirty forms, focus and monit
   ui.get("theme-toggle").emit("click");
   assert.equal(ui.get("view-title").textContent, "Sistema");
   assert.equal(ui.location.hash, "sistema");
-  assert.equal(ui.get("policy-on-battery").value, 17);
+  assert.equal(ui.get("policy-countdown").value, 75);
   assert.equal(ui.get("notifications-sound").checked, false);
   assert.equal(ui.get("theme-toggle").focused, true);
   assert.equal(ui.calls.length, initialCalls);
@@ -1313,7 +1371,7 @@ test("switching theme preserves the active section, dirty forms, focus and monit
   ui.calls.at(-1).respond(snapshot());
   await flush();
   assert.equal(ui.rootElement.dataset.theme, "light");
-  assert.equal(ui.get("policy-on-battery").value, 17);
+  assert.equal(ui.get("policy-countdown").value, 75);
   assert.equal(ui.get("notifications-sound").checked, false);
   assert.equal(ui.intervals.filter((item) => item.ms === 2000).length, 1);
   assert.equal(ui.calls.some((call) => call.options.method === "POST"), false);
@@ -1521,7 +1579,7 @@ test("battery charge is primary, estimates are labelled and voltage stays second
   assert.match(textOf(ui.get("critical-list")), /Batería baja/);
 });
 
-test("invalid or unproven percentages stay unavailable and an estimate cannot fabricate an alarm", async () => {
+test("invalid or unproven percentages stay unavailable while unrecognized estimates remain informational", async () => {
   const ui = harness();
   const data = snapshot();
   const cases = [
@@ -1544,7 +1602,7 @@ test("invalid or unproven percentages stay unavailable and an estimate cannot fa
   data.sample = liveSample({ battery_voltage: 25, battery_percent_estimate: 5, battery_estimate_method: "fixture_v1" });
   ui.poll(); ui.calls.at(-1).respond(data); await flush();
   assert.equal(ui.get("critical-dialog").open, false);
-  assert.equal(ui.get("policy-battery-field").hidden, true, "an estimate does not enable the native power-policy threshold");
+  assert.equal(ui.get("policy-battery-field").hidden, false, "native USB percentage protection is visible and configurable");
   assert.equal(ui.get("protection-alert").hidden, true);
 });
 
@@ -1786,12 +1844,13 @@ test("vertical load meter preserves zero, caps the graphic at one hundred and ex
   }
 });
 
-test("vertical battery meter accepts reported and estimated zero without converting estimates into alarms", async () => {
+test("vertical battery meter accepts reported and unknown estimated zero without treating the unknown method as protection", async () => {
   const { ui, data } = await currentUi({ battery_percent_estimate: 0, battery_estimate_method: "fixture-v1" });
   assert.equal(ui.get("battery-percent").textContent, "0");
   assert.equal(ui.get("battery-bar").style.height, "0%");
   assert.equal(ui.get("battery-note").textContent, "Carga estimada");
   assert.equal(ui.get("critical-dialog").open, false);
+  assert.match(ui.get("battery-note").title, /Estimación informativa.*no se usa/);
   data.sample = liveSample({ battery_percent: 0 }, ui.now());
   await pushStatus(ui, data);
   assert.equal(ui.get("battery-percent").textContent, "0");
@@ -1912,6 +1971,199 @@ test("recovery before acknowledgment stays visible as resolved until the user ac
   assert.equal(ui.get("critical-dialog").open, false);
 });
 
+function pendingNotice(ui, changes = {}) {
+  return { id: 101, kind: "power_lost", title: "Corte de energía", message: "El UPS está funcionando con batería.",
+    timestamp: new Date(ui.now()).toISOString(), resolved_at: null, ...changes };
+}
+
+test("a five-second outage and its recovery remain visible until durable Entendido is confirmed", async () => {
+  const { ui, data } = await currentUi({}, { navigation: true });
+  const outage = pendingNotice(ui);
+  data.sample = liveSample({ on_battery: true }, ui.now());
+  data.notifications.pending = [outage];
+  await pushStatus(ui, data);
+  const dialog = ui.get("critical-dialog");
+  const outageRow = ui.get("critical-list").children[0];
+  assert.equal(dialog.open, true);
+  assert.equal(ui.get("critical-title").textContent, "Corte de energía");
+  ui.advance(5000);
+  const recoveryTime = new Date(ui.now()).toISOString();
+  data.sample = liveSample({}, ui.now());
+  data.events = [
+    { id: 10, kind: "power_lost", timestamp: outage.timestamp, message: outage.message },
+    { id: 11, kind: "power_restored", timestamp: recoveryTime, message: "Volvió el suministro eléctrico." },
+  ];
+  data.notifications.pending = [{ ...outage, resolved_at: recoveryTime }, pendingNotice(ui, {
+    id: 102, kind: "power_restored", title: "Suministro eléctrico recuperado", message: "Volvió el suministro eléctrico.",
+  })];
+  await pushStatus(ui, data);
+  assert.equal(dialog.open, true);
+  assert.equal(dialog.modalShows, 1);
+  assert.equal(ui.get("critical-title").textContent, "Avisos pendientes de Entendido");
+  assert.equal(ui.get("critical-list").children[0], outageRow);
+  assert.equal(outageRow.dataset.state, "resolved");
+  assert.match(textOf(outageRow), /Registrado:.*Recuperado:.*Pendiente de Entendido/);
+  assert.match(textOf(ui.get("critical-list").children[1]), /Suministro eléctrico recuperado.*Volvió el suministro/);
+  assert.equal(ui.get("toast").hidden, true, "the recovery must use the persistent inbox instead of a transient toast");
+  ui.advance(10000); ui.runTimeouts();
+  for (const view of ["system", "history", "overview"]) ui.open(view);
+  ui.get("critical-dialog").emit("cancel");
+  assert.equal(dialog.open, true);
+  assert.equal(ui.calls.some((call) => call.options.method === "POST"), false);
+  const acknowledgment = ui.get("critical-ack").emit("click");
+  const request = ui.calls.at(-1);
+  assert.equal(request.url, "/api/notifications/ack");
+  assert.deepEqual(JSON.parse(request.options.body), { ids: [101, 102] });
+  assert.equal(request.options.headers["X-UPS-Token"], "test-token");
+  assert.equal(dialog.open, true, "the notices must stay visible until the monitor confirms the disk write");
+  assert.equal(ui.get("critical-ack").disabled, true);
+  await ui.get("critical-ack").emit("click");
+  assert.equal(ui.calls.at(-1), request);
+  data.notifications.pending = [];
+  request.respond(data);
+  await acknowledgment;
+  assert.equal(dialog.open, false);
+  await pushStatus(ui, data);
+  assert.equal(dialog.open, false);
+  assert.equal(data.events.length, 2, "Entendido must preserve event history");
+});
+
+test("an outage completed between panel polls opens from the durable inbox and survives reloading the panel", async () => {
+  const { ui, data } = await currentUi();
+  data.notifications.pending = [pendingNotice(ui, { timestamp: new Date(ui.now() - 5000).toISOString(), resolved_at: new Date(ui.now()).toISOString() }),
+    pendingNotice(ui, { id: 102, kind: "power_restored", title: "Suministro eléctrico recuperado", message: "Volvió la electricidad." })];
+  await pushStatus(ui, data);
+  assert.equal(ui.get("critical-dialog").open, true);
+  assert.equal(ui.get("critical-list").children.length, 2);
+  const reloaded = harness();
+  reloaded.calls[0].respond(data); await flush();
+  assert.equal(reloaded.get("critical-dialog").open, true, "initial event history must not suppress unread persisted notices");
+  assert.equal(reloaded.get("critical-list").children.length, 2);
+  const acknowledgment = reloaded.get("critical-ack").emit("click");
+  data.notifications.pending = [];
+  reloaded.calls.at(-1).respond(data); await acknowledgment;
+  const understood = harness();
+  understood.calls[0].respond(data); await flush();
+  assert.equal(understood.get("critical-dialog").open, false);
+});
+
+test("Entendido failures and unconfirmed responses leave every selected notice pending for a safe retry", async () => {
+  const { ui, data } = await currentUi();
+  data.notifications.pending = [pendingNotice(ui)];
+  await pushStatus(ui, data);
+  let acknowledgment = ui.get("critical-ack").emit("click");
+  ui.calls.at(-1).respond({ error: "No se pudo guardar en disco." }, false); await acknowledgment;
+  assert.equal(ui.get("critical-dialog").open, true);
+  assert.equal(ui.get("critical-list").children.length, 1);
+  assert.match(ui.get("critical-feedback").textContent, /No se confirmó Entendido.*No se pudo guardar en disco.*siguen pendientes/);
+  assert.equal(ui.get("critical-ack").disabled, false);
+  acknowledgment = ui.get("critical-ack").emit("click");
+  ui.calls.at(-1).respond(data); await acknowledgment;
+  assert.equal(ui.get("critical-dialog").open, true);
+  assert.match(ui.get("critical-feedback").textContent, /no confirmó Entendido/);
+  acknowledgment = ui.get("critical-ack").emit("click");
+  ui.calls.at(-1).reject(new TypeError("offline")); await acknowledgment;
+  assert.equal(ui.get("critical-dialog").open, true);
+  assert.equal(ui.get("critical-list").children[0].dataset.state, "unconfirmed");
+  const calls = ui.calls.length;
+  await ui.get("critical-ack").emit("click");
+  assert.equal(ui.calls.length, calls, "offline acknowledgment must not be cached as read locally");
+  assert.match(ui.get("critical-feedback").textContent, /Recupera la conexión.*siguen pendientes/);
+  await pushStatus(ui, data);
+  acknowledgment = ui.get("critical-ack").emit("click");
+  data.notifications.pending = [];
+  ui.calls.at(-1).respond(data); await acknowledgment;
+  assert.equal(ui.get("critical-dialog").open, false);
+});
+
+test("a notice arriving during Entendido remains unread and needs its own acknowledgment", async () => {
+  const { ui, data } = await currentUi();
+  data.notifications.pending = [pendingNotice(ui)];
+  await pushStatus(ui, data);
+  const acknowledgment = ui.get("critical-ack").emit("click");
+  const request = ui.calls.at(-1);
+  data.notifications.pending = [pendingNotice(ui, { id: 102, kind: "power_restored", title: "Suministro eléctrico recuperado" })];
+  request.respond(data); await acknowledgment;
+  assert.deepEqual(JSON.parse(request.options.body), { ids: [101] });
+  assert.equal(ui.get("critical-dialog").open, true);
+  assert.equal(ui.get("critical-list").children.length, 1);
+  assert.equal(ui.get("critical-list").children[0].dataset.notificationId, "102");
+  const next = ui.get("critical-ack").emit("click");
+  assert.deepEqual(JSON.parse(ui.calls.at(-1).options.body), { ids: [102] });
+  data.notifications.pending = [];
+  ui.calls.at(-1).respond(data); await next;
+  assert.equal(ui.get("critical-dialog").open, false);
+});
+
+test("Entendido commits more than 200 pending notices in bounded batches without acknowledging new arrivals", async () => {
+  const { ui, data } = await currentUi();
+  data.notifications.pending = Array.from({ length: 201 }, (_unused, index) => pendingNotice(ui, { id: index + 1 }));
+  await pushStatus(ui, data);
+  const acknowledgment = ui.get("critical-ack").emit("click");
+  const first = ui.calls.at(-1);
+  assert.equal(JSON.parse(first.options.body).ids.length, 200);
+  data.notifications.pending = [pendingNotice(ui, { id: 201 }), pendingNotice(ui, { id: 202, kind: "power_restored" })];
+  first.respond(data); await flush();
+  const second = ui.calls.at(-1);
+  assert.notEqual(first, second);
+  assert.deepEqual(JSON.parse(second.options.body), { ids: [201] });
+  data.notifications.pending = [pendingNotice(ui, { id: 202, kind: "power_restored" })];
+  second.respond(data); await acknowledgment;
+  assert.equal(ui.get("critical-dialog").open, true);
+  assert.equal(ui.get("critical-list").children.length, 1);
+  assert.equal(ui.get("critical-list").children[0].dataset.notificationId, "202");
+});
+
+test("cancelling protection never acknowledges an unread electricity incident", async () => {
+  const { ui, data } = await currentUi();
+  data.notifications.pending = [pendingNotice(ui)];
+  data.protection = { state: "countdown", simulation: false, deadline: new Date(ui.now() + 60000).toISOString() };
+  await pushStatus(ui, data);
+  const cancellation = ui.get("critical-cancel").emit("click");
+  assert.equal(ui.calls.at(-1).url, "/api/protection/cancel");
+  data.protection = { state: "cancelled", simulation: false };
+  ui.calls.at(-1).respond(data); await cancellation;
+  assert.equal(ui.get("critical-dialog").open, true);
+  assert.equal(ui.get("critical-list").children[0].dataset.notificationId, "101");
+  assert.equal(ui.calls.some((call) => call.url === "/api/notifications/ack"), false);
+  const acknowledgment = ui.get("critical-ack").emit("click");
+  assert.equal(ui.calls.at(-1).url, "/api/notifications/ack");
+  data.notifications.pending = [];
+  ui.calls.at(-1).respond(data); await acknowledgment;
+  assert.equal(ui.get("critical-dialog").open, false);
+});
+
+test("native Entendido is reflected in the panel and active telemetry does not recreate acknowledged inbox incidents", async () => {
+  const { ui, data } = await currentUi();
+  data.sample = liveSample({ low_battery: true }, ui.now());
+  data.notifications.pending = [pendingNotice(ui, { kind: "battery_low", title: "Batería baja del UPS" })];
+  await pushStatus(ui, data);
+  assert.equal(ui.get("critical-list").children.length, 1, "the persisted condition and telemetry cannot duplicate the same incident");
+  ui.get("critical-dialog").close();
+  assert.equal(ui.get("critical-dialog").open, true, "closing the window programmatically is not Entendido");
+  data.notifications.pending = [];
+  await pushStatus(ui, data);
+  assert.equal(ui.get("critical-dialog").open, false);
+  assert.equal(ui.calls.some((call) => call.options.method === "POST"), false, "a native acknowledgment is already recorded by the backend");
+  const reloaded = harness();
+  reloaded.calls[0].respond(data); await flush();
+  assert.equal(reloaded.get("critical-dialog").open, false, "the durable inbox is authoritative across clients");
+});
+
+test("native Entendido acknowledges its matching countdown notice without cancelling the active protection", async () => {
+  const { ui, data } = await currentUi();
+  data.protection = { state: "countdown", simulation: false, deadline: new Date(ui.now() + 60000).toISOString() };
+  data.notifications.pending = [pendingNotice(ui, { kind: "policy_countdown", title: "Cuenta regresiva de protección" })];
+  await pushStatus(ui, data);
+  assert.equal(ui.get("critical-dialog").open, true);
+  data.notifications.pending = [];
+  await pushStatus(ui, data);
+  assert.equal(ui.get("critical-dialog").open, false);
+  assert.equal(ui.get("protection-alert").hidden, false);
+  assert.equal(ui.get("countdown").textContent, "01:00");
+  assert.equal(ui.calls.some((call) => call.options.method === "POST"), false);
+});
+
 test("lost communication marks pending alarms unconfirmed and cannot reset acknowledgment", async () => {
   const { ui, data } = await currentUi({ fault: true });
   ui.poll(); ui.calls.at(-1).reject(new TypeError("offline")); await flush();
@@ -1928,7 +2180,7 @@ test("lost communication marks pending alarms unconfirmed and cannot reset ackno
   assert.equal(ui.get("critical-dialog").open, true);
 });
 
-test("Escape acknowledges the dialog and restores focus without posting a power action", async () => {
+test("Escape keeps the alert pending until the explicit Entendido action restores focus", async () => {
   const ui = harness();
   ui.get("theme-toggle").focus();
   const data = snapshot();
@@ -1936,6 +2188,11 @@ test("Escape acknowledges the dialog and restores focus without posting a power 
   ui.calls[0].respond(data); await flush();
   assert.equal(ui.get("critical-dialog").open, true);
   ui.get("critical-dialog").emit("cancel");
+  assert.equal(ui.get("critical-dialog").open, true);
+  assert.equal(ui.document.activeElement, ui.get("critical-ack"));
+  await pushStatus(ui, data);
+  assert.equal(ui.get("critical-dialog").open, true);
+  ui.get("critical-ack").emit("click");
   assert.equal(ui.get("critical-dialog").open, false);
   assert.equal(ui.document.activeElement, ui.get("theme-toggle"));
   assert.equal(ui.calls.some((call) => call.options.method === "POST"), false);
@@ -2004,11 +2261,13 @@ test("a hibernation countdown remains visible without fresh UPS readings and thr
   assert.equal(ui.get("critical-cancel").disabled, false);
 });
 
-test("Escape acknowledges a countdown without canceling it and a later countdown opens again", async () => {
+test("Escape cannot acknowledge or cancel a countdown and a later countdown opens again after Entendido", async () => {
   const { ui, data } = await currentUi();
   data.protection = { state: "countdown", simulation: false, deadline: new Date(ui.now() + 60000).toISOString() };
   await pushStatus(ui, data);
   ui.get("critical-dialog").emit("cancel");
+  assert.equal(ui.get("critical-dialog").open, true);
+  ui.get("critical-ack").emit("click");
   assert.equal(ui.get("critical-dialog").open, false);
   assert.equal(ui.get("protection-alert").hidden, false);
   assert.equal(ui.get("critical-cancel").disabled, false);
@@ -2317,12 +2576,15 @@ test("available UPS opt-in survives dirty polls and reconnect without enabling i
   ui.calls[0].respond(data);
   await flush();
   assert.equal(ui.get("policy-ups-poweroff").disabled, false);
+  assert.equal(ui.get("ups-power-enabled-label").textContent, "Desactivado");
   assert.match(ui.get("ups-power-delay").textContent, /De 1 a 9 min/);
   ui.get("policy-ups-poweroff").checked = true;
   ui.get("policy-form").emit("input");
+  assert.equal(ui.get("ups-power-enabled-label").textContent, "Activado");
   ui.open("history");
   await pushStatus(ui, data);
   assert.equal(ui.get("policy-ups-poweroff").checked, true);
+  assert.equal(ui.get("ups-power-enabled-label").textContent, "Activado");
   ui.poll(); ui.calls.at(-1).reject(new TypeError("offline")); await flush();
   assert.equal(ui.get("policy-ups-poweroff").disabled, true);
   assert.match(ui.get("ups-power-capability").textContent, /Sin comunicación/);
@@ -2342,6 +2604,7 @@ test("available UPS opt-in survives dirty polls and reconnect without enabling i
   await pending;
   assert.equal(ui.get("policy-ups-poweroff").checked, true);
   assert.equal(ui.get("policy-ups-poweroff").disabled, false);
+  assert.equal(ui.get("ups-power-enabled-label").textContent, "Activado");
 });
 
 test("a saved UPS opt-in can be turned off after capability degrades", async () => {
@@ -2528,7 +2791,7 @@ test("countdown input and policy saves accept ten to one hundred twenty seconds 
   const { ui, data } = await currentUi();
   assert.equal(ui.get("policy-countdown").getAttribute("min"), "10");
   assert.equal(ui.get("policy-countdown").getAttribute("max"), "120");
-  assert.match(html, /id="policy-countdown-note"[^>]*>De 10 a 120 segundos/);
+  assert.match(html, /id="policy-countdown-note"[^>]*>Puedes cancelar/);
   for (const value of ["9", "121", "10.5", "", "not-a-number"]) {
     ui.get("policy-countdown").value = value;
     ui.get("policy-form").emit("input");
@@ -2547,14 +2810,15 @@ test("countdown input and policy saves accept ten to one hundred twenty seconds 
 
 test("UPS settings stay configurable while current admission is false and the preview describes sending before Windows completion", async () => {
   const { ui, data } = await currentUi();
-  data.policy = { ...data.policy, action: "hibernate", on_battery_seconds: 0, countdown_seconds: 15, ups_poweroff: true, ups_poweroff_delay_seconds: 180 };
+  data.policy = { ...data.policy, action: "hibernate", countdown_seconds: 15, ups_poweroff: true, ups_poweroff_delay_seconds: 180 };
   data.ups_poweroff = observedSequenceCapability();
   await pushStatus(ui, data);
   assert.equal(ui.get("policy-ups-poweroff").disabled, false);
-  assert.match(ui.get("protection-preview-wait").textContent, /15 s para cancelar/);
-  assert.match(ui.get("protection-preview-action").textContent, /PC empieza a hibernar/);
-  assert.match(ui.get("protection-preview-ups").textContent, /3 min después/);
-  assert.equal(ui.get("protection-preview-ups-detail").textContent, "El UPS corta la energía de sus salidas.");
+  assert.equal(ui.get("protection-preview-wait").textContent, "Aviso inmediato.");
+  assert.equal(ui.get("protection-preview-action").textContent, "A los 15 s");
+  assert.equal(ui.get("protection-preview-action-detail").textContent, "Se solicita hibernar Windows");
+  assert.equal(ui.get("protection-preview-ups").textContent, "+3 min");
+  assert.equal(ui.get("protection-preview-ups-detail").textContent, "Ahora está bloqueado. Revisa las condiciones del UPS.");
   assert.match(html, /temporizador del UPS no espera una confirmación de que Windows terminó/);
   assert.match(ui.get("ups-power-sequence-warning").textContent, /Esperando una lectura/);
   assert.equal(ui.get("ups-power-restart").textContent, "El UPS enciende sus salidas automáticamente cuando vuelve la luz.");
@@ -2568,14 +2832,14 @@ test("UPS settings stay configurable while current admission is false and the pr
 
 test("saving longer cancellation and UPS delays preserves both actions without a local ten-second restriction", async () => {
   const { ui, data } = await currentUi();
-  data.policy = { ...data.policy, enabled: true, action: "hibernate", on_battery_seconds: 0, countdown_seconds: 15, ups_poweroff: true, ups_poweroff_delay_seconds: 180 };
+  data.policy = { ...data.policy, enabled: true, action: "hibernate", countdown_seconds: 15, ups_poweroff: true, ups_poweroff_delay_seconds: 180 };
   data.ups_poweroff = observedSequenceCapability();
   await pushStatus(ui, data);
   ui.get("policy-countdown").value = "120";
   ui.get("policy-ups-delay").value = "9";
   ui.get("policy-form").emit("input");
-  assert.match(ui.get("protection-preview-wait").textContent, /120 s para cancelar/);
-  assert.match(ui.get("protection-preview-ups").textContent, /9 min después/);
+  assert.equal(ui.get("protection-preview-action").textContent, "A los 120 s");
+  assert.equal(ui.get("protection-preview-ups").textContent, "+9 min");
   assert.doesNotMatch(ui.get("ups-power-sequence-warning").textContent, /fuera.*secuencia|no se programará/);
   await pushStatus(ui, data);
   assert.equal(ui.get("policy-countdown").value, "120");
@@ -2584,34 +2848,73 @@ test("saving longer cancellation and UPS delays preserves both actions without a
   const request = ui.calls.at(-1);
   const body = JSON.parse(request.options.body);
   assert.equal(body.countdown_seconds, 120);
+  assert.equal(Object.hasOwn(body, "on_battery_seconds"), false);
   assert.equal(body.ups_poweroff_delay_seconds, 540);
   assert.equal(body.ups_poweroff, true);
   request.respond({ ...data, policy: { ...data.policy, countdown_seconds: 120, ups_poweroff_delay_seconds: 540 } });
   await pending;
-  assert.match(ui.get("protection-preview-ups").textContent, /9 min después/);
+  assert.equal(ui.get("protection-preview-ups").textContent, "+9 min");
 });
 
-test("the three-step preview updates the initial wait and action while leaving eligibility to the backend", async () => {
+test("the configured thirty-second countdown survives loading and unrelated changes without reintroducing an initial wait", async () => {
   const { ui, data } = await currentUi();
-  data.policy = { ...data.policy, action: "hibernate", on_battery_seconds: 0, countdown_seconds: 15, ups_poweroff: true };
+  data.policy = { ...data.policy, countdown_seconds: 30, action: "hibernate", ups_poweroff: true, ups_poweroff_delay_seconds: 180 };
   data.ups_poweroff = observedSequenceCapability();
   await pushStatus(ui, data);
-  ui.get("policy-on-battery").value = "1";
+  assert.equal(ui.get("policy-countdown").value, 30);
+  assert.equal(ui.get("policy-countdown-note").textContent, "Puedes cancelar durante estos 30 segundos.");
+  ui.get("policy-ups-delay").value = "4";
   ui.get("policy-form").emit("input");
-  assert.match(ui.get("protection-preview-wait").textContent, /Tras 1 min con batería/);
-  ui.get("policy-on-battery").value = "0";
+  const pending = ui.get("policy-form").emit("submit");
+  const request = ui.calls.at(-1);
+  const body = JSON.parse(request.options.body);
+  assert.equal(body.countdown_seconds, 30);
+  assert.equal(body.ups_poweroff_delay_seconds, 240);
+  assert.equal(Object.hasOwn(body, "on_battery_seconds"), false);
+  request.respond({ ...data, policy: body });
+  await pending;
+  assert.equal(ui.get("policy-countdown").value, 30);
+});
+
+test("the three-step preview updates its single countdown and Windows action while leaving eligibility to the backend", async () => {
+  const { ui, data } = await currentUi();
+  data.policy = { ...data.policy, action: "hibernate", countdown_seconds: 15, ups_poweroff: true };
+  data.ups_poweroff = observedSequenceCapability();
+  await pushStatus(ui, data);
+  ui.get("policy-countdown").value = "30";
+  ui.get("policy-form").emit("input");
+  assert.equal(ui.get("policy-countdown-label").textContent, "Tiempo antes de hibernar");
+  assert.equal(ui.get("ups-power-delay").textContent, "De 1 a 9 min, desde la solicitud de hibernación.");
+  assert.equal(ui.get("policy-countdown-note").textContent, "Puedes cancelar durante estos 30 segundos.");
+  assert.equal(ui.get("protection-preview-action-detail").textContent, "Se solicita hibernar Windows");
+  assert.equal(ui.get("battery-protection-subtitle").textContent, "Adelantar la hibernación");
   ui.get("policy-action").value = "shutdown";
   ui.get("policy-form").emit("input");
-  assert.match(ui.get("protection-preview-wait").textContent, /s para cancelar toda la protección/);
-  assert.match(ui.get("protection-preview-action").textContent, /Windows empieza a apagarse/);
-  assert.match(ui.get("protection-preview-ups").textContent, /3 min después/);
+  assert.equal(ui.get("policy-countdown-label").textContent, "Tiempo antes de apagar");
+  assert.equal(ui.get("ups-power-delay").textContent, "De 1 a 9 min, desde la solicitud de apagado.");
+  assert.equal(ui.get("protection-preview-wait").textContent, "Aviso inmediato.");
+  assert.equal(ui.get("protection-preview-action").textContent, "A los 30 s");
+  assert.equal(ui.get("protection-preview-action-detail").textContent, "Se solicita apagar Windows");
+  assert.equal(ui.get("battery-protection-subtitle").textContent, "Adelantar el apagado de Windows");
+  assert.equal(ui.get("protection-preview-ups").textContent, "+3 min");
   assert.equal(ui.calls.some((call) => call.options.method === "POST"), false);
+  const pending = ui.get("policy-form").emit("submit");
+  const request = ui.calls.at(-1);
+  const body = JSON.parse(request.options.body);
+  assert.equal(body.action, "shutdown");
+  assert.equal(body.countdown_seconds, 30);
+  assert.equal(body.ups_poweroff_delay_seconds, 180);
+  assert.equal(body.ups_poweroff, true);
+  assert.equal(Object.hasOwn(body, "on_battery_seconds"), false);
+  request.respond({ ...data, policy: body });
+  await pending;
+  assert.equal(ui.get("battery-protection-subtitle").textContent, "Adelantar el apagado de Windows");
 });
 
 for (const countdown of [10, 30, 120]) {
   test(`configured UPS simulation at ${countdown} seconds does not impose a ten-second profile limit`, async () => {
     const { ui, data } = await currentUi();
-    data.policy = { ...data.policy, action: "hibernate", on_battery_seconds: 0, countdown_seconds: countdown, ups_poweroff: true, ups_poweroff_delay_seconds: 240 };
+    data.policy = { ...data.policy, action: "hibernate", countdown_seconds: countdown, ups_poweroff: true, ups_poweroff_delay_seconds: 240 };
     data.ups_poweroff = observedSequenceCapability();
     await pushStatus(ui, data);
     assert.match(ui.get("test-description").textContent, new RegExp(`${countdown} s.*240 s desde el envío`));
@@ -2634,7 +2937,7 @@ function reviewableUpsCapability(changes = {}) {
 test("closing an automatic UPS cycle review requires a manual acknowledgement and sends only metadata for its operation", async () => {
   const { ui, data } = await currentUi();
   assert.equal(ui.get("ups-power-review").hidden, true);
-  data.policy = { ...data.policy, enabled: true, action: "hibernate", on_battery_seconds: 0, countdown_seconds: 10, ups_poweroff: true };
+  data.policy = { ...data.policy, enabled: true, action: "hibernate", countdown_seconds: 10, ups_poweroff: true };
   data.ups_poweroff = reviewableUpsCapability();
   await pushStatus(ui, data);
   assert.equal(ui.get("ups-power-review").hidden, false);
@@ -2744,7 +3047,7 @@ test("Protection is the second sidebar destination and keyboard order matches th
 
 test("production Protection contains settings, harmless simulation and cycle review without manual test cards or dialogs", async () => {
   const { ui, data } = await currentUi({}, { navigation: true });
-  data.policy = { ...data.policy, enabled: true, action: "hibernate", on_battery_seconds: 0, countdown_seconds: 10, ups_poweroff: true };
+  data.policy = { ...data.policy, enabled: true, action: "hibernate", countdown_seconds: 10, ups_poweroff: true };
   data.ups_poweroff = observedSequenceCapability();
   data.ups_cancel_test = { state: "finished", result: "cancel_observed_by_user" };
   data.ups_battery_test = { state: "finished", result: "automatic_return_observed", windows_request: "unconfirmed" };
@@ -2806,34 +3109,39 @@ test("pending battery diagnostics distinguish a rejected request from unconfirme
   assert.equal(ui.calls.some((call) => call.options.method === "POST"), false);
 });
 
-test("Protection is always expanded and its three-step preview uses the configured wait, cancellation and UPS delay", async () => {
+test("Protection is always expanded and its preview uses one Windows countdown and an independent UPS delay", async () => {
   const { ui, data } = await currentUi({}, { navigation: true });
-  data.policy = { enabled: false, ups_poweroff: true, action: "hibernate", on_battery_seconds: 0 };
+  data.policy = { enabled: false, ups_poweroff: true, action: "hibernate" };
   data.ups_poweroff = observedSequenceCapability();
   await pushStatus(ui, data);
   ui.open("protection");
   const page = html.match(/<section id="page-protection"[\s\S]*?(?=<section id="page-system")/)[0];
-  assert.doesNotMatch(page, /<details|id="settings-toggle"|aria-expanded|disclosure-arrow/);
+  assert.doesNotMatch(page, /id="settings-toggle"|aria-expanded|disclosure-arrow/);
+  assert.equal([...page.matchAll(/<details\b/g)].length, 1, "only operating details and the previous block history are collapsible");
+  assert.equal(ui.get("ups-power-block-history").hidden, false, "operating details remain accessible without a previous block");
+  assert.equal(ui.get("ups-power-last-block").hidden, true);
   assert.equal(ui.document.getElementById("settings-toggle"), null);
   assert.equal(ui.get("settings-panel").hidden, false);
   assert.equal(ui.get("policy-countdown").value, 15);
   assert.equal(ui.get("policy-ups-delay").value, 3);
-  assert.match(ui.get("protection-preview-wait").textContent, /s para cancelar toda la protección/);
-  assert.match(ui.get("protection-preview-wait").textContent, /15 s para cancelar/);
-  assert.match(ui.get("protection-preview-action").textContent, /PC empieza a hibernar/);
-  assert.match(ui.get("protection-preview-ups").textContent, /3 min después/);
-  ui.get("policy-on-battery").value = "0.5";
+  assert.equal(ui.get("protection-preview-wait").textContent, "Aviso inmediato.");
+  assert.equal(ui.get("protection-preview-action").textContent, "A los 15 s");
+  assert.equal(ui.get("protection-preview-action-detail").textContent, "Se solicita hibernar Windows");
+  assert.equal(ui.get("protection-preview-ups").textContent, "+3 min");
   ui.get("policy-countdown").value = "120";
   ui.get("policy-ups-delay").value = "1";
   ui.get("policy-form").emit("input");
-  assert.match(ui.get("protection-preview-wait").textContent, /30 s/);
-  assert.match(ui.get("protection-preview-wait").textContent, /120 s para cancelar/);
-  assert.match(ui.get("protection-preview-ups").textContent, /1 min después/);
-  assert.equal(ui.get("protection-preview-ups-detail").textContent, "El UPS corta la energía de sus salidas.");
+  assert.equal(ui.document.getElementById("policy-on-battery"), null);
+  assert.equal(ui.get("protection-preview-action").textContent, "A los 120 s");
+  assert.equal(ui.get("protection-preview-ups").textContent, "+1 min");
+  assert.equal(ui.get("protection-preview-ups-detail").textContent, "Ahora está bloqueado. Revisa las condiciones del UPS.");
   assert.match(html, /temporizador del UPS no espera una confirmación de que Windows terminó/);
-  assert.match(page, /Cancelar la cuenta atrás anula PC y UPS hasta el próximo corte/);
-  assert.match(page, /La batería baja puede adelantar/);
-  assert.match(page, /Si faltan condiciones.*se mantiene la protección de la PC/);
+  const notes = page.match(/<ul class="protection-notes">[\s\S]*?<\/ul>/)[0];
+  assert.match(notes, /Si vuelve la luz durante la cuenta atrás, se cancela la actuación/);
+  assert.match(notes, /id="ups-power-restart"/);
+  assert.match(notes, /El temporizador del UPS no espera una confirmación de que Windows terminó/);
+  assert.match(notes, /0 % desactiva la prioridad por porcentaje.*alarma crítica del UPS sigue atendida/);
+  assert.match(notes, /porcentaje estimado no es una medición directa del UPS/);
 });
 
 test("the only protection-cancel button cancels Windows and UPS through one endpoint and can be reopened from the live banner", async () => {
@@ -2899,15 +3207,16 @@ test("the global countdown banner is absent outside a real or simulated active c
   assert.equal(ui.calls.some((call) => call.options.method === "POST"), false);
 });
 
-test("an unavailable UPS keeps its backend admission visible in simple language without disabling Windows protection", async () => {
+test("an unavailable UPS keeps the exact backend reason visible without disabling Windows protection", async () => {
   const { ui, data } = await currentUi();
   data.policy = { ...data.policy, enabled: true, action: "hibernate", ups_poweroff: true, countdown_seconds: 15, ups_poweroff_delay_seconds: 180 };
   const reason = "La lectura, carga o tensión quedó fuera de la secuencia observada; requiere una nueva lectura válida de red.";
   data.ups_poweroff = observedSequenceCapability({ available: false, reason, sequence_admission: { available: false, reason } });
   await pushStatus(ui, data);
-  assert.equal(ui.get("ups-power-capability").textContent, "El UPS no está listo para un corte automático: revisa la carga y la batería.");
+  assert.equal(ui.get("ups-power-capability").textContent, reason);
+  assert.equal(ui.get("ups-power-capability").hidden, false);
+  assert.equal(ui.get("ups-power-availability").textContent, "Bloqueado ahora");
   assert.equal(ui.get("ups-power-sequence-warning").hidden, true);
-  assert.match(html, /Si faltan condiciones para cortar el UPS, se mantiene la protección de la PC/);
   assert.equal(ui.get("policy-enabled").checked, true);
   assert.equal(ui.calls.some((call) => call.options.method === "POST"), false);
 });
@@ -2917,15 +3226,17 @@ test("the preview precedes settings and keeps separate steps for the warning, Wi
   const page = html.match(/<section id="page-protection"[\s\S]*?(?=<section id="page-system")/)[0];
   assert.ok(page.indexOf('class="protection-preview"') < page.indexOf('id="policy-fields"'));
   assert.doesNotMatch(page, /id="ups-power-sequence"/);
-  assert.match(page, /Espera antes del aviso/);
-  assert.match(page, /0 muestra el aviso inmediatamente/);
+  assert.doesNotMatch(page, /Espera antes del aviso|policy-on-battery|policy-wait-note/);
+  assert.match(page, /Tiempo antes de hibernar/);
+  assert.match(page, /Si vuelve la luz durante la cuenta atrás, se cancela la acción\. El aviso permanece hasta pulsar Entendido\./);
   assert.match(page, /Apagar el UPS después de/);
-  data.policy = { ...data.policy, on_battery_seconds: 0, countdown_seconds: 15, action: "hibernate", ups_poweroff: true, ups_poweroff_delay_seconds: 180 };
+  data.policy = { ...data.policy, countdown_seconds: 15, action: "hibernate", ups_poweroff: true, ups_poweroff_delay_seconds: 180 };
   await pushStatus(ui, data);
-  assert.equal(ui.get("protection-preview-countdown").textContent, "Se detecta el corte");
-  assert.match(ui.get("protection-preview-wait").textContent, /15 s para cancelar toda la protección/);
-  assert.equal(ui.get("protection-preview-action").textContent, "La PC empieza a hibernar");
-  assert.equal(ui.get("protection-preview-ups").textContent, "Unos 3 min después");
+  assert.equal(ui.get("protection-preview-countdown").textContent, "Corte detectado");
+  assert.equal(ui.get("protection-preview-wait").textContent, "Aviso inmediato.");
+  assert.equal(ui.get("protection-preview-action").textContent, "A los 15 s");
+  assert.equal(ui.get("protection-preview-action-detail").textContent, "Se solicita hibernar Windows");
+  assert.equal(ui.get("protection-preview-ups").textContent, "+3 min");
   data.policy.ups_poweroff = false;
   await pushStatus(ui, data);
   assert.equal(ui.get("protection-preview-ups").textContent, "El UPS permanece encendido");
@@ -2966,15 +3277,14 @@ test("the production timeline has three inline SVG device icons and each input k
   assert.equal([...timeline.matchAll(/<svg\b/g)].length, 3);
   assert.doesNotMatch(timeline, /<img|data:image/);
   assert.doesNotMatch(page, /Protege tu trabajo|Una cuenta atrás para cancelar toda|id="policy-state"|id="policy-action-description"|Se programa cuando se solicita/);
-  const waitLabel = page.match(/<label>Espera antes del aviso[\s\S]*?<\/label>/)[0];
-  const countdownLabel = page.match(/<label>Tiempo para cancelar[\s\S]*?<\/label>/)[0];
+  const countdownLabel = page.match(/<label><span id="policy-countdown-label"[\s\S]*?<\/label>/)[0];
   const upsLabel = page.match(/<label class="ups-delay-field">[\s\S]*?<\/label>/)[0];
-  assert.match(waitLabel, /id="policy-on-battery"[\s\S]*id="policy-wait-note"[^>]*>0 muestra el aviso inmediatamente/);
-  assert.match(countdownLabel, /id="policy-countdown"[\s\S]*id="policy-countdown-note"[^>]*>De 10 a 120 segundos/);
+  assert.doesNotMatch(page, /policy-on-battery|policy-wait-note/);
+  assert.match(countdownLabel, /id="policy-countdown"[\s\S]*id="policy-countdown-note"[^>]*>Puedes cancelar/);
   assert.match(upsLabel, /id="policy-ups-delay"[\s\S]*id="ups-power-delay"/);
 });
 
-test("healthy UPS capability copy disappears only when actually available and no operation needs attention", async () => {
+test("healthy UPS availability uses the four condition rows while blocked operations keep the exact reason visible", async () => {
   const { ui, data } = await currentUi({}, { navigation: true });
   data.ups_poweroff = observedSequenceCapability({ available: true, reason: "Disponible para configurar.", sequence_admission: { available: true }, operation: { state: "idle" } });
   await pushStatus(ui, data);
@@ -2983,7 +3293,11 @@ test("healthy UPS capability copy disappears only when actually available and no
   for (const phase of ["idle", "completed", "cancelled"]) {
     data.ups_poweroff.operation.state = phase;
     await pushStatus(ui, data);
-    assert.equal(ui.get("ups-power-capability").hidden, true, phase);
+    assert.equal(ui.get("ups-power-capability").hidden, true, "healthy explanatory text does not duplicate the current condition rows");
+    assert.equal(ui.get("ups-power-availability").textContent, "Disponible ahora");
+    assert.equal(ui.get("ups-power-checks").hidden, false);
+    assert.equal(ui.get("ups-power-checks").children.length, 4);
+    assert.ok(ui.get("ups-power-checks").children.every((row) => row.dataset.state === "passed"), phase);
   }
   data.ups_poweroff.available = false;
   data.ups_poweroff.can_configure = true;
@@ -2991,13 +3305,255 @@ test("healthy UPS capability copy disappears only when actually available and no
   await pushStatus(ui, data);
   assert.equal(ui.get("ups-power-capability").hidden, false);
   assert.match(ui.get("ups-power-capability").textContent, /lectura reciente sin batería baja/);
-  data.ups_poweroff.available = true;
+  data.ups_poweroff.available = false;
   data.ups_poweroff.operation.state = "review_required";
   data.ups_poweroff.reason = "La operación anterior requiere revisión.";
   await pushStatus(ui, data);
   assert.equal(ui.get("ups-power-capability").hidden, false);
   assert.match(ui.get("ups-power-capability").textContent, /requiere revisión/);
   assert.equal(ui.calls.some((call) => call.options.method === "POST"), false);
+});
+
+function fourUpsBlockers(changes = {}) {
+  return ["connection", "windows", "operation", "controlled_shutdown"].map((key) => ({ key, blocked: false, reason: null, reasons: [], ...changes[key] }));
+}
+
+test("UPS protection shows exactly four current blockers and ignores removed voltage, load and historical prerequisites", async () => {
+  const { ui, data } = await currentUi();
+  data.policy = { ...data.policy, enabled: true, action: "hibernate", countdown_seconds: 10, ups_poweroff: true, ups_poweroff_delay_seconds: 60 };
+  data.ups_poweroff = observedSequenceCapability({ available: true, reason: "Condiciones actuales válidas.",
+    blockers: fourUpsBlockers(),
+    sequence_admission: { available: true, checks: [
+      { key: "battery_voltage", label: "Límite de voltaje antiguo", passed: false, value: 25.18 },
+      { key: "load_percent", label: "Carga inferior al 100 %", passed: false, value: 100 },
+      { key: "sequence_continuity", label: "Red eléctrica previa", passed: false },
+    ] } });
+  await pushStatus(ui, data);
+  assert.equal(ui.get("ups-power-availability").textContent, "Disponible ahora");
+  assert.equal(ui.get("ups-power-checks").children.length, 4);
+  assert.deepEqual(ui.get("ups-power-checks").children.map((row) => row.dataset.check), ["connection", "windows", "operation", "controlled_shutdown"]);
+  assert.match(textOf(ui.get("ups-power-checks")), /UPS conectado y compatible.*Windows preparado para hibernar.*Sin otra operación de energía pendiente.*Apagado controlado disponible/);
+  assert.ok(ui.get("ups-power-checks").children.every((row) => row.dataset.state === "passed"));
+  assert.match(ui.get("ups-power-conditions-note").textContent, /voltaje y la carga no bloquean/);
+  assert.doesNotMatch(textOf(ui.get("ups-power-checks")), /25[.,]18|100 %|Red eléctrica previa/);
+  assert.equal(ui.get("protection-preview-action").textContent, "A los 10 s");
+  assert.equal(ui.get("protection-preview-ups").textContent, "+1 min");
+  assert.equal(ui.get("protection-preview-ups-detail").textContent, "Corte programado del UPS.");
+  assert.equal(ui.calls.some((call) => call.options.method === "POST"), false);
+});
+
+test("a failed operating check keeps its exact reason visible while the user edits either timer", async () => {
+  const { ui, data } = await currentUi();
+  const reason = "El UPS reporta batería crítica; una orden podría cortar inmediatamente. Se prioriza hibernar Windows.";
+  data.policy = { ...data.policy, enabled: true, action: "hibernate", ups_poweroff: true, countdown_seconds: 10, ups_poweroff_delay_seconds: 60 };
+  data.ups_poweroff = observedSequenceCapability({ available: false, reason, reason_code: "low_battery",
+    checks: [{ key: "low_battery", label: "Sin alarma crítica del UPS", passed: false, blocking: true, severity: "critical", reason }],
+    sequence_admission: { available: false, reason } });
+  await pushStatus(ui, data);
+  assert.equal(ui.get("ups-power-availability").textContent, "Bloqueado ahora");
+  assert.match(textOf(ui.get("ups-power-checks")), /Bloqueado/);
+  assert.equal(ui.get("ups-power-checks").children[3].dataset.state, "blocked");
+  assert.ok(textOf(ui.get("ups-power-checks")).includes(reason));
+  ui.get("policy-countdown").value = "30";
+  ui.get("policy-ups-delay").value = "3";
+  ui.get("policy-form").emit("input");
+  assert.equal(ui.get("ups-power-capability").hidden, false);
+  assert.equal(ui.get("ups-power-capability").textContent, reason);
+  assert.equal(ui.get("protection-preview-ups-detail").textContent, "Ahora está bloqueado. Revisa las condiciones del UPS.");
+  assert.equal(ui.get("policy-enabled").checked, true);
+  assert.equal(ui.get("policy-ups-poweroff").disabled, false);
+  ui.poll(); ui.calls.at(-1).reject(new TypeError("offline")); await flush();
+  assert.equal(ui.get("ups-power-availability").textContent, "Sin confirmar");
+  assert.equal(ui.get("ups-power-checks").children[0].dataset.state, "unknown");
+  assert.match(textOf(ui.get("ups-power-checks")), /Sin confirmar/);
+  assert.equal(ui.calls.some((call) => call.options.method === "POST"), false);
+});
+
+test("each of the four blocker categories displays its exact reasons without hiding other categories", async () => {
+  const { ui, data } = await currentUi();
+  const cases = [
+    ["connection", "El UPS no responde por USB."],
+    ["windows", "La hibernación no está disponible en Windows."],
+    ["operation", "Ya hay una orden de apagado pendiente."],
+    ["controlled_shutdown", "El UPS reporta batería crítica; la orden podría cortar inmediatamente."],
+  ];
+  for (const [key, reason] of cases) {
+    data.ups_poweroff = observedSequenceCapability({ available: false, reason,
+      blockers: fourUpsBlockers({ [key]: { blocked: true, reason, reasons: [reason] } }),
+      sequence_admission: { available: false, reason } });
+    await pushStatus(ui, data);
+    const rows = ui.get("ups-power-checks").children;
+    assert.equal(rows.length, 4);
+    assert.equal(rows.filter((row) => row.dataset.state === "blocked").length, 1);
+    const row = rows.find((item) => item.dataset.check === key);
+    assert.equal(row.dataset.state, "blocked");
+    assert.ok(textOf(row).includes(reason));
+    assert.equal(textOf(row).split(reason).length - 1, 1, "the reason is not duplicated between reason and reasons");
+    assert.equal(ui.get("ups-power-availability").textContent, "Bloqueado ahora");
+  }
+  const reason = "El UPS reporta una falla.";
+  const detail = "No se puede garantizar que respete el retardo configurado.";
+  data.ups_poweroff.blockers = fourUpsBlockers({ controlled_shutdown: { blocked: true, reason, reasons: [detail] } });
+  await pushStatus(ui, data);
+  const row = ui.get("ups-power-checks").children[3];
+  assert.ok(textOf(row).includes(reason));
+  assert.ok(textOf(row).includes(detail));
+  data.ups_poweroff.blockers = fourUpsBlockers({ controlled_shutdown: { blocked: true, reason: `${reason} ${detail}`, reasons: [reason, detail] } });
+  await pushStatus(ui, data);
+  assert.equal(textOf(ui.get("ups-power-checks").children[3]).split(reason).length - 1, 1, "an aggregate reason does not repeat its details");
+  ui.poll(); ui.calls.at(-1).reject(new TypeError("offline")); await flush();
+  assert.equal(ui.get("ups-power-availability").textContent, "Sin confirmar");
+  assert.ok(ui.get("ups-power-checks").children.every((item) => item.dataset.state === "unknown"));
+  assert.doesNotMatch(textOf(ui.get("ups-power-checks")), /El UPS reporta una falla/, "a stale alarm is not shown as a current condition");
+});
+
+test("native USB exposes a percentage threshold and saves it without changing either configured timer", async () => {
+  const { ui, data } = await currentUi({ battery_percent_estimate: 35, battery_estimate_method: "nt2402pro-pmv-qs-v1" });
+  data.policy = { ...data.policy, enabled: true, action: "hibernate", low_battery_percent: 20, countdown_seconds: 30, ups_poweroff: true, ups_poweroff_delay_seconds: 180 };
+  await pushStatus(ui, data);
+  assert.equal(ui.get("policy-battery-field").hidden, false);
+  assert.equal(ui.get("policy-low-battery").value, 20);
+  assert.equal(ui.get("policy-low-battery").getAttribute("aria-describedby"), "policy-battery-help policy-battery-source");
+  assert.equal(ui.get("policy-battery-source").textContent, "Actual: 35 % estimado");
+  assert.match(ui.get("policy-battery-source").title, /no mide directamente/);
+  assert.match(ui.get("policy-battery-help").textContent, /Si estás usando batería.*10 s como máximo.*retardo del UPS no cambia/);
+  assert.match(ui.get("battery-note").title, /protección por porcentaje/);
+  const page = html.match(/<section id="page-protection"[\s\S]*?(?=<section id="page-system")/)[0];
+  assert.match(page, /Batería baja/);
+  assert.equal([...page.matchAll(/<input\b[^>]*type="number"/g)].length, 4, "only percentage, hidden legacy runtime, Windows countdown and UPS delay inputs exist");
+  ui.get("policy-low-battery").value = "15";
+  ui.get("policy-form").emit("input");
+  await pushStatus(ui, data);
+  assert.equal(ui.get("policy-low-battery").value, "15", "polling preserves an edited threshold");
+  const saved = ui.get("policy-form").emit("submit");
+  const request = ui.calls.at(-1);
+  assert.equal(request.url, "/api/policy");
+  const body = JSON.parse(request.options.body);
+  assert.equal(body.low_battery_percent, 15);
+  assert.equal(body.countdown_seconds, 30);
+  assert.equal(body.ups_poweroff_delay_seconds, 180);
+  request.respond({ ...data, policy: { ...data.policy, low_battery_percent: 15 } }); await saved;
+  assert.equal(ui.get("policy-low-battery").value, 15);
+});
+
+test("percentage alerts honor the saved threshold, prefer native charge and label estimates explicitly", async () => {
+  const { ui, data } = await currentUi({ on_battery: true, battery_percent: 30, battery_percent_estimate: 5, battery_estimate_method: "nt2402pro-pmv-qs-v1" });
+  data.policy.low_battery_percent = 10;
+  await pushStatus(ui, data);
+  assert.equal(ui.get("critical-dialog").open, false);
+  assert.match(ui.get("policy-battery-source").textContent, /30 %.*reportado por el UPS/);
+  data.sample = liveSample({ on_battery: true, battery_percent_estimate: 11, battery_estimate_method: "nt2402pro-pmv-qs-v1" }, ui.now());
+  await pushStatus(ui, data);
+  assert.equal(ui.get("critical-dialog").open, false);
+  data.sample = liveSample({ on_battery: true, battery_percent_estimate: 10, battery_estimate_method: "nt2402pro-pmv-qs-v1" }, ui.now());
+  await pushStatus(ui, data);
+  assert.equal(ui.get("critical-dialog").open, true);
+  assert.match(textOf(ui.get("critical-list")), /Carga estimada de batería: 10 %.*Umbral configurado: 10 %/);
+  assert.equal(ui.get("battery-bar").classList.contains("low"), true);
+});
+
+test("an unknown twenty-percent estimate stays informational and cannot claim percentage priority", async () => {
+  const { ui, data } = await currentUi({ on_battery: true, battery_percent_estimate: 20, battery_estimate_method: "unknown-estimator" });
+  data.policy.low_battery_percent = 20;
+  await pushStatus(ui, data);
+  assert.equal(ui.get("battery-percent").textContent, "20");
+  assert.equal(ui.get("battery-note").textContent, "Carga estimada");
+  assert.match(ui.get("battery-note").title, /Estimación informativa.*no se usa en la protección por porcentaje/);
+  assert.match(ui.get("policy-battery-source").textContent, /20 %.*estimado.*Estimación informativa.*no se usa/);
+  assert.match(ui.get("policy-battery-help").textContent, /estimación actual es solo informativa/);
+  assert.doesNotMatch(ui.get("policy-battery-help").textContent, /se reduce a 10 s/);
+  assert.equal(ui.get("battery-bar").classList.contains("low"), false);
+  assert.equal(ui.get("policy-battery-emergency").hidden, true);
+  assert.equal(ui.get("critical-dialog").open, false);
+  data.sample.low_battery = true;
+  await pushStatus(ui, data);
+  assert.equal(ui.get("critical-dialog").open, true);
+  assert.match(textOf(ui.get("critical-list")), /El UPS ha enviado la señal de batería baja/);
+});
+
+test("legacy informational readings do not become additional blocking rows", async () => {
+  const { ui, data } = await currentUi();
+  for (const value of [null, 0]) {
+    data.ups_poweroff = observedSequenceCapability({ available: true, sequence_admission: { available: true },
+      checks: [{ key: "battery_voltage", label: "Voltaje de batería informativo", passed: true, blocking: false, severity: "info", value }] });
+    await pushStatus(ui, data);
+    assert.equal(ui.get("ups-power-availability").textContent, "Disponible ahora");
+    assert.equal(ui.get("ups-power-checks").children.length, 4);
+    assert.ok(ui.get("ups-power-checks").children.every((row) => row.dataset.state === "passed"));
+    assert.doesNotMatch(textOf(ui.get("ups-power-checks")), /Voltaje|Requisito|Bloqueado/);
+  }
+});
+
+test("percentage emergency explains the shorter Windows countdown and keeps the selected UPS delay", async () => {
+  const { ui, data } = await currentUi({ on_battery: true, battery_percent_estimate: 18, battery_estimate_method: "nt2402pro-pmv-qs-v1" });
+  data.policy = { ...data.policy, enabled: true, action: "hibernate", low_battery_percent: 20, countdown_seconds: 120, ups_poweroff: true, ups_poweroff_delay_seconds: 180 };
+  data.protection = { state: "countdown", countdown_remaining: 8, configured_countdown_seconds: 120, effective_countdown_seconds: 10,
+    emergency: { active: true, source: "estimated_percentage", percent: 18, threshold_percent: 20, seconds_limit: 10, immediate: false } };
+  await pushStatus(ui, data);
+  assert.equal(ui.get("policy-battery-emergency").hidden, false);
+  assert.match(ui.get("policy-battery-emergency").textContent, /estimada: 18 %.*umbral de 20 %.*10 s.*conserva el retardo/);
+  assert.equal(ui.get("policy-countdown").value, 120, "an emergency does not overwrite the saved normal countdown");
+  assert.equal(ui.get("policy-ups-delay").value, 3);
+  assert.equal(ui.get("critical-countdown-time").textContent, "00:08", "the visible countdown uses the actual deadline rather than the normal configured duration");
+  data.sample.low_battery = true;
+  data.protection.countdown_remaining = 0;
+  data.protection.emergency = { active: true, source: "ups_critical_alarm", percent: 18, threshold_percent: 20, seconds_limit: 10, immediate: true };
+  await pushStatus(ui, data);
+  assert.match(ui.get("policy-battery-emergency").textContent, /batería crítica.*prioridad inmediata.*No se programa.*podría cortar la energía/);
+  assert.equal(ui.get("policy-ups-delay").value, 3);
+});
+
+test("zero disables percentage priority visibly while the UPS critical alarm still raises attention", async () => {
+  const { ui, data } = await currentUi({ on_battery: true, battery_percent: 50 });
+  data.policy.low_battery_percent = 0;
+  data.sample = liveSample({ on_battery: true, battery_percent_estimate: 0, battery_estimate_method: "nt2402pro-pmv-qs-v1" }, ui.now());
+  await pushStatus(ui, data);
+  assert.equal(ui.get("critical-dialog").open, false);
+  assert.match(ui.get("policy-battery-help").textContent, /prioridad por porcentaje está desactivada.*alarma crítica/);
+  assert.equal(ui.get("policy-battery-emergency").hidden, true);
+  data.sample.low_battery = true;
+  await pushStatus(ui, data);
+  assert.equal(ui.get("critical-dialog").open, true);
+  assert.match(textOf(ui.get("critical-list")), /El UPS ha enviado la señal de batería baja/);
+});
+
+test("a UPS block remains in the durable global notice after mains recovery and reload until Entendido", async () => {
+  const { ui, data } = await currentUi();
+  const reason = "Se perdió la comunicación USB antes de enviar la orden de apagado.";
+  const blockedAt = new Date(ui.now()).toISOString();
+  data.notifications.pending = [pendingNotice(ui, { kind: "ups_poweroff_blocked", title: "Corte del UPS bloqueado", message: reason })];
+  data.ups_poweroff = observedSequenceCapability({ available: false, reason, sequence_admission: { available: false, reason },
+    last_block: { reason, timestamp: blockedAt } });
+  data.sample = liveSample({ on_battery: true }, ui.now());
+  await pushStatus(ui, data);
+  assert.equal(ui.get("critical-dialog").open, true);
+  assert.match(textOf(ui.get("critical-list")), /Corte del UPS bloqueado.*comunicación USB.*Pendiente de Entendido/);
+  ui.advance(5000);
+  data.sample = liveSample({}, ui.now());
+  data.ups_poweroff.available = true;
+  data.ups_poweroff.reason = "Condiciones actuales válidas.";
+  data.ups_poweroff.sequence_admission = { available: true };
+  data.notifications.pending[0].resolved_at = new Date(ui.now()).toISOString();
+  await pushStatus(ui, data);
+  assert.equal(ui.get("ups-power-availability").textContent, "Disponible ahora");
+  assert.equal(ui.get("critical-dialog").open, true);
+  assert.match(textOf(ui.get("critical-list")), /Corte del UPS bloqueado.*comunicación USB.*Pendiente de Entendido/);
+  assert.equal(ui.get("ups-power-block-history").hidden, false);
+  assert.equal(ui.get("ups-power-block-history").open, false, "history is collapsed while the current UPS is ready");
+  assert.equal(ui.get("ups-power-last-block").hidden, false);
+  assert.ok(ui.get("ups-power-last-block").textContent.includes(reason));
+  const reloaded = harness();
+  reloaded.calls[0].respond(data); await flush();
+  assert.equal(reloaded.get("critical-dialog").open, true);
+  assert.ok(textOf(reloaded.get("critical-list")).includes(reason));
+  const acknowledged = reloaded.get("critical-ack").emit("click");
+  assert.equal(reloaded.calls.at(-1).url, "/api/notifications/ack");
+  data.notifications.pending = [];
+  reloaded.calls.at(-1).respond(data); await acknowledged;
+  assert.equal(reloaded.get("critical-dialog").open, false);
+  assert.ok(reloaded.get("ups-power-last-block").textContent.includes(reason));
+  await pushStatus(reloaded, data);
+  assert.equal(reloaded.get("critical-dialog").open, false);
 });
 
 async function connectedWebhooks(settings = {}, options = {}) {

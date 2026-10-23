@@ -10,7 +10,7 @@ from unittest.mock import Mock, patch
 import uuid
 
 from ups_monitor import hid_windows as hid
-from ups_monitor.ups_power import OperationJournal, UpsPowerBlocked
+from ups_monitor.ups_power import OperationJournal, UpsPowerBlocked, OPERATIONAL_LIMITS
 from tests.test_hid_cancel_test import fake_apis, QS_SAMPLE
 from tests.test_ups_power import DEVICE, unreliable_profile
 
@@ -287,6 +287,54 @@ class ProductionControlGuardTests(unittest.TestCase):
                 with self.subTest(selected=selected):
                     self.assertEqual(hid.control_worker_main(arguments), 1)
         apis.assert_not_called()
+
+    def operational_countdown(self):
+        raw = self.configurable_operation(60)
+        self.profile["operational_limits"] = OPERATIONAL_LIMITS.copy()
+        self.operation["sequence_evidence"] = {
+            "kind": "battery_countdown", "version": 2,
+            "profile_id": self.profile["profile_id"], "device_fingerprint": self.profile["device_fingerprint"],
+            "battery_started_monotonic": 80, "last_sample_monotonic": 110, "countdown_seconds": 10}
+        self.journal.write(self.operation)
+        arguments = self.arguments("shutdown")
+        arguments[3] = "60"
+        return raw, arguments
+
+    def test_current_battery_countdown_without_ac_history_writes_once_even_at_high_load(self):
+        raw, arguments = self.operational_countdown()
+        raw = raw.replace(b"\x20\x08\x20", b"\x20\x64\x20")
+        apis = fake_apis()
+        with patch.object(hid, "_apis", return_value=apis), patch.object(hid, "_query_status_once", return_value=raw), \
+                patch("sys.stdout", Mock(buffer=io.BytesIO())):
+            self.assertEqual(hid.control_worker_main(arguments), 0)
+        reports = [bytes(call.args[1]) for call in apis[1].HidD_SetOutputReport.call_args_list]
+        self.assertEqual(reports, [b"\x00S01R0000", b"\x00\r\x00\x00\x00\x00\x00\x00\x00"])
+        self.assertEqual(self.journal.load()["worker_claimed_for"], "shutdown")
+        with patch.object(hid, "_apis") as forbidden, patch("sys.stderr", io.StringIO()):
+            self.assertEqual(hid.control_worker_main(arguments), 1)
+        forbidden.assert_not_called()
+
+    def test_current_battery_countdown_must_finish_before_worker_claim_or_output(self):
+        raw, arguments = self.operational_countdown()
+        self.operation["sequence_evidence"]["battery_started_monotonic"] = 105
+        self.journal.write(self.operation)
+        apis = fake_apis()
+        with patch.object(hid, "_apis", return_value=apis), patch.object(hid, "_query_status_once", return_value=raw), \
+                patch("sys.stderr", io.StringIO()):
+            self.assertEqual(hid.control_worker_main(arguments), 1)
+        apis[1].HidD_SetOutputReport.assert_not_called()
+        self.assertNotIn("worker_claimed_for", self.journal.load())
+
+    def test_current_worker_blocks_device_critical_fault_test_and_pending_signals(self):
+        for status in (b"\xC9", b"\x99", b"\x8D", b"\x8B"):
+            raw, arguments = self.operational_countdown()
+            raw = raw.replace(b"\x3C\x20\x89\x20", b"\x3C\x20" + status + b"\x20")
+            apis = fake_apis()
+            with self.subTest(status=status), patch.object(hid, "_apis", return_value=apis), \
+                    patch.object(hid, "_query_status_once", return_value=raw), patch("sys.stderr", io.StringIO()):
+                self.assertEqual(hid.control_worker_main(arguments), 1)
+            apis[1].HidD_SetOutputReport.assert_not_called()
+            self.assertNotIn("worker_claimed_for", self.journal.load())
 
 
 if __name__ == "__main__":

@@ -169,7 +169,7 @@ try {
         $snapshot = Wait-SimulationConnected
         Assert-SimulationSafe $snapshot
         $headers = @{ 'X-UPS-Token' = $snapshot.csrf_token; Origin = 'http://127.0.0.1:8765' }
-        $safePolicy = @{ enabled = $true; on_battery_seconds = 86400; low_battery_percent = 0;
+        $safePolicy = @{ enabled = $true; low_battery_percent = 0;
             min_runtime_seconds = 0; countdown_seconds = 10; action = 'shutdown' } | ConvertTo-Json -Compress
         $observedPhases = [Collections.Generic.HashSet[string]]::new()
         $sawCountdown = $false

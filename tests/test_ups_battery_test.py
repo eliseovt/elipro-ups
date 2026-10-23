@@ -307,6 +307,77 @@ class BatteryTestTests(unittest.TestCase):
         self.transport.submit_test.assert_called_once()
         self.assertEqual(VALIDATED_PROFILES, self.production_profiles_before)
 
+    def test_finished_observation_and_cancel_evidence_survive_reboot_without_rewriting(self):
+        self.start()
+        self.test.record_windows_request(True)
+        self.advance(220)
+        finished = self.finish(off_after_ac_seconds=0, manual_restart=False, automatic_return_observed=True)
+        saved = self.path.read_bytes()
+        operation = json.loads(saved)
+        self.tick = 0.5
+        self.factory.reset_mock()
+
+        restarted = UpsBatteryTest(self.path, transport_factory=self.factory)
+        status = restarted.status(device=self.device, sample=self.sample())
+        self.assertEqual(status["state"], "finished")
+        self.assertEqual(status["operation_id"], finished["operation_id"])
+        self.assertEqual(status["result"], "automatic_return_observed")
+        self.assertEqual(status["physical_observation"], finished["physical_observation"])
+        self.assertEqual(restarted._operation, operation)
+        self.assertEqual(restarted._previous_cancel(self.profile), self.cancel)
+        self.assertEqual(restarted.compatibility(self.device)["source_operation_id"], finished["operation_id"])
+        self.assertFalse(restarted.pending())
+        self.assertFalse(status["production_validated"])
+        self.assertIsNone(status["remaining"])
+        self.assertEqual(load_battery_test_operation(self.path), operation)
+        self.assertEqual(self.path.read_bytes(), saved)
+        self.factory.assert_not_called()
+        self.assertEqual(VALIDATED_PROFILES, self.production_profiles_before)
+
+    def test_pending_operation_survives_clock_reset_as_review_without_replay_or_cancel(self):
+        started = self.start()
+        self.test.record_windows_request(False)
+        saved = self.path.read_bytes()
+        self.tick = 1
+        self.factory.reset_mock()
+
+        restarted = UpsBatteryTest(self.path, transport_factory=self.factory)
+        restarted.observe(device=self.device, sample=self.sample())
+        status = restarted.status(device=self.device, sample=self.sample())
+        self.assertEqual(status["state"], "review_required")
+        self.assertEqual(status["operation_id"], started["operation_id"])
+        self.assertEqual(status["windows_request"], "failed")
+        self.assertTrue(restarted.pending())
+        self.assertIsNone(status["remaining"])
+        self.assertFalse(status["can_confirm_observation"])
+        with self.assertRaises(UpsPowerBlocked):
+            restarted.start(device=self.device, sample=self.battery(), policy_enabled=False, blocked=False, acknowledge_risk=True)
+        with self.assertRaises(UpsPowerBlocked):
+            restarted.cancel_after_windows_failure(device=self.device, sample=self.battery())
+        self.assertEqual(self.path.read_bytes(), saved)
+        self.factory.assert_not_called()
+
+    def test_loader_still_rejects_malformed_persisted_ticks(self):
+        self.start()
+        operation = json.loads(self.path.read_text(encoding="utf-8"))
+        for state in ("submitted", "finished"):
+            for tick in (None, True, "1000", -1, float("nan"), float("inf")):
+                with self.subTest(state=state, tick=tick):
+                    self.path.write_text(json.dumps({**operation, "state": state, "started_monotonic": tick}), encoding="utf-8")
+                    with self.assertRaises(UpsPowerBlocked):
+                        load_battery_test_operation(self.path)
+
+    def test_workers_still_reject_a_reset_clock_for_start_and_cancel(self):
+        self.start()
+        operation = json.loads(self.path.read_text(encoding="utf-8"))
+        self.tick = 1
+        for selector, state in (("start", "arming"), ("cancel", "cancelling")):
+            with self.subTest(selector=selector):
+                self.path.write_text(json.dumps({**operation, "state": state}), encoding="utf-8")
+                self.assertEqual(load_battery_test_operation(self.path)["operation_id"], operation["operation_id"])
+                with self.assertRaisesRegex(UpsPowerBlocked, "El reloj de la operación cambió"):
+                    validate_battery_test_worker_request(self.auth_path, self.path, operation["operation_id"], selector)
+
     def test_observation_records_failure_without_inventing_automatic_return(self):
         self.start()
         self.test.record_windows_request(True)

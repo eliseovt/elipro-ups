@@ -34,6 +34,7 @@
     <main class="workspace">
       <section class="page-heading" aria-labelledby="page-title">
         <div><h1 id="page-title" tabindex="-1"><span id="view-title">Resumen</span></h1><p id="view-description" hidden></p></div>
+        <div id="protection-master" class="policy-intro" hidden><h2 id="settings-heading">Protección automática</h2><label class="switch-label"><input id="policy-enabled" form="policy-form" type="checkbox" role="switch" aria-labelledby="settings-heading enabled-label"><span class="switch" aria-hidden="true"></span><span id="enabled-label">Desactivada</span></label></div>
       </section>
 
       <div id="service-notice" class="notice service-notice" role="status" hidden></div>
@@ -198,29 +199,45 @@
       </section>
       <section id="page-protection" class="page-view" data-page="protection" aria-label="Protección de Windows y del UPS" hidden>
         <div id="development-notice" class="notice" hidden>Modo de prueba: el servicio no ejecuta acciones reales de Windows.</div>
-        <section class="settings-card card" aria-labelledby="settings-heading">
+        <section class="settings-card" aria-labelledby="settings-heading">
           <div id="settings-panel" class="settings-panel">
             <form id="policy-form">
-              <div class="policy-intro"><h2 id="settings-heading">Protección automática</h2><label class="switch-label"><input id="policy-enabled" type="checkbox" role="switch"><span class="switch" aria-hidden="true"></span><span id="enabled-label">Desactivada</span></label></div>
-              <section class="protection-preview" aria-labelledby="protection-preview-heading"><h3 id="protection-preview-heading">Así funcionará</h3><ol>
-                <li><span class="preview-icon" data-icon="plug" aria-hidden="true"><span class="preview-number">1</span><svg viewBox="0 0 32 32"><path d="M11 3v7m10-7v7M8 10h16v5a8 8 0 0 1-16 0Zm8 13v6"/></svg></span><div><strong id="protection-preview-countdown">Se detecta el corte</strong><p id="protection-preview-wait">15 s para cancelar toda la protección.</p></div></li>
-                <li><span class="preview-icon" data-icon="laptop" aria-hidden="true"><span class="preview-number">2</span><svg viewBox="0 0 32 32"><rect x="6" y="5" width="20" height="16" rx="2"/><path d="M3 25h26l-2 3H5Z"/></svg></span><div><strong id="protection-preview-action">La PC empieza a hibernar</strong><p id="protection-preview-action-detail">Conserva tu sesión sin cerrar aplicaciones.</p></div></li>
-                <li><span class="preview-icon" data-icon="ups" aria-hidden="true"><span class="preview-number">3</span><svg viewBox="0 0 32 32"><rect x="7" y="3" width="18" height="26" rx="3"/><rect x="11" y="7" width="10" height="6" rx="1"/><circle cx="16" cy="18" r="2"/><path d="M11 24h10"/></svg></span><div><strong id="protection-preview-ups">Unos 3 min después</strong><p id="protection-preview-ups-detail">El UPS corta la energía de sus salidas.</p></div></li>
+              <section class="protection-preview" aria-labelledby="protection-preview-heading"><h3 id="protection-preview-heading" class="sr-only">Así funcionará</h3><ol>
+                <li><span class="preview-icon" data-icon="plug" aria-hidden="true"><span class="preview-number">1</span><svg viewBox="0 0 32 32"><path d="M11 3v7m10-7v7M8 10h16v5a8 8 0 0 1-16 0Zm8 13v6"/></svg></span><div><strong id="protection-preview-countdown">Corte detectado</strong><p id="protection-preview-wait">Aviso inmediato.</p></div></li>
+                <li><span class="preview-icon" data-icon="laptop" aria-hidden="true"><span class="preview-number">2</span><svg viewBox="0 0 32 32"><rect x="6" y="5" width="20" height="16" rx="2"/><path d="M3 25h26l-2 3H5Z"/></svg></span><div><strong id="protection-preview-action">A los 15 s</strong><p id="protection-preview-action-detail">Se solicita hibernar Windows</p></div></li>
+                <li><span class="preview-icon" data-icon="ups" aria-hidden="true"><span class="preview-number">3</span><svg viewBox="0 0 32 32"><rect x="7" y="3" width="18" height="26" rx="3"/><rect x="11" y="7" width="10" height="6" rx="1"/><circle cx="16" cy="18" r="2"/><path d="M11 24h10"/></svg></span><div><strong id="protection-preview-ups">+3 min</strong><p id="protection-preview-ups-detail">Corte programado del UPS</p></div></li>
               </ol></section>
-              <div id="policy-fields" class="policy-fields">
-                <label>Espera antes del aviso<div class="input-with-unit"><input id="policy-on-battery" type="number" min="0" max="1440" step="0.5" required aria-describedby="policy-wait-note"><span>min</span></div><small id="policy-wait-note" class="field-help">0 muestra el aviso inmediatamente.</small></label>
-                <label id="policy-battery-field">Batería mínima<div class="input-with-unit"><input id="policy-low-battery" type="number" min="0" max="100" step="1" required><span>%</span></div></label>
+              <div class="protection-cards">
+              <section id="protection-windows-card" class="protection-setting-card" aria-labelledby="protection-windows-heading">
+                <div class="protection-card-heading"><span class="protection-card-icon" aria-hidden="true"><svg viewBox="0 0 32 32"><rect x="6" y="5" width="20" height="16" rx="2"/><path d="M3 25h26l-2 3H5Z"/></svg></span><h3 id="protection-windows-heading">Windows</h3></div>
+                <div id="policy-fields" class="policy-fields">
                 <label id="policy-runtime-field">Autonomía mínima<div class="input-with-unit"><input id="policy-runtime" type="number" min="0" max="86400" step="1" required><span>s</span></div></label>
-                <label>Tiempo para cancelar<div class="input-with-unit"><input id="policy-countdown" type="number" min="10" max="120" value="15" aria-describedby="policy-countdown-note" step="1" required><span>s</span></div><small id="policy-countdown-note" class="field-help">De 10 a 120 segundos.</small></label>
+                <label><span id="policy-countdown-label">Tiempo antes de hibernar</span><div class="input-with-unit"><input id="policy-countdown" type="number" min="10" max="120" value="15" aria-describedby="policy-countdown-note" step="1" required><span>s</span></div><small id="policy-countdown-note" class="field-help">Puedes cancelar durante estos 15 segundos.</small></label>
                 <label>Acción en Windows<select id="policy-action"><option value="shutdown">Apagar Windows</option><option value="hibernate">Hibernar Windows</option></select></label>
-              </div>
-              <p id="bridge-policy-note" class="section-note" hidden>ForzaTracker sigue activo: revisa también su política de apagado.</p>
-              <section class="ups-power-option" aria-labelledby="ups-power-heading">
-                <div class="ups-power-heading"><div><h3 id="ups-power-heading">Apagado del UPS</h3></div><label class="switch-label"><input id="policy-ups-poweroff" type="checkbox" role="switch" aria-describedby="ups-power-capability ups-power-delay ups-power-sequence-warning" disabled><span class="switch" aria-hidden="true"></span><span>Apagar también el UPS</span></label></div>
-                <label class="ups-delay-field">Apagar el UPS después de<div class="input-with-unit"><input id="policy-ups-delay" type="number" min="1" max="9" step="1" value="3" required aria-describedby="ups-power-delay"><span>min</span></div><small id="ups-power-delay" class="field-help">De 1 a 9 min, contados desde el inicio de la hibernación.</small></label>
+                </div>
+              </section>
+              <section id="protection-battery-card" class="protection-setting-card battery-protection-option" aria-labelledby="battery-protection-heading">
+                <div class="protection-card-heading"><span class="protection-card-icon" aria-hidden="true"><svg viewBox="0 0 32 32"><rect x="3" y="8" width="24" height="16" rx="3"/><path d="M27 13h3v6h-3M8 12v8"/></svg></span><div><h3 id="battery-protection-heading">Batería baja</h3><p id="battery-protection-subtitle">Adelantar la hibernación</p></div></div>
+                <label id="policy-battery-field">Cuando la batería baje al<div class="input-with-unit"><input id="policy-low-battery" type="number" min="0" max="100" step="1" value="20" required aria-describedby="policy-battery-help policy-battery-source"><span>%</span></div></label>
+                <p id="policy-battery-source" class="section-note" role="status">Esperando un porcentaje de batería actual.</p>
+                <p id="policy-battery-help" class="section-note">Si estás usando batería, la espera restante se reduce a 10 s como máximo. El retardo del UPS no cambia.</p>
+                <p id="policy-battery-emergency" class="section-note ups-power-unavailable" role="status" hidden></p>
+              </section>
+              <section id="protection-ups-card" class="protection-setting-card ups-power-option" aria-labelledby="ups-power-heading">
+                <div class="protection-card-heading ups-power-heading"><span class="protection-card-icon" aria-hidden="true"><svg viewBox="0 0 32 32"><rect x="7" y="3" width="18" height="26" rx="3"/><rect x="11" y="7" width="10" height="6" rx="1"/><circle cx="16" cy="18" r="2"/><path d="M11 24h10"/></svg></span><h3 id="ups-power-heading">Apagado del UPS</h3><label class="switch-label"><input id="policy-ups-poweroff" type="checkbox" role="switch" aria-label="Apagar también el UPS" aria-describedby="ups-power-capability ups-power-delay ups-power-sequence-warning" disabled><span class="switch" aria-hidden="true"></span><span id="ups-power-enabled-label">Desactivado</span></label></div>
+                <label class="ups-delay-field">Apagar el UPS después de<div class="input-with-unit"><input id="policy-ups-delay" type="number" min="1" max="9" step="1" value="3" required aria-describedby="ups-power-delay"><span>min</span></div><small id="ups-power-delay" class="field-help">De 1 a 9 min, desde la solicitud de hibernación.</small></label>
                 <p id="ups-power-capability" class="section-note" role="status">Esperando al monitor.</p>
                 <p id="ups-power-sequence-warning" class="section-note ups-power-unavailable" role="status"></p>
                 <p id="ups-power-state" class="section-note" role="status" hidden></p>
+                <p id="ups-power-restart-summary" class="section-note">El comportamiento al volver la luz todavía no está confirmado.</p>
+              </section>
+              </div>
+              <p id="bridge-policy-note" class="section-note" hidden>ForzaTracker sigue activo: revisa también su política de apagado.</p>
+              <section class="ups-power-conditions" aria-labelledby="ups-power-conditions-heading">
+                  <div class="ups-power-conditions-heading"><h4 id="ups-power-conditions-heading">Condiciones para apagar el UPS</h4><strong id="ups-power-availability" class="ups-power-availability" role="status">Sin confirmar</strong></div>
+                  <p id="ups-power-conditions-note" class="sr-only">Solo cuatro condiciones pueden bloquear la orden. Se comprueban antes de actuar.</p>
+                  <ul id="ups-power-checks" class="ups-power-checks" aria-label="Comprobaciones actuales para apagar el UPS"></ul>
+                  <details id="ups-power-block-history" class="ups-power-block-history"><summary>Último bloqueo y detalles de funcionamiento</summary><p id="ups-power-last-block" class="ups-power-last-block" hidden></p><ul class="protection-notes"><li>Si vuelve la luz durante la cuenta atrás, se cancela la actuación.</li><li id="ups-power-restart">El comportamiento del UPS al regresar la electricidad todavía no está confirmado.</li><li>El temporizador del UPS no espera una confirmación de que Windows terminó.</li><li>El voltaje y la carga no bloquean el apagado. El porcentaje bajo de batería adelanta la protección.</li><li>0 % desactiva la prioridad por porcentaje; la alarma crítica del UPS sigue atendida.</li><li>El porcentaje estimado no es una medición directa del UPS.</li></ul></details>
                 <div id="ups-power-review" class="ups-power-review" hidden>
                   <p class="section-note">Revisa este ciclo para preparar el próximo corte. Esto solo actualiza el registro; no confirma automáticamente el corte anterior.</p>
                   <label class="ups-power-review-consent"><input id="ups-power-review-ack" type="checkbox" disabled><span>Revisé que las salidas tienen energía y recuperé la sesión de Windows.</span></label>
@@ -228,13 +245,7 @@
                   <p id="ups-power-review-feedback" class="section-error" role="status" hidden></p>
                 </div>
               </section>
-              <ul class="protection-notes">
-                <li>Cancelar la cuenta atrás anula PC y UPS hasta el próximo corte. También se cancela si vuelve la luz o se pierden las lecturas.</li>
-                <li id="ups-power-restart">El comportamiento del UPS al regresar la electricidad todavía no está confirmado.</li>
-                <li>El temporizador del UPS no espera una confirmación de que Windows terminó.</li>
-                <li>La batería baja puede adelantar el corte del UPS.</li>
-                <li>Si faltan condiciones para cortar el UPS, se mantiene la protección de la PC.</li>
-              </ul>
+              <p class="protection-notification-note"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 11v6m0-10v.1"/></svg><span>Si vuelve la luz durante la cuenta atrás, se cancela la acción. El aviso permanece hasta pulsar Entendido.</span></p>
               <div class="settings-footer"><div class="test-action"><button id="test-shutdown" type="button" class="button button-secondary" disabled>Simular secuencia</button><span id="test-description">Esperando al monitor.</span></div><div class="save-action"><span id="settings-feedback" role="status"></span><button id="save-policy" type="submit" class="button button-primary" disabled>Guardar configuración</button></div></div>
             </form>
           </div>
@@ -267,7 +278,7 @@
               <label id="notifications-persistent-option" class="notification-option"><svg class="notification-option-icon" viewBox="0 0 32 32" aria-hidden="true"><rect x="2" y="3" width="28" height="26" rx="1.5"/><path d="M2 9h28M12 22l8-8m-7 0h7v7"/></svg><span class="notification-option-copy"><strong>Mantener avisos críticos</strong><small id="notifications-persistent-note">Hasta cerrarlos o resolverse la alerta.</small></span><span class="switch-label"><input id="notifications-persistent" type="checkbox" role="switch" aria-label="Mantener visibles los avisos críticos" disabled><span class="switch" aria-hidden="true"></span></span></label>
               <div class="notification-option notification-repeat-option"><svg class="notification-option-icon" viewBox="0 0 32 32" aria-hidden="true"><path d="M4 15a12 12 0 0 1 21-8l3 4m0-8v8h-8M28 17A12 12 0 0 1 7 25l-3-4m0 8v-8h8"/></svg><label class="notification-option-copy" for="notifications-repeat"><strong>Repetir alertas críticas</strong><small id="notifications-repeat-note">Mientras la alerta continúe.</small></label><div class="notification-repeat-control"><span>Cada</span><input id="notifications-repeat" type="number" min="10" max="300" step="1" value="30" required aria-describedby="notifications-repeat-note" disabled><span>s</span></div></div>
             </div>
-            <div class="notification-delivery"><p id="notifications-delivery" role="status" hidden></p><p id="notifications-error" class="error" role="status" hidden></p><p id="notifications-sound-error" class="error" role="status" hidden></p><p id="notifications-popup-error" class="error" role="status" hidden></p></div>
+            <div class="notification-delivery"><p id="notifications-inbox-note" hidden>Los avisos de energía permanecen hasta pulsar Entendido.</p><p id="notifications-delivery" role="status" hidden></p><p id="notifications-error" class="error" role="status" hidden></p><p id="notifications-sound-error" class="error" role="status" hidden></p><p id="notifications-popup-error" class="error" role="status" hidden></p></div>
             <div class="settings-footer"><div class="test-action"><button id="test-notifications" type="button" class="button button-secondary" disabled><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18 8a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9M10 21h4"/></svg><span id="test-notifications-label">Probar aviso y sonido</span></button><span>Sin apagar ni hibernar la PC.</span></div><div class="save-action"><span id="notifications-feedback" role="status"></span><button id="save-notifications" type="submit" class="button button-primary" disabled><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="m8 12 3 3 5-6"/></svg><span id="save-notifications-label">Guardar avisos</span></button></div></div>
           </form>
         </section>

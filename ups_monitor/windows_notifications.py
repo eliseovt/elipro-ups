@@ -459,7 +459,7 @@ class _Win32Backend:
             child_style | 0x80, self._scale(16), self._scale(49), self._scale(386), self._scale(78), self.popup_hwnd, None, self.instance, None)
         open_button = self.user.CreateWindowExW(0, "BUTTON", "Abrir Elipro",
             child_style, self._scale(16), self._scale(142), self._scale(180), self._scale(30), self.popup_hwnd, ctypes.c_void_p(101), self.instance, None)
-        close_button = self.user.CreateWindowExW(0, "BUTTON", "Cerrar aviso",
+        close_button = self.user.CreateWindowExW(0, "BUTTON", "Entendido",
             child_style, self._scale(212), self._scale(142), self._scale(190), self._scale(30), self.popup_hwnd, ctypes.c_void_p(102), self.instance, None)
         self.popup_buttons = (open_button, close_button)
         if not all((self.popup_title, self.popup_body, open_button, close_button)):
@@ -470,7 +470,7 @@ class _Win32Backend:
     def _show_popup(self, title, message, persistent=False, key=None, *, validity_callback=None):
         if self.owner._stop.is_set() or self.owner._session_currently_available() is False:
             return False
-        if not persistent and self.popup_persistent_key is not None:
+        if self.popup_persistent_key is not None and key != self.popup_persistent_key:
             # An informational fallback must not replace an active critical
             # window. There is always at most one custom window.
             return False
@@ -522,6 +522,11 @@ class _Win32Backend:
                     self._hide_popup()
         key = self.popup_persistent_key
         if key is None:
+            notice = self.owner._next_persistent()
+            if notice is not None and notice[0].startswith("notice:"):
+                self._query_user_notification_state()
+                if self.user_notification_code == 5:
+                    self._show_popup(notice[1]["title"], notice[1]["message"], persistent=True, key=notice[0])
             return
         notice = self.owner._persistent_message(key)
         if notice is None or self.owner._persistent_acknowledged(key):
@@ -529,6 +534,8 @@ class _Win32Backend:
             if self.last_notice and self.last_notice.get("persistent_key") == key:
                 self.last_notice = None
                 self.user.KillTimer(self.hwnd, 2)
+            # Acknowledging one item reveals the next unread incident.
+            self.sync_persistent()
             return
         # Refresh countdown text without showing/activating again or producing
         # sound. The reader publishes this state independently of the panel.
@@ -654,13 +661,13 @@ class _Win32Backend:
                     if command == 102:
                         if self.popup_persistent_key is not None:
                             self.owner._ack_persistent(self.popup_persistent_key)
-                        self._hide_popup()
+                            self.sync_persistent()
+                        else:
+                            self._hide_popup()
                         return 0
                 elif message in (WM_CLOSE, WM_TIMER):
-                    if message == WM_TIMER and self.popup_persistent_key is not None:
-                        return 0
-                    if message == WM_CLOSE and self.popup_persistent_key is not None:
-                        self.owner._ack_persistent(self.popup_persistent_key)
+                    if self.popup_persistent_key is not None:
+                        return 0  # Only the explicit Entendido button acknowledges.
                     self._hide_popup()
                     return 0
                 elif message == WM_DESTROY:
@@ -792,6 +799,8 @@ class WindowsNotifier:
         self._delivery_serial = 0
         self._completed_deliveries = OrderedDict()
         self._delivery_receipts = deque(maxlen=256)
+        self.acknowledge_callback = None
+        self._ack_inflight = set()
 
     def start(self):
         with self._lock:
@@ -1026,9 +1035,43 @@ class WindowsNotifier:
             return key in self._persistent_dismissed
 
     def _ack_persistent(self, key):
+        if isinstance(key, str) and key.startswith("notice:"):
+            callback = self.acknowledge_callback
+            try:
+                notice_id = int(key.partition(":")[2])
+            except ValueError:
+                return
+            with self._lock:
+                if key not in self._persistent_messages or key in self._ack_inflight:
+                    return
+                if not callable(callback):
+                    self._last_error = "No se pudo guardar Entendido; abre Elipro para confirmar el aviso."
+                    return
+                self._ack_inflight.add(key)
+            def acknowledge():
+                try:
+                    callback([notice_id])
+                    with self._lock:
+                        self._persistent_dismissed.add(key)
+                        self._last_error = None
+                except Exception as exc:
+                    self._set_error("No se guardó Entendido: " + str(exc)[:300])
+                finally:
+                    with self._lock:
+                        self._ack_inflight.discard(key)
+                        backend = self._backend
+                    if backend is not None:
+                        backend.wake()
+            threading.Thread(target=acknowledge, name="elipro-notice-ack", daemon=True).start()
+            return
         with self._lock:
             if key in self._persistent_messages:
                 self._persistent_dismissed.add(key)
+
+    def _next_persistent(self):
+        with self._lock:
+            return next(((key, dict(value)) for key, value in self._persistent_messages.items()
+                         if key not in self._persistent_dismissed), None)
 
     def _request_exit(self):
         callback = self.exit_callback

@@ -63,7 +63,7 @@ def _require(condition, message):
 
 def _cancel(monitor, adapter, tick, actions):
     monitor.set_policy({"enabled": True, "countdown_seconds": 10})
-    adapter.battery = adapter.low = True
+    adapter.battery, adapter.low = True, False
     _require(tick()["state"] == "countdown", "No se inició la cuenta regresiva simulada.")
     monitor.cancel()
     for _ in range(10):
@@ -71,14 +71,14 @@ def _cancel(monitor, adapter, tick, actions):
     _require(status["state"] == "cancelled", "La cancelación no se mantuvo durante el corte simulado.")
     adapter.battery = adapter.low = False
     _require(tick(2)["state"] == "online", "No volvió a estado de red.")
-    adapter.battery = adapter.low = True
+    adapter.battery, adapter.low = True, False
     _require(tick(2)["state"] == "countdown", "Un nuevo corte no recuperó las reglas.")
     return "Cancelar impide la acción durante ese corte y un nuevo corte vuelve a evaluar las reglas."
 
 
 def _mains(monitor, adapter, tick, actions):
     monitor.set_policy({"enabled": True, "countdown_seconds": 10})
-    adapter.battery = adapter.low = True
+    adapter.battery, adapter.low = True, False
     _require(tick()["state"] == "countdown", "Falta la cuenta regresiva simulada.")
     adapter.battery = adapter.low = False
     _require(tick(5)["state"] == "online", "El regreso de red no canceló la cuenta.")
@@ -88,7 +88,7 @@ def _mains(monitor, adapter, tick, actions):
 
 def _stale(monitor, adapter, tick, actions):
     monitor.set_policy({"enabled": True, "countdown_seconds": 10})
-    adapter.battery = adapter.low = True
+    adapter.battery, adapter.low = True, False
     tick()
     adapter.stale = True
     _require(tick(11)["state"] == "unknown", "Los datos antiguos no bloquearon la protección.")
@@ -112,8 +112,8 @@ def _communication(monitor, adapter, tick, actions):
 
 def _dry_run(monitor, adapter, tick, actions):
     monitor.set_policy({"enabled": True, "countdown_seconds": 10})
-    adapter.battery = adapter.low = True
-    tick()
+    adapter.battery, adapter.low = True, False
+    _require(tick()["state"] == "countdown", "No se inició la cuenta simulada previa al final del plazo.")
     _require(tick(11)["state"] == "action_started", "No se alcanzó el final de la simulación.")
     kinds = [event["kind"] for event in monitor.events()]
     _require("simulation" in kinds and "policy_action_started" not in kinds, "La acción no quedó identificada como simulación.")

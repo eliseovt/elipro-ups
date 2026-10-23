@@ -77,7 +77,7 @@ class StartupProbeIntegrationTests(unittest.TestCase):
         self.transport.return_value.query_status.return_value = QS
         self.store = Store(":memory:")
         self.addCleanup(self.store.close)
-        self.policy = {**DEFAULT_POLICY, "on_battery_seconds": 420}
+        self.policy = dict(DEFAULT_POLICY)
         self.action = Mock()
 
     def build_monitor(self):
@@ -275,7 +275,7 @@ class StartupProbeIntegrationTests(unittest.TestCase):
         self.assertEqual(desktop.messages, [])
         self.assert_policy_and_actions_unchanged()
 
-    def test_transient_table_uncertainty_preserves_countdown_and_real_low_battery_flag(self):
+    def test_transient_table_uncertainty_preserves_critical_result_and_real_low_battery_flag(self):
         self.policy = {**self.policy, "enabled": True, "countdown_seconds": 60}
         fields = QS[1:-1].split(b" ")
         fields[9] = b"\xc9"  # Actual QS battery + low-battery flags, decoded by parse_qs.
@@ -285,12 +285,15 @@ class StartupProbeIntegrationTests(unittest.TestCase):
         self.tick(100)
         initial = self.monitor.engine.status()
         initial_events = self.monitor.events()
-        self.assertEqual(initial["state"], "countdown")
-        self.assertEqual(initial["countdown_remaining"], 60)
+        self.assertEqual(initial["state"], "action_started")
+        self.assertIsNone(initial["countdown_remaining"])
+        self.assertTrue(initial["emergency"]["immediate"])
+        self.assertEqual(initial["emergency"]["source"], "ups_critical_alarm")
+        self.assertEqual(sum(event["kind"] == "simulation" for event in initial_events), 1)
         self.tick(102)
         current = self.monitor.engine.status()
-        self.assertEqual(current["state"], "countdown")
-        self.assertEqual(current["countdown_remaining"], 58)
+        self.assertEqual(current["state"], "action_started")
+        self.assertIsNone(current["countdown_remaining"])
         self.assertIs(self.monitor.sample["low_battery"], True)
         self.assertIsNone(self.monitor.sample["battery_percent"])
         self.assertEqual(self.monitor.events(), initial_events)

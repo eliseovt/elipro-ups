@@ -16,9 +16,9 @@ import time
 DELIVERY_FIELDS = {"last_error": 200, "last_sound_error": 200, "popup_error": 200,
                    "last_delivered_at": 80, "last_popup_shown_at": 80}
 SESSION_STATES = frozenset(("active", "locked", "disconnected", "unknown"))
-RETAINED_EVENTS = frozenset(("power_lost", "power_restored", "battery_low", "overload", "ups_fault",
+RETAINED_EVENTS = frozenset(("power_lost", "power_restored", "battery_low", "battery_low_percentage", "overload", "ups_fault",
                              "connection_lost", "connection_restored", "monitor_error", "monitor_restarted",
-                             "policy_countdown", "policy_cancelled", "policy_action_failed"))
+                             "policy_countdown", "policy_cancelled", "policy_action_failed", "ups_poweroff_blocked"))
 
 
 def delivery_diagnostics(value):
@@ -151,7 +151,7 @@ class SessionBroker:
         # A retained warning is an incident summary unless current telemetry
         # independently confirms that it remains active. Never infer state
         # from a title, a notification preference, or an old queued countdown.
-        result["persistent"] = False
+        result["persistent"] = bool(item.get("persistent") and item.get("key") in self._persistent)
         conditions_fresh = self._conditions_at is not None and self._clock() - self._conditions_at <= 3
         power_state = self._power_state if conditions_fresh else "unknown"
         connection_state = self._connection_state if conditions_fresh else "unknown"
@@ -184,7 +184,12 @@ class SessionBroker:
         with self._lock:
             self._persistent = {str(key)[:80]: {"title": str(value["title"])[:160],
                                                "message": str(value["message"])[:2000]}
-                                for key, value in list(messages.items())[:16]}
+                                for key, value in list(messages.items())[:200]}
+            # A user ACK removes the durable inbox entry. Older transport
+            # tickets must not turn it into a new historical balloon later.
+            self._retained = deque((item for item in self._retained
+                                    if not str(item.get("key", "")).startswith("notice:") or
+                                    item["key"] in messages), maxlen=self._retained.maxlen)
 
     def poll(self, data):
         legacy = {"client_id", "after", "delivery"}

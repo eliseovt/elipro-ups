@@ -87,6 +87,7 @@ El corte de la salida del UPS es una capacidad separada, bloqueada hasta validar
 
 ### Interfaz y secciones del panel
 * **Cinco secciones especializadas:** **Resumen**, **Protección**, **Historial**, **Sistema** y **Webhooks**; temas claro y oscuro con selector sol/luna.
+* **Protección compacta (0.9.20):** Tres columnas en el orden **Windows → Batería baja → Apagado del UPS**, con interruptores alineados, tiempos independientes y las cuatro condiciones de bloqueo siempre visibles. La secuencia, los ajustes y **Guardar configuración** caben en una pantalla en el estado normal, comprobado a 1366 × 768, 1600 × 900 y 1920 × 1080; en móvil se apilan. Los motivos activos permanecen visibles, mientras las notas y el último bloqueo histórico se consultan en un desplegable. La verificación está registrada en [docs/production-validation.md](docs/production-validation.md).
 * **Resumen compacto y fiel al hardware:** Permite consultar el diagrama de energía, las mediciones y los eventos recientes en una sola vista de escritorio (1920 × 1080).
   * La ilustración del UPS muestra **FORZA** y el modelo en el frontal, **sin visor LCD** (fiel al dispositivo físico); su botón de encendido refleja el estado del suministro.
   * **Conductos de luz:** Emplean color **turquesa** en la entrada de red y **azul** en batería y salida, con pulsos solo cuando las lecturas recientes confirman energía hacia los equipos.
@@ -102,8 +103,8 @@ El corte de la salida del UPS es una capacidad separada, bloqueada hasta validar
         <p align="center"><b>1 · Resumen</b><br><em>Diagrama compacto con conductos de luz (turquesa/azul), telemetría en vivo y eventos recientes</em></p>
       </td>
       <td width="50%">
-        <img src="docs/assets/screenshots/elipro-seccion-proteccion.jpg" alt="Sección Protección: reglas de apagado de Windows, cuenta atrás cancelable y retardo del UPS" />
-        <p align="center"><b>2 · Protección</b><br><em>Reglas de apagado o hibernación, cuenta atrás cancelable y corte programado del UPS</em></p>
+        <img src="docs/assets/screenshots/elipro-proteccion-compacta.png" alt="Sección Protección 0.9.20: columnas Windows, Batería baja y Apagado del UPS, con cuatro condiciones visibles en una pantalla" />
+        <p align="center"><b>2 · Protección</b><br><em>Windows, batería baja y UPS: ajustes independientes, cuatro condiciones visibles y avisos persistentes</em></p>
       </td>
     </tr>
     <tr>
@@ -123,14 +124,15 @@ Las capturas muestran una configuración de ejemplo; la protección automática 
 
 ### Telemetría, avisos y notificaciones
 * **Telemetría continua:** Lectura de alimentación de red/batería, voltajes de entrada y salida, frecuencia, carga del UPS, voltaje de batería y señales de batería baja o falla.
-* **Ventana modal global:** Para batería baja, sobrecarga, falla del UPS y cuentas atrás reales o simuladas. Durante el aviso inicial ofrece un único botón **Cancelar protección**; reconocer una alarma no cancela la actuación.
+* **Ventana modal global:** Los cortes eléctricos, la recuperación del suministro y las demás incidencias se guardan y permanecen hasta pulsar **Entendido**, aunque se recupere la electricidad o se vuelva a abrir el panel. Las cuentas atrás reales o simuladas mantienen **Cancelar protección**; reconocer un aviso no cancela la actuación.
 * **Avisos nativos y System Tray:** Notificaciones de Windows, sonido e icono de bandeja aunque se cierre el navegador.
 * **Retención durante bloqueo:** Avisos eléctricos retenidos durante bloqueo o desconexión de sesión, con acuse de aceptación nativa y recuperación del contexto al reanudar.
+* **Resultados históricos tras reiniciar:** Las pruebas físicas ya cerradas conservan su resultado sin repetir órdenes. La evidencia y las regresiones de recuperación y avisos están documentadas en [docs/production-validation.md](docs/production-validation.md).
 
 ### Historial, Registro y Sistema
 * **Historial con tabla única «Registro»:** Reúne las mediciones en gráfica y una única tabla Registro, conservando sus filtros al navegar. Los eventos recientes permanecen exclusivos en Resumen.
 * **Sistema:** Reúne el funcionamiento del monitor (última lectura, tiempo activo y recursos) y los ajustes de avisos (avisos de escritorio, sonido, persistencia de avisos críticos e intervalo de repetición) sin opciones contraídas.
-* **Botón de salida limpio:** La franja inferior de Sistema conserva **Salir de Elipro**: cerrar el panel mantiene la vigilancia; salir detiene el monitor y sus avisos.
+* **Salida desde el panel o la bandeja:** **Salir de Elipro** está disponible en Sistema y al hacer clic derecho en el ícono de Windows. Tras confirmar, solicita detener el monitor y cierra el agente de avisos; si el servidor rechaza el cierre, el ícono permanece y explica el motivo. Cerrar solamente el navegador mantiene la vigilancia.
 
 ### Webhooks e integraciones externas
 
@@ -297,7 +299,7 @@ El porcentaje nativo derivado se identifica como **Carga estimada** y utiliza un
 
 * Las estimaciones usan los campos aditivos `battery_percent_estimate` y `battery_estimate_method`.
 * No recalculan el historial previo. En el CSV se agregan al final.
-* **Las estimaciones no disparan apagados, eventos de batería baja ni avisos basados en porcentaje medido.**
+* **La estimación del perfil validado puede adelantar una protección ya configurada mientras se usa batería**, según el umbral elegido, y genera un aviso identificado como porcentaje estimado. No se presenta como porcentaje medido ni sustituye la alarma de batería baja que reporta el UPS.
 
 ### <a id="diagnóstico-explícito-de-batería"></a>Diagnóstico explícito de batería
 Permite observar `QS`, `BT?` y `BL?` sin crear un monitor ni ejecutar acciones de energía:
@@ -323,21 +325,31 @@ Se mantiene desactivada hasta que el usuario la configura y activa expresamente.
   Elipro.exe service install --allow-power-actions
   ```
   con el servicio detenido y después de validar el equipo. Volver a registrarlo sin esa opción restaura el bloqueo; `service status` informa la capacidad configurada.
-* **Condiciones de evaluación:** Exige datos recientes, alimentación por batería confirmada y un lector/supervisor sanos. En USB directo se utilizan el tiempo continuo en batería y la señal real de batería baja.
+* **Condiciones de evaluación:** Exige datos recientes, alimentación por batería confirmada y un lector/supervisor sanos. La primera lectura confirmada de batería inicia la cuenta atrás; las señales reales de batería baja y las demás alarmas conservan sus avisos.
 * **Tiempos configurables:**
-  * **Tiempo para cancelar:** Admite enteros de 10 a 120 segundos (predeterminado: **15 segundos**).
+  * **Tiempo antes de hibernar:** Un único plazo desde la detección del corte, con aviso inmediato y posibilidad de cancelar durante toda la cuenta. Admite enteros de 10 a 120 segundos (predeterminado: **15 segundos**); si se elige apagar Windows, el plazo se aplica al apagado.
   * **Tiempo para apagar el UPS:** Independiente, de 1 a 9 minutos enteros (predeterminado: **3 minutos**). Comienza al enviar la orden al iniciar la solicitud de hibernación; no al detectar el corte ni cuando Windows confirme haber terminado.
-* **Cancelación:** Volver a la red, perder la comunicación o recibir datos inválidos cancela el aviso inicial pendiente. **Cancelar protección** durante ese aviso anula la actuación de Windows y del UPS hasta que vuelva la red y ocurra otro corte. Después de programar el UPS no se ofrece una segunda cuenta cancelable.
-* **Simulación:** Reproduce los dos tiempos guardados sin ejecutar llamadas a Windows ni USB y omite la espera previa con batería.
+* **Protección por porcentaje bajo:** Umbral editable y visible, predeterminado **20 %**. Al alcanzarlo con batería, se reduce la cuenta restante a un máximo de **10 segundos**, conservando un plazo que ya sea menor y el retardo del UPS elegido. Se prefiere el porcentaje reportado; en esta unidad se utiliza la **Carga estimada**, identificada como tal. Cero desactiva esta prioridad por porcentaje.
+* **Voltaje y carga informativos:** No bloquean el corte del UPS, incluso si la carga alcanza o supera el 100 %. Las alertas por carga alta siguen disponibles. Los valores de 27,41 V, 25,41 V y 11 % de carga de la prueba antigua se conservan como evidencia histórica y no como barreras operativas. El panel muestra cuatro grupos de comprobaciones y el motivo exacto de cualquier bloqueo; el aviso persiste hasta **Entendido**.
+* **Alarma crítica real:** Si el UPS ya reporta batería crítica, se solicita la protección de Windows inmediatamente. En ese estado se evita enviar una orden que podría cortar las salidas antes de completar la hibernación, y se explica el motivo.
+* **Cancelación:** Volver a la red, perder la comunicación o recibir datos inválidos cancela la actuación pendiente. El aviso permanece hasta pulsar **Entendido**. **Cancelar protección** durante la cuenta anula la actuación de Windows y del UPS hasta que vuelva la red y ocurra otro corte. Después de programar el UPS no se ofrece una segunda cuenta cancelable.
+* **Simulación:** Reproduce el tiempo antes de actuar en Windows y el retardo independiente del UPS, sin ejecutar llamadas a Windows ni controles USB.
 
 ### <a id="apagado-de-la-salida-del-ups"></a>Apagado de la salida del UPS
 «Apagar también el UPS» está desactivado por defecto. El registro incluye únicamente la huella de la unidad NT-2402PRO observada, con corte aproximadamente a tres minutos, cancelación y retorno automático al volver CA registrados. El encendido exclusivamente manual no es un requisito. VID/PID o un ACK del programa original no bastan y no se habilita toda la familia de UPS.
 
-La habilitación de esta capacidad exige el cumplimiento estricto de todos los siguientes requisitos:
-1. Permisos administrativos en el servicio: `--allow-power-actions --allow-ups-poweroff`.
-2. El perfil ligado a la huella observada de la unidad NT-2402PRO.
-3. Habilitación en la configuración guardada: `policy.ups_poweroff: true`.
-4. **Requisitos de política del perfil actual:** Exige expresamente que la acción de Windows sea **Hibernación** (`policy.action: hibernate`) y que la **espera previa con batería sea de cero segundos** (`policy.on_battery_seconds: 0`, sin espera adicional antes del aviso cuando se cumplen las condiciones de evaluación). Si se configura una espera previa mayor a cero o se selecciona apagar la PC, **no se programará el corte del UPS**; la protección de Windows podrá actuar si cumple sus propias condiciones.
+Desde **0.9.19**, las condiciones que pueden bloquear una orden se presentan en cuatro grupos, con sus motivos concretos visibles:
+
+| Bloqueo | Condición que debe resolverse |
+| --- | --- |
+| UPS sin comunicación o incompatible | Lecturas ausentes, antiguas o incoherentes; fuente USB no disponible; identidad o protocolo incompatibles. |
+| Windows no está preparado para hibernar | Hibernación o permisos de acciones reales no disponibles; monitor incapaz de solicitar la acción. |
+| Otra operación de energía está pendiente | Una prueba real, una orden de corte o un resultado incierto requieren terminar o revisar la operación existente. |
+| El UPS no puede ejecutar un apagado controlado | Falla del equipo, alarma crítica real que podría adelantar el corte o salida sin energía confirmada. |
+
+La función requiere activar `policy.ups_poweroff` y habilitar los permisos administrativos `--allow-power-actions --allow-ups-poweroff`. Los tiempos inválidos se rechazan al guardar. El perfil actual admite hibernación, con una cuenta de 10 a 120 segundos y un retardo UPS de 1 a 9 minutos; apagar Windows conserva su protección pero no programa el UPS.
+
+El voltaje, el porcentaje de carga y los valores del ensayo antiguo no bloquean esta operación. Tampoco se exige una lectura de red eléctrica anterior: iniciar el servicio o recuperar USB mientras sigue usando batería permite comenzar una **cuenta nueva con lecturas válidas**. Las órdenes ya enviadas permanecen registradas y nunca se repiten al arrancar o reanudar.
 
 Diagnóstico de control: con Elipro y ForzaTracker detenidos, permite obtener metadatos y lectura QS sin armar ni cancelar el UPS:
 ```powershell

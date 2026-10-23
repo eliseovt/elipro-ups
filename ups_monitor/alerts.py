@@ -7,11 +7,12 @@ actions, replays stored events, or changes a protection setting.
 from __future__ import annotations
 
 import math
+import secrets
 import threading
 import time
 from datetime import datetime, timezone
 
-from .core import iso_utc, utc_now
+from .core import battery_percentage, iso_utc, utc_now
 
 
 DEFAULT_NOTIFICATION_SETTINGS = {
@@ -25,6 +26,7 @@ _EVENTS = {
     "power_lost": ("Corte de energía", "warning"),
     "power_restored": ("Suministro eléctrico recuperado", "info"),
     "battery_low": ("Batería baja del UPS", "critical"),
+    "battery_low_percentage": ("Porcentaje estimado de batería bajo", "critical"),
     "overload": ("Sobrecarga del UPS", "critical"),
     "ups_fault": ("Falla del UPS", "critical"),
     "connection_lost": ("Sin comunicación con el UPS", "warning"),
@@ -34,6 +36,8 @@ _EVENTS = {
     "policy_countdown": ("Protección: cuenta regresiva", "critical"),
     "policy_cancelled": ("Protección cancelada", "info"),
     "policy_action_failed": ("No se pudo ejecutar la protección", "critical"),
+    "policy_migration_review": ("Revisa el tiempo de protección", "warning"),
+    "ups_poweroff_blocked": ("No se programó el apagado del UPS", "warning"),
     "ups_poweroff_unconfirmed": ("Corte del UPS sin confirmar", "critical"),
     "ups_cancel_test_unconfirmed": ("Prueba del UPS sin confirmar", "critical"),
     "ups_battery_test_unconfirmed": ("Prueba del UPS en batería sin confirmar", "critical"),
@@ -42,15 +46,19 @@ _EVENTS = {
     "ups_poweroff_reviewed": ("Revisión del corte del UPS cerrada", "info"),
     "simulation": ("Prueba de protección sin apagado", "info"),
 }
-_PERSISTENT = frozenset(("battery_low", "overload", "ups_fault", "policy_countdown"))
+_PERSISTENT = frozenset(("battery_low", "battery_low_percentage", "overload", "ups_fault", "policy_countdown"))
+# Acknowledgement and recovery are independent. Every real incident remains in
+# this inbox until a user explicitly presses Entendido; desktop delivery is
+# merely another view of these records, never an acknowledgement.
+_INBOX_EVENTS = frozenset(_EVENTS) - {"simulation"}
 # These observations form persistence barriers. The history worker flushes
 # queued telemetry and the transition together; selecting an alert never waits
 # for SQLite or asks the desktop notifier to make a durability decision.
 CRITICAL_HISTORY_EVENTS = frozenset((
-    "power_lost", "power_restored", "battery_low", "overload", "ups_fault",
+    "power_lost", "power_restored", "battery_low", "battery_low_percentage", "overload", "ups_fault",
     "connection_lost", "connection_restored", "monitor_error", "monitor_restarted",
     "policy_countdown", "policy_cancelled", "policy_action_started", "policy_action_failed",
-    "policy_unknown",
+    "policy_unknown", "policy_migration_review",
     "ups_poweroff_submitted", "ups_poweroff_unconfirmed", "ups_poweroff_cancel_requested", "ups_poweroff_blocked",
     "ups_cancel_test_unconfirmed", "ups_cancel_test_reviewed",
     "ups_battery_test_unconfirmed", "ups_battery_test_reviewed",
@@ -59,6 +67,7 @@ CRITICAL_HISTORY_EVENTS = frozenset((
 ))
 _CONDITION_MESSAGES = {
     "battery_low": "El UPS continúa indicando batería baja. Revisa el estado del equipo.",
+    "battery_low_percentage": "La carga estimada continúa en el umbral de batería baja; se prioriza la protección de Windows.",
     "overload": "El UPS continúa indicando una carga igual o superior al 100 %.",
     "ups_fault": "El UPS continúa reportando una falla. Revisa el equipo.",
 }
@@ -105,6 +114,24 @@ class AlertManager:
         self._active = {}
         self._last_notification = self._last_error = None
         self._context_power = self._context_connection = "unknown"
+        self._pending = {}
+        self._incidents = {}
+        self._incident_records = {}
+        self._dirty = set()
+        self._last_persist_retry = None
+        self._inbox_error = None
+        try:
+            self._pending = {item["id"]: dict(item) for item in store.pending_notifications()}
+            self._incident_records = {item["id"]: dict(item) for item in store.notification_incidents()}
+        except Exception as exc:
+            self._inbox_error = "No se pudieron cargar los avisos pendientes: " + str(exc)[:300]
+        for item in self._incident_records.values():
+            # Prior countdowns never assert that a current action is pending.
+            # First live observations will confirm recovery independently.
+            if item.get("resolved_at") is None and item["kind"] in (_PERSISTENT | {"power_lost", "connection_lost", "monitor_error", "policy_migration_review"}):
+                self._incidents[item["kind"]] = item["id"]
+        self._loaded_notice_ids = set(self._pending) | set(self._incident_records)
+        self.notifier.acknowledge_callback = self.acknowledge
         try:
             self._settings = validate_notification_settings(
                 store.get_setting("notification_settings", DEFAULT_NOTIFICATION_SETTINGS))
@@ -119,6 +146,7 @@ class AlertManager:
             try:
                 self.notifier.start()
                 self._started = True
+                self._sync_persistent()
             except Exception as exc:
                 self._last_error = "No se pudieron iniciar los avisos de Windows: " + str(exc)[:300]
 
@@ -137,23 +165,49 @@ class AlertManager:
                 self._last_error = "No se pudieron cerrar los avisos: " + str(exc)[:300]
 
     def _emit(self, kind, message, *, repeat=False, explicit=False):
-        if self._stopped or (not explicit and not self._settings["enabled"]):
+        if self._stopped:
             return False
         now = self._clock()
         previous = self._last_attempt.get(kind)
         interval = self._settings["repeat_seconds"] if repeat else 30
-        if not explicit and previous is not None and now - previous < interval:
-            return False
+        limited = not explicit and previous is not None and now - previous < interval
         title, severity = _EVENTS.get(kind, ("Prueba de Elipro UPS", "info"))
+        notice = None
+        acknowledged_incident = False
+        if kind in _INBOX_EVENTS:
+            notice_id = self._incidents.get(kind)
+            notice = self._pending.get(notice_id)
+            acknowledged_incident = notice_id is not None and notice is None
+            if not repeat and notice is None and notice_id is None:
+                notice_id = secrets.randbits(52) or 1
+                while notice_id in self._pending:
+                    notice_id = secrets.randbits(52) or 1
+                notice = {"id": notice_id, "kind": kind, "title": title, "message": str(message),
+                          "severity": severity, "timestamp": iso_utc(self._utc_clock()),
+                          "resolved_at": None, "acknowledged_at": None}
+                self._pending[notice_id] = notice
+                self._loaded_notice_ids.add(notice_id)
+                self._incident_records[notice_id] = notice
+                if kind in (_PERSISTENT | {"power_lost", "connection_lost", "monitor_error", "policy_migration_review"}):
+                    self._incidents[kind] = notice_id
+                self._save_notice(notice)
+            self._sync_persistent()
+        if limited:
+            # Rate-limit desktop delivery, never a new unread incident.
+            return False
         sound = self._settings["sound_enabled"]
         # Count attempts too, so an unavailable backend cannot create a busy
         # retry loop or an unbounded Windows queue during telemetry errors.
         self._last_attempt[kind] = now
         if kind in self._active:
             self._active[kind]["last_attempt"] = now
+        if acknowledged_incident or (not explicit and not self._settings["enabled"]):
+            return False
         try:
             options = {"severity": severity, "sound": sound}
-            if self._settings["persistent_critical"] and kind in _PERSISTENT:
+            if notice is not None and callable(getattr(self.notifier, "sync_persistent", None)):
+                options.update(persistent=True, key="notice:" + str(notice["id"]))
+            elif kind not in _INBOX_EVENTS and self._settings["persistent_critical"] and kind in _PERSISTENT:
                 options.update(persistent=True, key=kind)
             publisher = getattr(type(self.notifier), "publish_event", None)
             accepted = (self.notifier.publish_event(kind, title, message, repeat=repeat, **options)
@@ -166,9 +220,74 @@ class AlertManager:
             "kind": kind, "title": title, "message": message, "severity": severity,
             "sound": sound, "timestamp": iso_utc(self._utc_clock()),
             "repeat": repeat, "accepted": accepted,
-            "persistent": self._settings["persistent_critical"] and kind in _PERSISTENT,
+            "persistent": notice is not None or (self._settings["persistent_critical"] and kind in _PERSISTENT),
         }
         return accepted
+
+    def _save_notice(self, notice):
+        try:
+            self.store.put_notification(notice)
+            self._dirty.discard(notice["id"])
+            if not self._dirty:
+                self._inbox_error = None
+        except Exception as exc:
+            self._dirty.add(notice["id"])
+            self._inbox_error = "El aviso sigue pendiente, pero no se pudo guardar en disco: " + str(exc)[:300]
+
+    def _refresh_inbox(self):
+        # ResilientStore reads its cache here; recovery after an unavailable
+        # startup can restore older unread notices without restarting Elipro.
+        try:
+            records = self.store.pending_notifications() + self.store.notification_incidents()
+        except Exception:
+            return
+        for item in records:
+            if item["id"] in self._loaded_notice_ids:
+                continue
+            self._loaded_notice_ids.add(item["id"])
+            value = dict(item)
+            self._incident_records[item["id"]] = value
+            if value.get("acknowledged_at") is None:
+                self._pending[item["id"]] = value
+            if value.get("resolved_at") is None and value["kind"] in (_PERSISTENT | {"power_lost", "connection_lost", "monitor_error", "policy_migration_review"}):
+                self._incidents.setdefault(value["kind"], value["id"])
+
+    def _resolve(self, *kinds):
+        stamp = iso_utc(self._utc_clock())
+        for kind in kinds:
+            notice_id = self._incidents.pop(kind, None)
+            notice = self._pending.get(notice_id) or self._incident_records.get(notice_id)
+            if notice is not None and notice.get("resolved_at") is None:
+                notice["resolved_at"] = stamp
+                self._save_notice(notice)
+
+    def _notice_message(self, notice):
+        kind = notice["kind"]
+        if kind == "policy_countdown":
+            if kind in self._active:
+                return "Elipro confirma una cuenta regresiva de protección activa. Abre el panel para consultar el tiempo actual o cancelarla."
+            return "Se registró una cuenta regresiva de protección anterior. Revisa el estado actual y su resultado en Elipro."
+        if notice.get("resolved_at") is not None:
+            return notice["message"] + " La condición terminó; el aviso sigue pendiente de Entendido."
+        return notice["message"]
+
+    def acknowledge(self, ids):
+        """Commit explicit user acknowledgement before removing any notice."""
+        if (not isinstance(ids, list) or not 1 <= len(ids) <= 200 or
+                any(type(value) is not int or not 0 < value <= 2**53 - 1 for value in ids)):
+            raise ValueError("Selecciona entre 1 y 200 identificadores de avisos válidos.")
+        with self._lock:
+            stamp = iso_utc(self._utc_clock())
+            records = [{**self._pending[value], "acknowledged_at": stamp}
+                       for value in set(ids) if value in self._pending]
+            if records:
+                self.store.acknowledge_notifications(records)
+                for item in records:
+                    self._pending.pop(item["id"], None)
+                    self._incident_records[item["id"]] = item
+                    self._dirty.discard(item["id"])
+                self._sync_persistent()
+            return self.status()
 
     def _sync_persistent(self):
         synchronize_conditions = getattr(type(self.notifier), "sync_conditions", None)
@@ -184,10 +303,9 @@ class AlertManager:
         synchronize = getattr(self.notifier, "sync_persistent", None)
         if not callable(synchronize):
             return
-        messages = {}
-        if self._settings["enabled"] and self._settings["persistent_critical"]:
-            messages = {kind: {"title": _EVENTS[kind][0], "message": value["message"]}
-                        for kind, value in self._active.items() if kind in _PERSISTENT}
+        messages = ({"notice:" + str(item["id"]): {"title": item["title"], "message": self._notice_message(item)}
+                     for item in sorted(self._pending.values(), key=lambda value: (value["timestamp"], value["id"]))}
+                    if self._settings["enabled"] else {})
         try:
             synchronize(messages)
         except Exception as exc:
@@ -195,6 +313,11 @@ class AlertManager:
 
     def on_event(self, kind, message, data=None):
         """Consume newly observed events; loading stored event history is forbidden."""
+        if kind == "policy_configured":
+            with self._lock:
+                self._resolve("policy_migration_review")
+                self._sync_persistent()
+            return
         if kind in ("policy_action_started", "policy_unknown", "policy_disabled", "policy_online", "policy_on_battery"):
             with self._lock:
                 if kind == "policy_unknown":
@@ -202,6 +325,7 @@ class AlertManager:
                     self._context_power = self._context_connection = "unknown"
                 else:
                     self._active.pop("policy_countdown", None)
+                self._resolve("policy_countdown")
                 self._sync_persistent()
             return
         if kind not in _EVENTS:
@@ -228,15 +352,18 @@ class AlertManager:
                 self._connection_was_lost = False
                 self._last_attempt.pop("connection_lost", None)
                 self._last_attempt.pop("monitor_error", None)
+                self._resolve("connection_lost", "monitor_error")
             elif kind in ("power_restored", "policy_cancelled", "policy_action_failed"):
                 self._active.pop("policy_countdown", None)
                 self._last_attempt.pop("policy_countdown", None)
+                self._resolve("policy_countdown")
             if kind == "power_lost":
                 self._context_power = "battery"
                 self._last_attempt.pop("power_restored", None)
             elif kind == "power_restored":
                 self._context_power = "online"
                 self._last_attempt.pop("power_lost", None)
+                self._resolve("power_lost")
             if kind == "policy_countdown":
                 message = (self._countdown_message(data) if self._number(data.get("countdown_remaining")) else
                            "Cuenta regresiva de protección iniciada. " + str(message).rstrip(".") +
@@ -279,16 +406,24 @@ class AlertManager:
         with self._lock:
             if self._stopped:
                 return
+            self._refresh_inbox()
             protection = protection if isinstance(protection, dict) else {}
             fresh = self._fresh(sample, connection)
             self._context_connection = "connected" if fresh else "unknown"
             self._context_power = ("battery" if sample.get("on_battery") is True else
                                    "online" if sample.get("on_battery") is False else "unknown") if fresh else "unknown"
-            conditions = {"battery_low": False, "overload": False, "ups_fault": False}
+            conditions = {"battery_low": False, "battery_low_percentage": False, "overload": False, "ups_fault": False}
             if fresh:
-                battery, load = sample.get("battery_percent"), sample.get("load_percent")
+                load = sample.get("load_percent")
+                threshold = protection.get("policy", {}).get("low_battery_percent", 20)
+                if type(threshold) is not int or not 0 <= threshold <= 100:
+                    threshold = 20
+                percent, percent_source = battery_percentage(sample)
                 conditions = {
-                    "battery_low": sample.get("low_battery") is True or (self._number(battery) and battery <= 20),
+                    "battery_low": sample.get("low_battery") is True or (threshold > 0
+                        and percent_source == "reported_percentage" and percent <= threshold),
+                    "battery_low_percentage": sample.get("on_battery") is True and threshold > 0
+                        and percent_source == "estimated_percentage" and percent <= threshold,
                     "overload": self._number(load) and load >= 100,
                     "ups_fault": sample.get("fault") is True,
                 }
@@ -301,6 +436,7 @@ class AlertManager:
                 if not active:
                     self._active.pop(kind, None)
                     if fresh:
+                        self._resolve(kind)
                         # Recovery ends this incident. A new alarm must be
                         # immediate even if it starts inside the old cooldown.
                         self._last_attempt.pop(kind, None)
@@ -316,7 +452,17 @@ class AlertManager:
                     emissions.append((kind, message, previous is not None))
             # Publish current conditions before queueing notices. The native
             # thread can then reject a warning invalidated while it was queued.
+            if fresh:
+                if self._context_power == "online":
+                    self._resolve("power_lost")
+                self._resolve("connection_lost", "monitor_error")
             self._sync_persistent()
+            if self._dirty and (self._last_persist_retry is None or self._clock() - self._last_persist_retry >= 30):
+                self._last_persist_retry = self._clock()
+                for notice_id in tuple(self._dirty):
+                    notice = self._pending.get(notice_id) or self._incident_records.get(notice_id)
+                    if notice is not None:
+                        self._save_notice(notice)
             for kind, message, repeat in emissions:
                 self._emit(kind, message, repeat=repeat)
 
@@ -343,6 +489,7 @@ class AlertManager:
     def status(self):
         """Return diagnostics without sending, repeating or acknowledging alerts."""
         with self._lock:
+            self._refresh_inbox()
             try:
                 delivery = self.notifier.status()
             except Exception as exc:
@@ -350,5 +497,7 @@ class AlertManager:
             return {
                 "settings": dict(self._settings), "delivery": delivery,
                 "last_notification": dict(self._last_notification) if self._last_notification else None,
-                "last_error": self._last_error,
+                "last_error": self._inbox_error or self._last_error,
+                "pending": [{**item, "message": self._notice_message(item)} for item in
+                            sorted(self._pending.values(), key=lambda value: (value["timestamp"], value["id"]))],
             }

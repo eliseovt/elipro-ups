@@ -185,6 +185,30 @@ class NativeAdapterTests(unittest.TestCase):
         self.assertFalse(any(key.startswith("_") for key in sample))
         transport.query_status.assert_called_once_with()
 
+    def test_zero_battery_voltage_keeps_native_telemetry_and_alarm_without_inventing_a_percentage(self):
+        for flags, critical in ((0x89, False), (0xC9, True)):
+            with self.subTest(flags=flags):
+                fields = FRAME[1:-1].split(b" ")
+                fields[7], fields[9] = b"\x00", bytes([flags])
+                transport = Mock()
+                transport.query_status.return_value = b"#" + b" ".join(fields) + b"\r"
+                with patch("ups_monitor.native_adapter.probe_forza_monitor", return_value=ABSENT), \
+                     patch("ups_monitor.native_adapter.enumerate_ups", return_value=[metadata()]), \
+                     patch("ups_monitor.native_adapter.StatusTransport", return_value=transport):
+                    adapter = NativeHidAdapter()
+                    sample = adapter.read()
+                self.assertEqual(sample["battery_voltage"], 0)
+                self.assertIs(sample["on_battery"], True)
+                self.assertIs(sample["low_battery"], critical)
+                self.assertIsNone(sample["battery_percent"])
+                self.assertIsNone(sample["battery_percent_estimate"])
+                self.assertIsNone(sample["battery_estimate_method"])
+                self.assertEqual(sample["raw_flags"]["status_hex"], f"{flags:02X}")
+                self.assertGreater(sample["output_voltage"], 0)
+                self.assertIs(adapter.transport, transport)
+                self.assertEqual(adapter._failures, 0)
+                transport.query_status.assert_called_once_with()
+
     def test_inexact_attributes_never_construct_transport(self):
         invalid = [metadata(metadata_open="true"), metadata(vendor_id=1),
                    metadata(product_id=1), metadata(feature_report_bytes=False),

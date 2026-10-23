@@ -1,9 +1,10 @@
 """Desktop tray/sound client. This process never imports or opens a USB reader.
 
 Only a Windows service owns the monitor in an installed build. One agent per
-interactive session polls the bounded broker; closing a browser or this agent
-does not stop the service. All HTTP requests stay on the fixed loopback host,
-disable proxy discovery and redirects, and mutations use the existing CSRF token.
+interactive session polls the bounded broker. The tray's exit command requests
+a complete monitor stop; the installer can stop only the agent with --stop.
+All HTTP requests stay on the fixed loopback host, disable proxy discovery and
+redirects, and mutations use the existing CSRF token.
 """
 from __future__ import annotations
 
@@ -15,6 +16,7 @@ import re
 import secrets
 import threading
 import time
+from urllib.error import HTTPError
 from urllib.request import build_opener, HTTPRedirectHandler, ProxyHandler, Request
 import webbrowser
 
@@ -97,7 +99,8 @@ class LocalClient:
         self.token = None
 
     def _request(self, path, payload=None):
-        if path not in {"/api/status", "/api/session/poll", "/api/protection/cancel"}:
+        if path not in {"/api/status", "/api/session/poll", "/api/protection/cancel",
+                        "/api/notifications/ack", "/api/service/stop"}:
             raise ValueError("Operación de agente no admitida")
         headers = {"Accept": "application/json"}
         body = None
@@ -134,6 +137,37 @@ class LocalClient:
             self.connect()
         return self._request("/api/protection/cancel", {})
 
+    def acknowledge(self, ids):
+        if not self.token:
+            self.connect()
+        return self._request("/api/notifications/ack", {"ids": ids})
+
+    def stop_monitor(self):
+        if not self.token:
+            self.connect()
+        try:
+            response = self._request("/api/service/stop", {})
+        except HTTPError as exc:
+            # Preserve the monitor's specific refusal (for example, a pending
+            # physical UPS test) instead of displaying only "HTTP Error 400".
+            try:
+                content = exc.read(1_000_001)
+                response = json.loads(content) if len(content) <= 1_000_000 else None
+                reason = response.get("error") if isinstance(response, dict) else None
+            except (OSError, ValueError):
+                reason = None
+            finally:
+                exc.close()
+            if isinstance(reason, str) and reason.strip():
+                raise ValueError(reason.strip()[:300]) from exc
+            raise ValueError("El servicio rechazó el cierre. Abre el panel y revisa su estado.") from exc
+        if (not isinstance(response, dict)
+                or not (response.get("stopped") is True or response.get("stopping") is True)):
+            reason = response.get("error") if isinstance(response, dict) else None
+            raise ValueError(reason[:300] if isinstance(reason, str) and reason.strip()
+                             else "El servicio no confirmó el cierre.")
+        return response
+
 
 class Agent:
     def __init__(self, client, notifier, *, stop_event=None, clock=time.monotonic, session_state=None):
@@ -150,8 +184,10 @@ class Agent:
         self.loss_reported = False
         self._clock, self._first_failure = clock, None
         self._session_state = session_state or query_session_state
+        self._exit_lock = threading.Lock()
         self.notifier.cancel_callback = self.cancel
-        self.notifier.exit_callback = self.stop_event.set
+        self.notifier.exit_callback = self.exit
+        self.notifier.acknowledge_callback = lambda ids: self.client.acknowledge(ids)
         probe = self._notifier_method("set_session_probe")
         if probe is not None:
             probe(lambda: self._current_session() == "active")
@@ -206,6 +242,25 @@ class Agent:
             # Do not claim a cancellation reached an unavailable monitor.
             self.notifier.notify("Elipro UPS", "No se pudo confirmar la cancelación. Abre el panel y verifica el estado.",
                                  severity="warning", sound=True)
+
+    def exit(self):
+        # The native menu calls us on a worker thread. Keep the tray available
+        # until the authenticated service acknowledges the stop request.
+        if not self._exit_lock.acquire(blocking=False):
+            return
+        try:
+            if self.stop_event.is_set():
+                return
+            try:
+                self.client.stop_monitor()
+            except (OSError, ValueError) as exc:
+                reason = str(exc).strip()[:300] or "No se pudo contactar con el servicio."
+                self.notifier.notify("Elipro UPS", "No se pudo salir de Elipro. " + reason,
+                                     severity="warning", sound=True)
+                return
+            self.stop_event.set()
+        finally:
+            self._exit_lock.release()
 
     def step(self):
         if not self.connected:
@@ -364,9 +419,7 @@ def main(argv=None):
     try:
         if not kernel.ResetEvent(event):
             raise OSError("No se pudo reiniciar la señal de cierre del agente")
-        notifier = WindowsNotifier(client.url, exit_label="Cerrar avisos de esta sesión…",
-                                   exit_message="Se cerrarán los avisos de esta sesión. El servicio seguirá vigilando el UPS y Windows seguirá encendido. ¿Quieres cerrar los avisos?",
-                                   tray_tip="Elipro UPS · avisos de esta sesión")
+        notifier = WindowsNotifier(client.url)
         Agent(client, notifier).run(lambda: kernel.WaitForSingleObject(event, 0) == 0)
         return 0
     finally:

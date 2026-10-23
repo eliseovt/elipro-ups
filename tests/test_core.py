@@ -5,7 +5,8 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from ups_monitor.core import DEFAULT_POLICY, PolicyEngine, Store, iso_utc, validate_policy
+from ups_monitor.battery_estimation import BATTERY_ESTIMATE_METHOD
+from ups_monitor.core import DEFAULT_POLICY, PolicyEngine, Store, iso_utc, load_saved_policy, migrate_saved_policy, validate_policy
 
 
 class Clock:
@@ -29,7 +30,7 @@ class PolicyTests(unittest.TestCase):
         self.actions = []
         self.events = []
         self.engine = PolicyEngine(
-            {"enabled": True, "on_battery_seconds": 20, "countdown_seconds": 10},
+            {"enabled": True, "countdown_seconds": 10},
             self.actions.append, clock=self.clock.monotonic, utc_clock=self.clock.utc,
             event_callback=lambda *event: self.events.append(event))
 
@@ -42,9 +43,8 @@ class PolicyTests(unittest.TestCase):
             self.clock.step(1)
             self.engine.evaluate(self.sample(**changes))
 
-    def test_time_threshold_and_countdown_fire_once(self):
-        self.engine.evaluate(self.sample())
-        self.advance(20)
+    def test_power_cut_immediately_starts_the_only_countdown_and_fires_once(self):
+        self.assertEqual(self.engine.evaluate(self.sample())["state"], "countdown")
         self.assertEqual(self.engine.status()["countdown_remaining"], 10)
         self.advance(9)
         self.assertEqual(self.actions, [])
@@ -52,7 +52,7 @@ class PolicyTests(unittest.TestCase):
         self.assertEqual(self.actions, ["shutdown"])
 
     def test_policy_change_explains_why_it_is_waiting_without_raw_state_message(self):
-        self.engine.evaluate(self.sample(low_battery=True))
+        self.engine.evaluate(self.sample())
         self.assertEqual(self.engine.status()["state"], "countdown")
         updated = {**self.engine.policy, "countdown_seconds": 20}
         status = self.engine.update_policy(updated)
@@ -66,14 +66,14 @@ class PolicyTests(unittest.TestCase):
         self.assertEqual(self.events[-1][1], "Protección automática desactivada.")
 
     def test_restored_power_cancels(self):
-        self.engine.evaluate(self.sample(low_battery=True))
+        self.engine.evaluate(self.sample())
         self.advance(5, on_battery=False)
         self.advance(20, on_battery=False)
         self.assertEqual(self.actions, [])
         self.assertEqual(self.engine.status()["state"], "online")
 
     def test_manual_cancel_survives_unknown_until_power_restored(self):
-        self.engine.evaluate(self.sample(low_battery=True))
+        self.engine.evaluate(self.sample())
         self.engine.cancel()
         self.engine.evaluate(None)
         self.advance(30, low_battery=True)
@@ -85,7 +85,7 @@ class PolicyTests(unittest.TestCase):
         self.assertEqual(self.actions, ["shutdown"])
 
     def test_disconnect_cancels_and_resets_continuity(self):
-        self.engine.evaluate(self.sample(low_battery=True))
+        self.engine.evaluate(self.sample())
         self.advance(9)
         self.engine.evaluate(self.sample(connected=False))
         self.clock.step(1)
@@ -103,9 +103,9 @@ class PolicyTests(unittest.TestCase):
         self.assertEqual(self.actions, [])
 
     def test_long_polling_gap_restarts_countdown(self):
-        self.engine.evaluate(self.sample(low_battery=True))
+        self.engine.evaluate(self.sample())
         self.clock.step(20)
-        self.engine.evaluate(self.sample(low_battery=True))
+        self.engine.evaluate(self.sample())
         self.assertEqual(self.actions, [])
         self.assertEqual(self.engine.status()["countdown_remaining"], 10)
 
@@ -113,27 +113,20 @@ class PolicyTests(unittest.TestCase):
         self.clock.step(10000)
         self.engine.evaluate(self.sample())
         self.assertEqual(self.engine.status()["on_battery_seconds"], 0)
-        self.assertEqual(self.engine.status()["state"], "on_battery")
+        self.assertEqual(self.engine.status()["state"], "countdown")
+        self.assertEqual(self.engine.status()["countdown_remaining"], 10)
 
     def test_only_real_battery_evidence_allows_low_threshold(self):
         self.engine.evaluate(self.sample(on_battery=False, battery_percent=1, low_battery=True))
         self.advance(50, on_battery=False, battery_percent=1, low_battery=True)
         self.assertEqual(self.actions, [])
 
-    def test_each_low_threshold_starts_countdown(self):
-        for changed in [{"low_battery": True}, {"battery_percent": 20}, {"runtime_seconds": 180}]:
-            self.engine.evaluate(self.sample(on_battery=False))
-            self.assertEqual(self.engine.evaluate(self.sample(**changed))["state"], "countdown")
-
-    def test_string_false_is_not_low_battery_and_invalid_numbers_ignored(self):
-        self.assertEqual(self.engine.evaluate(self.sample(low_battery="false", battery_percent=False,
-                                                         runtime_seconds="0"))["state"], "on_battery")
-
     def test_default_disabled_and_strict_validation(self):
         self.assertFalse(DEFAULT_POLICY["enabled"])
         self.assertEqual(DEFAULT_POLICY["countdown_seconds"], 15)
         self.assertEqual(DEFAULT_POLICY["ups_poweroff_delay_seconds"], 180)
-        for bad in [{"enabled": "false"}, {"on_battery_seconds": True}, {"action": "restart"},
+        self.assertNotIn("on_battery_seconds", DEFAULT_POLICY)
+        for bad in [{"enabled": "false"}, {"on_battery_seconds": 0}, {"action": "restart"},
                     {"countdown_seconds": 0}, {"extra": 1}, {"battery_percent": 2}]:
             with self.assertRaises(ValueError):
                 validate_policy(bad)
@@ -162,7 +155,7 @@ class PolicyTests(unittest.TestCase):
                 validate_policy({"countdown_seconds": value})
 
     def test_disable_and_reenable_resets_manual_cancel(self):
-        self.engine.evaluate(self.sample(low_battery=True))
+        self.engine.evaluate(self.sample())
         self.engine.cancel()
         self.engine.update_policy({"enabled": False})
         self.engine.update_policy({"enabled": True, "countdown_seconds": 10})
@@ -185,8 +178,143 @@ class PolicyTests(unittest.TestCase):
         self.assertEqual(self.actions, ["shutdown"])
         self.assertEqual(self.engine.status()["state"], "action_failed")
 
+    def test_known_estimate_accelerates_without_rewriting_reported_telemetry(self):
+        self.engine.update_policy({"enabled": True, "countdown_seconds": 120})
+        changes = {"battery_percent": None, "battery_percent_estimate": 20,
+                   "battery_estimate_method": BATTERY_ESTIMATE_METHOD}
+        original = self.sample(**changes)
+        status = self.engine.evaluate(original)
+        self.assertEqual(status["countdown_remaining"], 10)
+        self.assertEqual(status["configured_countdown_seconds"], 120)
+        self.assertEqual(status["effective_countdown_seconds"], 10)
+        self.assertEqual(status["emergency"]["source"], "estimated_percentage")
+        self.assertIn("estimado", status["reason"])
+        self.assertIsNone(original["battery_percent"])
+        self.assertIs(original["low_battery"], False)
+        self.advance(9, **changes)
+        self.assertEqual(self.actions, [])
+        self.advance(10, **changes)
+        self.assertEqual(self.actions, ["shutdown"])
+
+    def test_unknown_estimate_never_accelerates_normal_countdown(self):
+        self.engine.update_policy({"enabled": True, "countdown_seconds": 120})
+        changes = {"battery_percent": None, "battery_percent_estimate": 0,
+                   "battery_estimate_method": "unrecognized-estimator"}
+        status = self.engine.evaluate(self.sample(**changes))
+        self.assertFalse(status["emergency"]["active"])
+        self.assertEqual(status["countdown_remaining"], 120)
+        self.advance(10, **changes)
+        self.assertEqual(self.actions, [])
+        self.assertEqual(self.engine.status()["countdown_remaining"], 110)
+
+    def test_reported_percentage_overrides_a_contradictory_known_estimate(self):
+        self.engine.update_policy({"enabled": True, "countdown_seconds": 120})
+        status = self.engine.evaluate(self.sample(battery_percent=80,
+            battery_percent_estimate=1, battery_estimate_method=BATTERY_ESTIMATE_METHOD))
+        self.assertFalse(status["emergency"]["active"])
+        self.assertEqual(status["countdown_remaining"], 120)
+        status = self.engine.evaluate(self.sample(battery_percent=5,
+            battery_percent_estimate=100, battery_estimate_method=BATTERY_ESTIMATE_METHOD))
+        self.assertEqual(status["countdown_remaining"], 10)
+        self.assertEqual(status["emergency"]["source"], "reported_percentage")
+        self.assertEqual(status["emergency"]["percent"], 5)
+
+    def test_percentage_emergency_mid_countdown_preserves_total_elapsed_evidence(self):
+        self.engine.update_policy({"enabled": True, "countdown_seconds": 120})
+        self.engine.evaluate(self.sample())
+        self.advance(30)
+        status = self.engine.evaluate(self.sample(battery_percent=20))
+        self.assertEqual(status["countdown_remaining"], 10)
+        self.assertEqual(status["effective_countdown_seconds"], 40)
+        self.assertEqual(status["configured_countdown_seconds"], 120)
+        self.advance(9)
+        self.assertEqual(self.actions, [])
+        self.advance(1)
+        self.assertEqual(self.actions, ["shutdown"])
+        self.assertEqual(self.engine.status()["effective_countdown_seconds"], 40)
+
+    def test_percentage_emergency_does_not_extend_an_earlier_deadline(self):
+        self.engine.update_policy({"enabled": True, "countdown_seconds": 15})
+        self.engine.evaluate(self.sample())
+        self.advance(10)
+        status = self.engine.evaluate(self.sample(battery_percent=20))
+        self.assertEqual(status["countdown_remaining"], 5)
+        self.assertEqual(status["effective_countdown_seconds"], 15)
+        self.advance(5)
+        self.assertEqual(self.actions, ["shutdown"])
+
+    def test_zero_percentage_threshold_disables_percentage_acceleration_only(self):
+        self.engine.update_policy({"enabled": True, "countdown_seconds": 120, "low_battery_percent": 0})
+        for changes in ({"battery_percent": 0}, {"battery_percent": None, "battery_percent_estimate": 0,
+                         "battery_estimate_method": BATTERY_ESTIMATE_METHOD}):
+            with self.subTest(changes=changes):
+                status = self.engine.evaluate(self.sample(**changes))
+                self.assertFalse(status["emergency"]["active"])
+                self.assertEqual(status["countdown_remaining"], 120)
+                self.assertEqual(self.actions, [])
+        status = self.engine.evaluate(self.sample(low_battery=True))
+        self.assertEqual(self.actions, ["shutdown"])
+        self.assertTrue(status["emergency"]["immediate"])
+        self.assertEqual(status["emergency"]["source"], "ups_critical_alarm")
+
+    def test_hardware_critical_alarm_acts_immediately_and_only_once(self):
+        self.engine.update_policy({"enabled": True, "countdown_seconds": 120})
+        status = self.engine.evaluate(self.sample(low_battery=True, battery_percent=100))
+        self.assertEqual(self.actions, ["shutdown"])
+        self.assertEqual(status["state"], "action_started")
+        self.assertTrue(status["emergency"]["immediate"])
+        self.assertEqual(status["effective_countdown_seconds"], 0)
+        self.advance(30, low_battery=True)
+        self.assertEqual(self.actions, ["shutdown"])
+
 
 class StoreTests(unittest.TestCase):
+    def test_saved_timer_migration_preserves_total_and_independent_ups_delay(self):
+        for wait, countdown, total in ((0, 30, 30), (30, 30, 60), (90, 30, 120)):
+            with self.subTest(wait=wait, countdown=countdown):
+                original = {**DEFAULT_POLICY, "enabled": True, "action": "hibernate", "ups_poweroff": True,
+                            "on_battery_seconds": wait, "countdown_seconds": countdown,
+                            "ups_poweroff_delay_seconds": 540}
+                policy, migration = migrate_saved_policy(original)
+                self.assertEqual(policy["countdown_seconds"], total)
+                self.assertTrue(policy["enabled"])
+                self.assertTrue(policy["ups_poweroff"])
+                self.assertEqual(policy["ups_poweroff_delay_seconds"], 540)
+                self.assertEqual(policy["action"], "hibernate")
+                self.assertNotIn("on_battery_seconds", policy)
+                self.assertFalse(migration["requires_review"])
+                self.assertEqual(original["on_battery_seconds"], wait)
+
+    def test_saved_timer_outside_new_range_requires_review_without_enabling_earlier_action(self):
+        for previous in ({"on_battery_seconds": 300, "countdown_seconds": 30},
+                         {"countdown_seconds": 3600}):
+            with self.subTest(previous=previous):
+                policy, migration = migrate_saved_policy({**DEFAULT_POLICY, "enabled": True, **previous})
+                self.assertFalse(policy["enabled"])
+                self.assertEqual(policy["countdown_seconds"], 120)
+                self.assertTrue(migration["requires_review"])
+                self.assertGreater(migration["previous_total_seconds"], 120)
+
+    def test_saved_timer_migration_never_coerces_invalid_settings(self):
+        for previous in ({"on_battery_seconds": True}, {"on_battery_seconds": -1},
+                         {"on_battery_seconds": 86401}, {"countdown_seconds": "30"},
+                         {"countdown_seconds": 3601}, {"on_battery_seconds": 300, "enabled": "true"}):
+            with self.subTest(previous=previous), self.assertRaises(ValueError):
+                migrate_saved_policy({**DEFAULT_POLICY, **previous})
+
+    def test_saved_timer_migration_backs_up_original_and_is_idempotent(self):
+        store = Store(":memory:")
+        self.addCleanup(store.close)
+        original = {**DEFAULT_POLICY, "enabled": True, "on_battery_seconds": 30, "countdown_seconds": 30}
+        store.set_setting("policy", original)
+        policy = load_saved_policy(store)
+        self.assertEqual(policy["countdown_seconds"], 60)
+        backup = store.get_setting("policy_migration_backup")
+        self.assertEqual(backup["policy"], original)
+        self.assertEqual(load_saved_policy(store), policy)
+        self.assertEqual(store.get_setting("policy_migration_backup"), backup)
+        self.assertIsNone(store.get_setting("policy_migration_review"))
+
     def test_derived_battery_percentage_requires_valid_provenance_and_keeps_real_data(self):
         store = Store(":memory:")
         self.addCleanup(store.close)

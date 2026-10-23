@@ -264,7 +264,7 @@ class ServerTests(unittest.TestCase):
 
     def test_stale_snapshot_cancels_countdown_and_hides_old_measurements(self):
         self.monitor.set_policy({"enabled": True, "countdown_seconds": 10})
-        self.adapter.read = lambda: {"timestamp": iso_utc(), "on_battery": True, "low_battery": True}
+        self.adapter.read = lambda: {"timestamp": iso_utc(), "on_battery": True, "low_battery": False}
         self.monitor.tick()
         self.monitor.sample["timestamp"] = iso_utc(datetime.now(timezone.utc) - timedelta(seconds=16))
         snapshot = self.monitor.snapshot()

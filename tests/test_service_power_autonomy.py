@@ -20,7 +20,7 @@ class ServicePowerAutonomyTests(unittest.TestCase):
             data_dir = Path(directory)
             saved = Store(data_dir / "monitor.sqlite3")
             saved.set_setting("policy", {**DEFAULT_POLICY, "enabled": enabled, "action": action,
-                                         "on_battery_seconds": 86400, "countdown_seconds": 10})
+                                         "countdown_seconds": 10})
             saved.close()
             api, power, ownership = FakeHostAPI(), Mock(), Mock()
             broker = SessionBroker()
@@ -40,6 +40,8 @@ class ServicePowerAutonomyTests(unittest.TestCase):
                     monitor.engine._clock = clock
                     monitor.tick()
                     result["first_state"] = monitor.engine.status()["state"]
+                    result["immediate_emergency"] = monitor.engine.status()["emergency"]["immediate"]
+                    result["actions_after_first"] = power.call_count
                     clock.return_value = 111
                     monitor.tick()
                     clock.return_value = 112
@@ -79,7 +81,9 @@ class ServicePowerAutonomyTests(unittest.TestCase):
     def test_default_service_keeps_enabled_policy_in_simulation_without_agent(self):
         result, power = self.run_host(enabled=True)
         self.assertTrue(result["dry_run"])
-        self.assertEqual(result["first_state"], "countdown")
+        self.assertEqual(result["first_state"], "action_started")
+        self.assertTrue(result["immediate_emergency"])
+        self.assertEqual(result["actions_after_first"], 0)
         self.assertIn("simulation", result["events"])
         power.assert_not_called()
 
@@ -90,12 +94,14 @@ class ServicePowerAutonomyTests(unittest.TestCase):
         self.assertEqual(result["final_state"], "disabled")
         power.assert_not_called()
 
-    def test_low_battery_runs_one_service_owned_action_without_any_agent(self):
+    def test_critical_battery_runs_one_immediate_service_owned_action_without_any_agent(self):
         for action in ("shutdown", "hibernate"):
             with self.subTest(action=action):
                 result, power = self.run_host(allow_power_actions=True, enabled=True, action=action)
                 self.assertFalse(result["dry_run"])
-                self.assertEqual(result["first_state"], "countdown")
+                self.assertEqual(result["first_state"], "action_started")
+                self.assertTrue(result["immediate_emergency"])
+                self.assertEqual(result["actions_after_first"], 1)
                 self.assertEqual(result["final_state"], "action_started")
                 self.assertIn("policy_action_started", result["events"])
                 power.assert_called_once_with(action)

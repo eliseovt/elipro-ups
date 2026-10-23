@@ -388,7 +388,8 @@ class UpsPowerCoordinatorTests(unittest.TestCase):
         self.assertEqual(VALIDATED_PROFILES[profile["profile_id"]]["device_fingerprint"], OBSERVED_UNIT_FINGERPRINT)
 
     def sequence_evidence(self):
-        return {"profile_id": self.profile["profile_id"], "device_fingerprint": device_fingerprint(DEVICE),
+        return {"kind": "battery_countdown", "version": 2,
+                "profile_id": self.profile["profile_id"], "device_fingerprint": device_fingerprint(DEVICE),
                 "last_mains_monotonic": 88, "battery_started_monotonic": 90, "last_sample_monotonic": 100,
                 "last_mains_sample": sample(on_battery=False, raw_status="Line mode", raw_flags={"status_hex": "09"},
                                             battery_voltage=27.41, load_percent=11),
@@ -424,8 +425,9 @@ class UpsPowerCoordinatorTests(unittest.TestCase):
             self.assertEqual(operation["reserve_mode"], "observed_sequence")
             self.assertEqual(operation["state"], "arming")
             self.assertIs(validate_production_start_preflight(profile, operation, self.sequence_sample(), now_monotonic=101), True)
+            self.assertTrue(validate_production_start_preflight(profile, operation, self.sequence_sample(), now_monotonic=108.001))
             with self.assertRaises(UpsPowerBlocked):
-                validate_production_start_preflight(profile, operation, self.sequence_sample(), now_monotonic=108.001)
+                validate_production_start_preflight(profile, operation, self.sequence_sample(), now_monotonic=110.001)
             return {"state": "submitted"}
 
         self.transport.submit_shutdown.side_effect = submit
@@ -438,22 +440,20 @@ class UpsPowerCoordinatorTests(unittest.TestCase):
         self.assertIsNone(capability["reserve_baseline"])
         self.transport.submit_shutdown.assert_called_once_with(180)
 
-    def test_sequence_rejects_long_countdown_wait_missing_history_load_voltage_fault_and_late_arm(self):
+    def test_current_countdown_rejects_bad_timing_identity_fault_and_pending_commands(self):
         profile = sequence_profile()
         coordinator = self.make(profiles={profile["profile_id"]: profile})
         original = self.sequence_evidence()
-        for changes in ({"countdown_seconds": 120}, {"countdown_seconds": 9}, {"on_battery_seconds": 60},
-                        {"device_fingerprint": "0" * 64}, {"last_mains_monotonic": 79.999},
-                        {"battery_started_monotonic": None}, {"max_load_percent": 12}, {"min_battery_voltage": 25.40}):
+        for changes in ({"countdown_seconds": 120}, {"countdown_seconds": 9}, {"version": True},
+                        {"device_fingerprint": "0" * 64}, {"last_sample_monotonic": 84.999},
+                        {"battery_started_monotonic": None}, {"kind": "old_sequence"}):
             with self.subTest(changes=changes), self.assertRaises(UpsPowerBlocked):
                 coordinator.arm("hibernate", device=DEVICE, sample=self.sequence_sample(), sequence_evidence={**original, **changes})
-        for changes in ({"load_percent": 12}, {"load_percent": None}, {"battery_voltage": 25.40},
-                        {"battery_voltage": None}, {"low_battery": True}, {"fault": True}):
+        for changes in ({"output_voltage": 0}, {"timestamp": "2000-01-01T00:00:00Z"}, {"low_battery": True}, {"fault": True},
+                        {"raw_flags": {"status_hex": "8D"}}, {"raw_flags": {"status_hex": "8B"}},
+                        {"raw_flags": {"status_hex": "C9"}}, {"raw_flags": {"status_hex": "99"}}):
             with self.subTest(changes=changes), self.assertRaises(UpsPowerBlocked):
                 coordinator.arm("hibernate", device=DEVICE, sample=self.sequence_sample(**changes), sequence_evidence=original)
-        bad_mains = {**original, "last_mains_sample": {**original["last_mains_sample"], "battery_voltage": 27.40}}
-        with self.assertRaises(UpsPowerBlocked):
-            coordinator.arm("hibernate", device=DEVICE, sample=self.sequence_sample(), sequence_evidence=bad_mains)
         with self.assertRaises(UpsPowerBlocked):
             coordinator.arm("hibernate", device=DEVICE, sample=self.sequence_sample())
         with self.assertRaises(UpsPowerBlocked):
@@ -524,7 +524,7 @@ class UpsPowerCoordinatorTests(unittest.TestCase):
         evidence["last_mains_sample"]["timestamp"] = (datetime.now(timezone.utc) - timedelta(seconds=122)).isoformat()
         self.assertTrue(validate_observed_sequence_preflight(profile, "hibernate", self.sequence_sample(), evidence, now_monotonic=200))
         for change in ({"last_sample_monotonic": 184.99}, {"battery_started_monotonic": 81},
-                       {"max_load_percent": 12}, {"min_battery_voltage": 25.40}):
+                       {"last_sample_monotonic": 201}):
             with self.subTest(change=change), self.assertRaises(UpsPowerBlocked):
                 validate_observed_sequence_preflight(profile, "hibernate", self.sequence_sample(),
                     {**evidence, **change}, now_monotonic=200)
@@ -532,6 +532,49 @@ class UpsPowerCoordinatorTests(unittest.TestCase):
             sequence_evidence=evidence, delay_seconds=60)
         self.assertEqual(result["delay_seconds"], 60)
         self.assertEqual(result["sequence_evidence"]["countdown_seconds"], 120)
+
+    def test_operational_limits_do_not_turn_trial_readings_into_voltage_or_load_thresholds(self):
+        profile = sequence_profile()
+        physical = copy.deepcopy(profile["action_validation"]["hibernate"])
+        coordinator = self.make(profiles={profile["profile_id"]: profile})
+        evidence = {**self.sequence_evidence(), "max_load_percent": 23, "min_battery_voltage": 25.18}
+        evidence["last_mains_sample"].update(battery_voltage=26.9, load_percent=23)
+
+        def submit(delay):
+            operation = OperationJournal(self.path).load()
+            self.assertTrue(validate_production_start_preflight(profile, operation,
+                self.sequence_sample(battery_voltage=25.18, load_percent=23), now_monotonic=101))
+            return {"state": "submitted"}
+
+        self.transport.submit_shutdown.side_effect = submit
+        result = coordinator.arm("hibernate", device=DEVICE,
+            sample=self.sequence_sample(battery_voltage=25.18, load_percent=23), sequence_evidence=evidence, delay_seconds=60)
+        self.assertEqual(result["state"], "submitted")
+        self.assertEqual(result["delay_seconds"], 60)
+        self.assertIsNone(result["reserve_seconds"])
+        self.assertEqual(profile["action_validation"]["hibernate"], physical)
+        capability = coordinator.capabilities(DEVICE, "hibernate", delay_seconds=60)
+        self.assertEqual(capability["operational_limits"]["source"], "device_status")
+        self.assertNotIn("min_battery_voltage", capability["operational_limits"])
+
+    def test_voltage_is_informational_even_missing_or_zero_in_tracker_evidence_and_worker_reading(self):
+        profile = sequence_profile()
+        for voltage in (None, 0, -1):
+            with self.subTest(voltage=voltage):
+                coordinator = self.make(path=self.path.with_name(f"voltage-{voltage}.json"), profiles={profile["profile_id"]: profile})
+                evidence = {**self.sequence_evidence(), "min_battery_voltage": None}
+                evidence["last_mains_sample"]["battery_voltage"] = voltage
+
+                def submit(delay):
+                    operation = coordinator._journal.load()
+                    self.assertTrue(validate_production_start_preflight(profile, operation,
+                        self.sequence_sample(battery_voltage=voltage), now_monotonic=101))
+                    return {"state": "submitted"}
+
+                self.transport.submit_shutdown.side_effect = submit
+                result = coordinator.arm("hibernate", device=DEVICE,
+                    sample=self.sequence_sample(battery_voltage=voltage), sequence_evidence=evidence, delay_seconds=60)
+                self.assertEqual(result["state"], "submitted")
 
     def test_configured_delay_owns_its_cancellation_deadline_and_survives_journal_reload(self):
         profile = sequence_profile()
@@ -544,6 +587,41 @@ class UpsPowerCoordinatorTests(unittest.TestCase):
         with self.assertRaises(UpsPowerBlocked):
             coordinator.cancel(device=DEVICE, sample=self.sequence_sample())
         self.transport.cancel_shutdown.assert_not_called()
+
+    def test_current_battery_countdown_arms_without_mains_load_or_voltage_conditions(self):
+        profile = sequence_profile()
+        profile["action_validation"]["hibernate"]["validated_max_load_percent"] = 11
+        physical = copy.deepcopy(profile["action_validation"])
+        coordinator = self.make(profiles={profile["profile_id"]: profile})
+        evidence = self.sequence_evidence()
+        for key in ("last_mains_sample", "last_mains_monotonic", "max_load_percent", "min_battery_voltage"):
+            evidence.pop(key)
+        self.clock.return_value = 300
+        evidence["last_sample_monotonic"] = 300
+        reading = self.sequence_sample(load_percent=150, battery_voltage=None)
+        def submit(delay):
+            self.assertTrue(validate_production_start_preflight(profile, coordinator._journal.load(),
+                reading, now_monotonic=301))
+            return {"state": "submitted"}
+        self.transport.submit_shutdown.side_effect = submit
+        result = coordinator.arm("hibernate", device=DEVICE, sample=reading, sequence_evidence=evidence, delay_seconds=60)
+        self.assertTrue(result["submission_complete"])
+        self.assertEqual(profile["action_validation"], physical)
+        self.transport.submit_shutdown.assert_called_once_with(60)
+
+    def test_legacy_sequence_journal_loads_for_review_but_cannot_be_replayed_as_current_evidence(self):
+        profile = sequence_profile()
+        coordinator = self.make(profiles={profile["profile_id"]: profile})
+        evidence = self.sequence_evidence()
+        evidence.pop("kind")
+        evidence.pop("version")
+        with self.assertRaises(UpsPowerBlocked):
+            coordinator.arm("hibernate", device=DEVICE, sample=self.sequence_sample(), sequence_evidence=evidence)
+        self.transport.submit_shutdown.assert_not_called()
+        operation = self.arm(self.coordinator)
+        operation["sequence_evidence"] = evidence
+        OperationJournal(self.path).write(operation)
+        self.assertEqual(OperationJournal(self.path).load()["sequence_evidence"], evidence)
 
     def test_user_timer_keeps_numeric_headroom_above_the_profile_hibernation_measurement(self):
         profile = sequence_profile()
