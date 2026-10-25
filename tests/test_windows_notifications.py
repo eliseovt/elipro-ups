@@ -520,7 +520,7 @@ class NativeShellTests(unittest.TestCase):
         notifier = wn.WindowsNotifier("http://127.0.0.1:8765", cancel_callback=Mock())
         notifier._open_panel = Mock()
         self.backend.owner = notifier
-        self.user.CreateWindowExW.side_effect = [0xE0000000001 + n for n in range(5)]
+        self.user.CreateWindowExW.side_effect = [0xE0000000001 + n for n in range(6)]
         self.user.SetWindowPos.return_value = 1
         self.user.SetTimer.return_value = 1
 
@@ -539,8 +539,8 @@ class NativeShellTests(unittest.TestCase):
         self.backend.gdi.CreateFontW.side_effect = [1001, 1002]
         self.backend._show_popup("DPI", "Escala 200 %")
         create_popup = self.user.CreateWindowExW.call_args_list[1].args
-        self.assertEqual(create_popup[6:8], (840, 380))
-        self.assertEqual(self.user.SetWindowPos.call_args.args[4:6], (840, 380))
+        self.assertEqual(create_popup[6:8], (840, 460))
+        self.assertEqual(self.user.SetWindowPos.call_args.args[4:6], (840, 460))
         self.assertEqual(self.backend.gdi.CreateFontW.call_args.args[0], -26)
         proposed = wn.RECT(20, 40, 650, 325)
         self.backend._window_proc(self.backend.popup_hwnd, wn.WM_DPICHANGED,
@@ -549,7 +549,7 @@ class NativeShellTests(unittest.TestCase):
         self.assertEqual(self.user.SetWindowPos.call_args.args[2:6], (20, 40, 630, 285))
         self.assertEqual(self.backend.gdi.CreateFontW.call_args.args[0], -20)
         self.backend.gdi.DeleteObject.assert_called_once_with(1001)
-        self.assertEqual(self.user.SendMessageW.call_count, 8)
+        self.assertEqual(self.user.SendMessageW.call_count, 10)
         self.backend._destroy_popup()
         self.backend.gdi.DeleteObject.assert_called_with(1002)
         self.assertIsNone(self.backend.popup_font)
@@ -623,7 +623,7 @@ class NativeShellTests(unittest.TestCase):
         self.assertTrue(create_args[0] & 0x08000000)  # WS_EX_NOACTIVATE
         self.assertTrue(create_args[0] & 0x00000080)  # WS_EX_TOOLWINDOW
         self.assertTrue(create_args[0] & 0x00000008)  # WS_EX_TOPMOST
-        self.assertEqual(create_args[6:8], (420, 190))
+        self.assertEqual(create_args[6:8], (420, 230))
         self.assertTrue(self.user.SetWindowPos.call_args.args[-1] & 0x10)  # SWP_NOACTIVATE
         with patch.object(wn.time, "monotonic", return_value=100.05):
             self.backend._maybe_fallback_popup()
@@ -687,7 +687,8 @@ class NativeShellTests(unittest.TestCase):
         self.backend._destroy_popup()
         self.assertIsNone(self.backend.popup_hwnd)
         self.assertEqual(self.backend.hwnd, main_hwnd)
-        self.user.KillTimer.assert_called_with(popup_hwnd, 1)
+        self.user.KillTimer.assert_any_call(popup_hwnd, 1)
+        self.user.KillTimer.assert_any_call(popup_hwnd, 3)
         self.user.PostQuitMessage.assert_not_called()
 
     def test_destroy_removes_icon_with_original_window_handle(self):

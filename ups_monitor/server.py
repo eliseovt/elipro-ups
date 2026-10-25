@@ -58,6 +58,14 @@ class WindowsActionUnconfirmed(RuntimeError):
     """The request may have acted; lack of process completion is not rejection."""
 
 
+class CountdownConflictError(ValueError):
+    """A guarded cancellation no longer names a current cancelable episode."""
+
+
+class CountdownBusyError(RuntimeError):
+    """The protection lock could not be acquired within the UI request budget."""
+
+
 def log_failure(message, exc):
     # Keep traceback locations, but never log request bodies, tokens or exception payloads.
     LOGGER.error("%s (%s)\n%s", message, type(exc).__name__, "".join(traceback.format_tb(exc.__traceback__)))
@@ -1535,6 +1543,7 @@ class Monitor:
             elif self.test_ups_simulation is not None:
                 phase = self.test_ups_simulation["phase"]
                 simulation = True
+            actionable_countdown = not simulation and self._countdown_actionable(raw)
             return {
                 "csrf_token": self.csrf_token,
                 "connection": {"state": self.connection, "source": self.adapter.source,
@@ -1556,7 +1565,10 @@ class Monitor:
                                "effective_countdown_seconds": raw.get("effective_countdown_seconds"),
                                "emergency": copy.deepcopy(raw.get("emergency")),
                                "phase": phase, "windows_request": self._windows_request,
-                               "cancelable": state == "countdown" and phase == "windows_countdown",
+                               "cancelable": (state == "countdown" and phase == "windows_countdown"
+                                              if simulation else actionable_countdown),
+                               "countdown_id": raw.get("countdown_id") if actionable_countdown else None,
+                               "valid_for_ms": raw.get("countdown_valid_for_ms", 0) if actionable_countdown else 0,
                                "countdown_remaining": remaining, "simulation": simulation,
                                "deadline": iso_utc(datetime.now(timezone.utc) + timedelta(seconds=remaining)) if remaining else None},
                 "meta": {"name": "Elipro UPS", "model": "Forza NT-2402PRO", "capacity_watts": 1200,
@@ -1623,6 +1635,35 @@ class Monitor:
                 self.test_ups_delay = None
             self.engine.cancel()
             return self.snapshot()
+
+    def _countdown_actionable(self, raw):
+        """Inspect current state under the decision lock, without new USB I/O."""
+        return (raw.get("state") == "countdown" and raw.get("cancelable") is True
+                and isinstance(raw.get("countdown_id"), str)
+                and not self.power_actions_blocked and self.test_deadline is None
+                and not self.stop_event.is_set() and not self._power_gate.is_set()
+                and not self._health_fault.is_set() and self.system_power_status()["state"] == "running"
+                and self.connection == "connected" and self._fresh_sample(self.sample)
+                and self.sample.get("on_battery") is True)
+
+    def cancel_countdown(self, countdown_id):
+        """Cancel exactly one still-current real countdown, never a later one."""
+        if (not isinstance(countdown_id, str) or len(countdown_id) != 32
+                or any(character not in "0123456789abcdef" for character in countdown_id)):
+            raise ValueError("El identificador de la cuenta regresiva no es válido.")
+        if not self.lock.acquire(timeout=0.25):
+            raise CountdownBusyError("El monitor está ocupado; no se confirmó la cancelación.")
+        try:
+            current = self.engine.status()
+            if current.get("countdown_id") != countdown_id or not self._countdown_actionable(current):
+                raise CountdownConflictError("La cuenta cambió, terminó o ya no admite cancelación. Revisa el estado actual.")
+            self.engine.cancel()
+            self._update_alerts()
+            result = self.snapshot()
+            result["cancelled_countdown_id"] = countdown_id
+            return result
+        finally:
+            self.lock.release()
 
     def test(self, *, include_ups=False):
         with self.lock:
@@ -1812,6 +1853,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(broker.poll(data))
             if path == "/api/protection/cancel":
                 return self._json(self.monitor.cancel())
+            if path == "/api/protection/countdown/cancel":
+                if not isinstance(data, dict) or set(data) != {"countdown_id"}:
+                    raise ValueError("La cancelación identificada requiere únicamente countdown_id.")
+                return self._json(self.monitor.cancel_countdown(data["countdown_id"]))
             if path == "/api/ups/cancel-test/start":
                 if not isinstance(data, dict) or set(data) != {"acknowledge_risk"} or data["acknowledge_risk"] is not True:
                     raise ValueError("La prueba real requiere confirmación explícita del riesgo.")
@@ -1867,6 +1912,10 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"stopped": True})
                 return
             return self._json({"error": "No encontrado."}, 404)
+        except CountdownConflictError as exc:
+            self._json({"error": str(exc)}, 409)
+        except CountdownBusyError as exc:
+            self._json({"error": str(exc)}, 503)
         except HistoryUnavailable as exc:
             self._json({"error": str(exc), "history": self.monitor.history_status()}, 503)
         except (ValueError, TypeError) as exc:
@@ -1953,6 +2002,7 @@ def _run_owned_monitor(args, ownership, *, stop_event=None, ready_callback=None)
                           ups_battery_test_journal=args.data_dir / "ups-battery-test-operation.json")
         monitor.runtime_mode = "service" if getattr(args, "headless", False) else "session"
         notifier.cancel_callback = lambda: monitor.cancel() if not monitor.stop_event.is_set() else None
+        notifier.cancel_countdown_callback = monitor.cancel_countdown
         server = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
         server.monitor = monitor
         server.session_broker = notifier if getattr(args, "headless", False) else None

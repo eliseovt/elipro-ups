@@ -123,6 +123,8 @@ El corte de la salida del UPS es una capacidad separada, bloqueada hasta validar
 Las capturas muestran una configuración de ejemplo; la protección automática está desactivada por defecto.
 
 ### Telemetría, avisos y notificaciones
+
+* **Prioridad de avisos (0.9.21):** Una cuenta regresiva real se muestra antes que las alarmas críticas; estas tienen prioridad sobre cortes y revisiones pendientes. Una alerta más urgente sustituye la ventana visible conservando los demás incidentes. Windows muestra el contador y permite **Cancelar protección** únicamente para la cuenta vigente, con confirmación del monitor. Los datos caducados deshabilitan ese botón; las actualizaciones del contador no repiten el sonido.
 * **Telemetría continua:** Lectura de alimentación de red/batería, voltajes de entrada y salida, frecuencia, carga del UPS, voltaje de batería y señales de batería baja o falla.
 * **Ventana modal global:** Los avisos de condiciones activas se cierran automáticamente cuando el monitor confirma su recuperación. Los avisos de recuperación son temporales y los incidentes se conservan en el historial, sin marcarlos como leídos automáticamente. **Entendido** permite reconocer un aviso activo; las cuentas atrás reales o simuladas mantienen **Cancelar protección** y reconocer un aviso no cancela la actuación. Los resultados que requieren revisión siguen visibles hasta confirmarlos.
 * **Avisos nativos y System Tray:** Notificaciones de Windows, sonido e icono de bandeja aunque se cierre el navegador.

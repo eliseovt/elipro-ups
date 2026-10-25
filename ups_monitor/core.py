@@ -12,6 +12,7 @@ import hashlib
 import math
 import copy
 import queue
+import secrets
 import sqlite3
 import threading
 import time
@@ -1030,6 +1031,7 @@ class PolicyEngine:
         self._clock, self._utc_clock = clock, utc_clock
         self.stale_after = stale_after
         self._battery_since = self._deadline = self._last_fresh_at = None
+        self._countdown_id = None
         self._effective_countdown_seconds = None
         self._emergency_source = self._emergency_percent = None
         self._suppressed = self._fired = False
@@ -1038,8 +1040,15 @@ class PolicyEngine:
     def _transition(self, state, reason=None):
         changed = state != self._state or reason != self._reason
         self._state, self._reason = state, reason
+        if state != "countdown":
+            self._countdown_id = None
         if changed and self._event_callback:
-            self._event_callback("policy_" + state, reason or state, {"state": state})
+            data = {"state": state}
+            if state == "countdown":
+                current = self.status()
+                data.update({key: current[key] for key in (
+                    "countdown_id", "countdown_remaining", "countdown_valid_for_ms", "cancelable", "action")})
+            self._event_callback("policy_" + state, reason or state, data)
 
     def update_policy(self, policy):
         value = validate_policy(policy)
@@ -1119,6 +1128,7 @@ class PolicyEngine:
         percentage_low = threshold > 0 and percent is not None and percent <= threshold
         starting_countdown = self._deadline is None
         if starting_countdown:
+            self._countdown_id = secrets.token_hex(16)
             self._deadline = now + self.policy["countdown_seconds"]
             self._effective_countdown_seconds = self.policy["countdown_seconds"]
         if hardware_critical or percentage_low:
@@ -1152,8 +1162,14 @@ class PolicyEngine:
 
     def status(self):
         now = self._clock()
+        countdown = self._state == "countdown" and self._deadline is not None and self._countdown_id is not None
+        age = now - self._last_fresh_at if self._last_fresh_at is not None else None
+        valid_for_ms = max(0, int(3000 - age * 1000)) if countdown and age is not None and age >= 0 else 0
         return {
             "state": self._state, "enabled": self.policy["enabled"], "reason": self._reason,
+            "countdown_id": self._countdown_id if countdown else None,
+            "countdown_valid_for_ms": valid_for_ms,
+            "cancelable": bool(countdown and self._deadline > now and valid_for_ms > 0 and not self._fired),
             "countdown_remaining": max(0, math.ceil(self._deadline - now)) if self._deadline is not None else None,
             "on_battery_seconds": max(0, int(now - self._battery_since)) if self._battery_since is not None else 0,
             "action": self.policy["action"], "suppressed": self._suppressed,

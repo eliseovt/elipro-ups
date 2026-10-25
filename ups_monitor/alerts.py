@@ -13,6 +13,7 @@ import time
 from datetime import datetime, timezone
 
 from .core import battery_percentage, iso_utc, utc_now
+from .notification_priority import age_notice_metadata, normalize_notice_metadata, notification_priority
 
 
 DEFAULT_NOTIFICATION_SETTINGS = {
@@ -121,6 +122,8 @@ class AlertManager:
         self._connection_was_lost = False
         self._last_attempt = {}
         self._active = {}
+        self._event_confirmations = {}
+        self._countdown = None
         self._last_notification = self._last_error = None
         self._context_power = self._context_connection = "unknown"
         self._pending = {}
@@ -147,6 +150,7 @@ class AlertManager:
                     self._battery_low_sources.update(source for source in item.get("condition_sources", [])
                                                      if source in ("signal", "reported_percentage"))
         self._loaded_notice_ids = set(self._pending) | set(self._incident_records)
+        self._restored_countdown_notice = self._incidents.get("policy_countdown")
         self.notifier.acknowledge_callback = self.acknowledge
         try:
             self._settings = validate_notification_settings(
@@ -229,6 +233,8 @@ class AlertManager:
             elif kind not in _INBOX_EVENTS and self._settings["persistent_critical"] and kind in _PERSISTENT:
                 options.update(persistent=True, key=kind)
             publisher = getattr(type(self.notifier), "publish_event", None)
+            if getattr(type(self.notifier), "supports_notification_priority", False) is True:
+                options["priority"] = self._notice_metadata(notice)["priority"] if notice else notification_priority(kind)
             accepted = (self.notifier.publish_event(kind, title, message, repeat=repeat, **options)
                         if callable(publisher) else self.notifier.notify(title, message, **options)) is True
             self._last_error = None if accepted else "El canal de avisos no aceptó el aviso en la cola de entrega. Revisa el estado de los avisos."
@@ -319,7 +325,8 @@ class AlertManager:
             # Session-zero delivery needs semantic state even when users do
             # not want sticky popups. Queued countdowns must never imply that
             # an expired/cancelled power action is still pending after unlock.
-            current = ({kind: {"title": _EVENTS[kind][0], "message": value["message"]}
+            current = ({kind: self._notice_metadata({"kind": kind, "title": _EVENTS[kind][0],
+                                                    "message": value["message"], "resolved_at": None})
                         for kind, value in self._active.items()} if self._settings["enabled"] else {})
             self.notifier.sync_conditions(current, power_state=self._context_power,
                                           connection_state=self._context_connection,
@@ -327,14 +334,65 @@ class AlertManager:
         synchronize = getattr(self.notifier, "sync_persistent", None)
         if not callable(synchronize):
             return
-        messages = ({"notice:" + str(item["id"]): {"title": item["title"], "message": self._notice_message(item)}
-                     for item in sorted(self._pending.values(), key=lambda value: (value["timestamp"], value["id"]))
+        messages = ({"notice:" + str(item["id"]): self._notice_metadata(item)
+                     for item in sorted(self._pending.values(), key=self._notice_sort_key)
                      if _requires_attention(item)}
                     if self._settings["enabled"] else {})
         try:
             synchronize(messages)
         except Exception as exc:
             self._last_error = "No se pudo actualizar el aviso persistente: " + str(exc)[:300]
+
+    def _notice_sort_key(self, notice):
+        return (-self._notice_metadata(notice)["priority"], notice["timestamp"], notice["id"])
+
+    def _countdown_snapshot(self):
+        if self._countdown is None:
+            return None
+        return age_notice_metadata(self._countdown["value"], self._clock() - self._countdown["received"])["countdown"]
+
+    def _observe_countdown(self, protection):
+        value = normalize_notice_metadata({"title": "Protección", "message": "Cuenta activa", "countdown": {
+            "countdown_id": protection.get("countdown_id"), "action": protection.get("action"),
+            "remaining_seconds": protection.get("countdown_remaining"),
+            "valid_for_ms": protection.get("countdown_valid_for_ms", 0),
+            "cancelable": protection.get("cancelable", True)}})
+        countdown = value.get("countdown")
+        if countdown is None:
+            self._countdown = None
+            return
+        previous = self._countdown_snapshot()
+        if ((previous is not None and previous["countdown_id"] != countdown["countdown_id"])
+                or self._restored_countdown_notice is not None):
+            self._resolve("policy_countdown")
+            self._active.pop("policy_countdown", None)
+            self._last_attempt.pop("policy_countdown", None)
+            self._restored_countdown_notice = None
+        if previous is not None and previous["countdown_id"] == countdown["countdown_id"]:
+            countdown["remaining_seconds"] = min(previous["remaining_seconds"], countdown["remaining_seconds"])
+        self._countdown = {"value": value, "received": self._clock()}
+
+    def _notice_metadata(self, notice):
+        kind = notice["kind"]
+        active = self._active.get(kind)
+        confirmed_until = active.get("confirmed_until", 0) if active else self._event_confirmations.get(kind, 0)
+        confirmed_for_ms = max(0, min(3000, (confirmed_until - self._clock()) * 1000))
+        confirmed = bool(confirmed_for_ms and _requires_attention(notice))
+        countdown = self._countdown_snapshot() if kind == "policy_countdown" else None
+        current_countdown = (confirmed and countdown is not None and countdown["valid_for_ms"] > 0
+                             and countdown["remaining_seconds"] > 0)
+        priority = notification_priority(kind, countdown_active=current_countdown)
+        if not _requires_attention(notice):
+            priority = 0
+        result = {"title": notice["title"], "message": self._notice_message(notice),
+                  "priority": priority, "severity": _EVENTS.get(kind, (None, "info"))[1],
+                  "sound": self._settings["sound_enabled"], "repeat_seconds": self._settings["repeat_seconds"],
+                  "confirmed": confirmed, "confirmed_for_ms": confirmed_for_ms}
+        if countdown is not None and _requires_attention(notice):
+            result["countdown"] = countdown
+            if not current_countdown:
+                result["confirmed"] = False
+        return result
 
     def on_event(self, kind, message, data=None):
         """Consume newly observed events; loading stored event history is forbidden."""
@@ -347,9 +405,13 @@ class AlertManager:
             with self._lock:
                 if kind == "policy_unknown":
                     self._active.clear()
+                    self._countdown = None
+                    for condition in _PERSISTENT:
+                        self._event_confirmations.pop(condition, None)
                     self._context_power = self._context_connection = "unknown"
                 else:
                     self._active.pop("policy_countdown", None)
+                    self._countdown = None
                 self._resolve("policy_countdown")
                 self._sync_persistent()
             return
@@ -359,6 +421,7 @@ class AlertManager:
         with self._lock:
             if self._stopped or data.get("error_kind") == "stopped":
                 return
+            self._event_confirmations[kind] = self._clock() + 3
             if kind == "policy_countdown" and data.get("simulation") is True:
                 self._active.pop("policy_countdown", None)
                 self._sync_persistent()
@@ -369,6 +432,9 @@ class AlertManager:
                 self._context_power = self._context_connection = "unknown"
                 self._connection_was_lost = True
                 self._active.clear()
+                self._countdown = None
+                for condition in _PERSISTENT:
+                    self._event_confirmations.pop(condition, None)
                 self._last_attempt.pop("connection_restored", None)
             elif kind == "connection_restored":
                 self._context_connection = "connected"
@@ -380,6 +446,7 @@ class AlertManager:
                 self._resolve("connection_lost", "monitor_error")
             elif kind in ("power_restored", "policy_cancelled", "policy_action_failed"):
                 self._active.pop("policy_countdown", None)
+                self._countdown = None
                 self._last_attempt.pop("policy_countdown", None)
                 self._resolve("policy_countdown")
             if kind == "power_lost":
@@ -393,8 +460,11 @@ class AlertManager:
                 message = (self._countdown_message(data) if self._number(data.get("countdown_remaining")) else
                            "Cuenta regresiva de protección iniciada. " + str(message).rstrip(".") +
                            ". Abre Elipro para revisar o cancelar la protección.")
+            if kind == "policy_countdown":
+                self._observe_countdown(data)
             if kind in _PERSISTENT:
                 self._active.setdefault(kind, {"last_attempt": None})["message"] = str(message)
+                self._active[kind]["confirmed_until"] = self._clock() + 3
             self._sync_persistent()
             self._emit(kind, str(message))
 
@@ -459,6 +529,12 @@ class AlertManager:
             self._context_connection = "connected" if fresh else "unknown"
             self._context_power = ("battery" if sample.get("on_battery") is True else
                                    "online" if sample.get("on_battery") is False else "unknown") if fresh else "unknown"
+            if fresh and sample.get("on_battery") is True:
+                self._event_confirmations["power_lost"] = self._clock() + 3
+            connection_state = connection.get("state") if isinstance(connection, dict) else connection
+            if not fresh and self._connection_was_lost and connection_state in ("disconnected", "stale"):
+                self._event_confirmations["connection_lost"] = self._clock() + 3
+                self._event_confirmations["monitor_error"] = self._clock() + 3
             conditions = {"battery_low": None, "battery_low_percentage": None, "overload": None, "ups_fault": None}
             if fresh:
                 load = sample.get("load_percent")
@@ -481,11 +557,16 @@ class AlertManager:
             # A countdown must be real and backed by current telemetry. A visual
             # browser simulation is deliberately not a repeated protection alert.
             countdown = fresh and protection.get("state") == "countdown" and protection.get("simulation") is not True
+            if countdown:
+                self._observe_countdown(protection)
+            elif fresh:
+                self._countdown = None
             conditions["policy_countdown"] = countdown
             emissions = []
             for kind, active in conditions.items():
                 if active is not True:
                     self._active.pop(kind, None)
+                    self._event_confirmations.pop(kind, None)
                     if active is False and fresh:
                         self._resolve(kind)
                         # Recovery ends this incident. A new alarm must be
@@ -498,6 +579,7 @@ class AlertManager:
                     message = _CONDITION_MESSAGES[kind]
                 record = self._active.setdefault(kind, {"last_attempt": self._last_attempt.get(kind)})
                 record["message"] = message
+                record["confirmed_until"] = self._clock() + 3
                 previous = record["last_attempt"]
                 if previous is None or self._clock() - previous >= self._settings["repeat_seconds"]:
                     emissions.append((kind, message, previous is not None))
@@ -549,7 +631,7 @@ class AlertManager:
                 "settings": dict(self._settings), "delivery": delivery,
                 "last_notification": dict(self._last_notification) if self._last_notification else None,
                 "last_error": self._inbox_error or self._last_error,
-                "pending": [{**item, "message": self._notice_message(item),
+                "pending": [{**item, **self._notice_metadata(item),
                              "requires_attention": _requires_attention(item)} for item in
-                            sorted(self._pending.values(), key=lambda value: (value["timestamp"], value["id"]))],
+                            sorted(self._pending.values(), key=self._notice_sort_key)],
             }

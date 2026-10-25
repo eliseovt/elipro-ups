@@ -23,6 +23,7 @@ import webbrowser
 from .instance_guard import AlreadyRunningError, _WindowsOwnership
 from .session_broker import SESSION_STATES, delivery_diagnostics
 from .windows_notifications import WindowsNotifier
+from .notification_priority import age_notice_metadata
 
 AGENT_MUTEX = "Local\\EliproUPS.SessionAgent"
 STOP_EVENT = "Local\\EliproUPS.SessionAgent.Stop"
@@ -100,6 +101,7 @@ class LocalClient:
 
     def _request(self, path, payload=None):
         if path not in {"/api/status", "/api/session/poll", "/api/protection/cancel",
+                        "/api/protection/countdown/cancel",
                         "/api/notifications/ack", "/api/service/stop"}:
             raise ValueError("Operación de agente no admitida")
         headers = {"Accept": "application/json"}
@@ -136,6 +138,13 @@ class LocalClient:
         if not self.token:
             self.connect()
         return self._request("/api/protection/cancel", {})
+
+    def cancel_countdown(self, countdown_id):
+        if not isinstance(countdown_id, str) or not re.fullmatch(r"[a-f0-9]{32}", countdown_id):
+            raise ValueError("La cuenta regresiva no tiene un identificador válido.")
+        if not self.token:
+            self.connect()
+        return self._request("/api/protection/countdown/cancel", {"countdown_id": countdown_id})
 
     def acknowledge(self, ids):
         if not self.token:
@@ -179,6 +188,7 @@ class Agent:
         self._acks = set()
         self._inflight = {}
         self._payloads = {}
+        self._priorities = {}
         self.connected = False
         self.had_connection = False
         self.loss_reported = False
@@ -186,6 +196,7 @@ class Agent:
         self._session_state = session_state or query_session_state
         self._exit_lock = threading.Lock()
         self.notifier.cancel_callback = self.cancel
+        self.notifier.cancel_countdown_callback = self.cancel_countdown
         self.notifier.exit_callback = self.exit
         self.notifier.acknowledge_callback = lambda ids: self.client.acknowledge(ids)
         probe = self._notifier_method("set_session_probe")
@@ -218,6 +229,7 @@ class Agent:
                 continue
             self._inflight.pop(delivery_id, None)
             self._payloads.pop(delivery_id, None)
+            self._priorities.pop(delivery_id, None)
             if receipt.get("outcome") == "accepted" and active:
                 epoch, _, message_id = delivery_id.partition(":")
                 if epoch == self.epoch and message_id.isdecimal() and len(self._acks) < 64:
@@ -234,6 +246,7 @@ class Agent:
                     cancel(delivery_id)
                 self._inflight.pop(delivery_id, None)
                 self._payloads.pop(delivery_id, None)
+                self._priorities.pop(delivery_id, None)
 
     def cancel(self):
         try:
@@ -242,6 +255,14 @@ class Agent:
             # Do not claim a cancellation reached an unavailable monitor.
             self.notifier.notify("Elipro UPS", "No se pudo confirmar la cancelación. Abre el panel y verifica el estado.",
                                  severity="warning", sound=True)
+
+    def cancel_countdown(self, countdown_id):
+        # Deliberately no fallback to the legacy, unqualified cancellation URL.
+        response = self.client.cancel_countdown(countdown_id)
+        if (not isinstance(response, dict) or response.get("cancelled_countdown_id") != countdown_id
+                or response.get("protection", {}).get("state") in ("countdown", "executed")):
+            raise ValueError("El monitor no confirmó la cancelación de esta cuenta regresiva.")
+        return response
 
     def exit(self):
         # The native menu calls us on a worker thread. Keep the tray available
@@ -273,8 +294,10 @@ class Agent:
         self._collect_receipts(active)
         self._expire_inflight()
         sent_acks = sorted(self._acks) if active else []
+        poll_started = self._clock()
         response = self.client.poll(self.client_id, self.cursor, self.notifier.status(),
                                     acks=sent_acks, epoch=self.epoch, session_state=session)
+        transit_age = max(0, self._clock() - poll_started)
         # Clear ACKs only after a successful round trip. A lost HTTP response
         # causes an idempotent retry, never a second display or false receipt.
         self._acks.difference_update(sent_acks)
@@ -284,38 +307,62 @@ class Agent:
             self._availability(False)
             self._inflight.clear()
             self._payloads.clear()
+            self._priorities.clear()
             self._acks.clear()
             self.epoch = epoch
         active = active and self._current_session() == "active"
         self._availability(active)
-        self.notifier.sync_persistent(response.get("persistent", {}) if active else {})
-        for item in response.get("messages", [])[:32]:
+        persistent = {key: age_notice_metadata(value, transit_age)
+                      for key, value in response.get("persistent", {}).items()} if active else {}
+        self.notifier.sync_persistent(persistent)
+        messages = []
+        for value in response.get("messages", []):
+            item = {key: field for key, field in value.items() if key != "countdown"}
+            item.update(age_notice_metadata(value, transit_age))
+            messages.append(item)
+        messages.sort(key=lambda item: -self._priority(item))
+        for item in messages[:32]:
             if not active:
                 break
             options = {"severity": item.get("severity", "info"), "sound": item.get("sound", True),
                        "persistent": item.get("persistent", False), "key": item.get("key")}
+            priority = self._priority(item)
+            if "priority" in item:
+                options["priority"] = priority
             if v2:
                 message_id = item.get("id")
                 if type(message_id) is not int or not 0 < message_id <= 2**63 - 1:
                     continue
                 delivery_id = f"{epoch}:{message_id}"
                 signature = (item["title"], item["message"], options["severity"], options["sound"],
-                             options["persistent"], options["key"])
+                             options["persistent"], options["key"], priority,
+                             (item.get("countdown") or {}).get("countdown_id"),
+                             (item.get("countdown") or {}).get("action"))
                 if delivery_id in self._payloads and self._payloads[delivery_id] != signature:
                     cancel = self._notifier_method("cancel_delivery")
                     if cancel is not None:
                         cancel(delivery_id)
                     self._inflight.pop(delivery_id, None)
                     self._payloads.pop(delivery_id, None)
+                    self._priorities.pop(delivery_id, None)
                 if self._inflight.get(delivery_id, 0) > self._clock() or message_id in self._acks:
                     continue
                 if len(self._inflight) >= 32:
-                    continue
+                    previous = min(self._inflight, key=lambda value: self._priorities.get(value, 0))
+                    if self._priorities.get(previous, 0) >= priority:
+                        continue
+                    cancel = self._notifier_method("cancel_delivery")
+                    if cancel is not None:
+                        cancel(previous)
+                    self._inflight.pop(previous, None)
+                    self._payloads.pop(previous, None)
+                    self._priorities.pop(previous, None)
                 options["delivery_id"] = delivery_id
             accepted = self.notifier.notify(item["title"], item["message"], **options)
             if v2 and accepted is True:
                 self._inflight[delivery_id] = self._clock() + 5
                 self._payloads[delivery_id] = signature
+                self._priorities[delivery_id] = priority
         self.cursor = response["cursor"]
         self._expire_inflight()
         if self.loss_reported:
@@ -324,6 +371,11 @@ class Agent:
         self._first_failure = None
         if not response.get("running", False):
             self.connected = False
+
+    @staticmethod
+    def _priority(item):
+        value = item.get("priority", 0)
+        return value if type(value) is int and 0 <= value <= 3 else 0
 
     def run(self, stopped=lambda: False):
         self.notifier.start()

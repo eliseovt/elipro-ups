@@ -251,6 +251,8 @@ html.theme-transitioning .theme-thumb{transition:transform 350ms cubic-bezier(.2
 .critical-dialog-icon svg path:first-child{fill:#fc858508}
 .critical-dialog h2{font-size:24px;line-height:1.25;letter-spacing:-.6px;font-weight:600;overflow-wrap:anywhere}
 .critical-dialog h2:focus{outline:none}
+.critical-urgency{margin:0 0 9px;color:var(--red);font-size:12px;font-weight:700;letter-spacing:.04em}
+.critical-dialog[data-priority="3"] .critical-countdown{border-color:var(--red)}
 #critical-description{margin-top:10px;font-size:14px;line-height:1.7;color:var(--muted)}
 .critical-list{display:grid;gap:9px;margin:20px 0 0;padding:0;list-style:none}
 .critical-list:empty{display:none}

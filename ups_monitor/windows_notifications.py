@@ -15,6 +15,7 @@ https://learn.microsoft.com/windows/win32/api/shellapi/nf-shellapi-shqueryuserno
 from __future__ import annotations
 
 import ctypes
+import math
 from collections import OrderedDict, deque
 from ctypes import wintypes
 from datetime import datetime, timezone
@@ -26,6 +27,7 @@ from urllib.parse import urlsplit
 import webbrowser
 
 from .runtime import resource_root
+from .notification_priority import age_notice_metadata, normalize_notice_metadata
 
 
 WM_CLOSE = 0x0010
@@ -158,6 +160,7 @@ def _load_apis():
     _bind(user, "MessageBoxW", [ptr, text, text, UINT], ctypes.c_int)
     _bind(user, "SetWindowTextW", [ptr, text], wintypes.BOOL)
     _bind(user, "ShowWindow", [ptr, ctypes.c_int], wintypes.BOOL)
+    _bind(user, "EnableWindow", [ptr, wintypes.BOOL], wintypes.BOOL)
     _bind(user, "SetWindowPos", [ptr, ptr, ctypes.c_int, ctypes.c_int,
           ctypes.c_int, ctypes.c_int, UINT], wintypes.BOOL)
     _bind(user, "SystemParametersInfoW", [UINT, UINT, ptr, UINT], wintypes.BOOL)
@@ -215,6 +218,7 @@ def _utf16_clip(value, units):
 
 class _Win32Backend:
     supports_delivery_validation = True
+    supports_notification_priority = True
 
     def __init__(self, owner):
         self.owner = owner
@@ -230,10 +234,12 @@ class _Win32Backend:
         self.popup_title = None
         self.popup_body = None
         self.popup_buttons = ()
+        self.popup_cancel = None
         self.popup_dpi = 96
         self.popup_font = None
         self.popup_persistent_key = None
         self.last_notice = None
+        self._shown_keys = set()
         self.user_notification_code = None
         self.class_name = f"EliproNotifications-{os.getpid()}-{id(self)}"
         self.instance = self.kernel.GetModuleHandleW(None)
@@ -362,6 +368,13 @@ class _Win32Backend:
         if persistent and not self.owner._persistent_active(key, generation):
             return False
         self._query_user_notification_state()
+        if not persistent and self.popup_persistent_key is not None and self.user_notification_code == 5:
+            return False  # A transient must not sound over the dominant incident.
+        if persistent and self.user_notification_code == 5:
+            winner = self.owner._next_persistent(self.popup_persistent_key)
+            if winner is not None and winner[0] != key:
+                self.sync_persistent()
+                return False  # Deferred is not a native delivery receipt.
         data = self._data()
         data.uFlags = NIF_INFO | NIF_REALTIME
         data.szInfoTitle = _utf16_clip(title, 63)
@@ -395,15 +408,35 @@ class _Win32Backend:
             self.user.KillTimer(self.hwnd, 2)
             if not self.user.SetTimer(self.hwnd, 2, 1000, None):
                 self.owner._set_error("No se pudo programar la comprobación visual del aviso")
-        if sound:
-            try:
-                import winsound
-                winsound.PlaySound(SEVERITIES[severity][1],
-                                   winsound.SND_ALIAS | winsound.SND_ASYNC | winsound.SND_NODEFAULT)
-                self.owner._set_sound_error(None)
-            except Exception as exc:
-                self.owner._set_sound_error(str(exc))
+        if persistent and self.user_notification_code == 5:
+            notice = self.owner._persistent_message(key) or {}
+            notice.setdefault("severity", severity)
+            self._persistent_sound(key, notice, requested=sound)
+        elif sound:
+            self._play_sound(severity)
         return True
+
+    def _play_sound(self, severity):
+        try:
+            import winsound
+            winsound.PlaySound(SEVERITIES.get(severity, SEVERITIES["info"])[1],
+                               winsound.SND_ALIAS | winsound.SND_ASYNC | winsound.SND_NODEFAULT)
+            self.owner._set_sound_error(None)
+        except Exception as exc:
+            self.owner._set_sound_error(str(exc))
+
+    def _persistent_sound(self, key, notice, *, requested=None):
+        if self.popup_persistent_key != key:
+            return
+        enabled = notice.get("sound", requested is True)
+        if not enabled or notice.get("confirmed", True) is not True:
+            return
+        now = time.monotonic()
+        previous = self.owner._persistent_sound_at.get(key)
+        if previous is not None and (requested is None or now - previous < notice.get("repeat_seconds", 30)):
+            return
+        self.owner._persistent_sound_at[key] = now
+        self._play_sound(notice.get("severity", "critical"))
 
     def _window_dpi(self, hwnd):
         for name, args in (("GetDpiForWindow", (hwnd,)), ("GetDpiForSystem", ())):
@@ -434,9 +467,11 @@ class _Win32Backend:
     def _layout_popup(self, dpi):
         self.popup_dpi = dpi
         controls = ((self.popup_title, 16, 14, 386, 32), (self.popup_body, 16, 49, 386, 78))
-        if len(self.popup_buttons) == 2:
+        if len(self.popup_buttons) >= 2:
             controls += ((self.popup_buttons[0], 16, 142, 180, 30),
                          (self.popup_buttons[1], 212, 142, 190, 30))
+        if self.popup_cancel:
+            controls += ((self.popup_cancel, 16, 182, 386, 30),)
         for hwnd, x, y, width, height in controls:
             if hwnd and not self.user.SetWindowPos(hwnd, None, self._scale(x), self._scale(y),
                                                   self._scale(width), self._scale(height), 0x0010 | 0x0004):
@@ -449,7 +484,7 @@ class _Win32Backend:
         self.popup_dpi = self._window_dpi(self.hwnd)
         self.popup_hwnd = self.user.CreateWindowExW(
             0x08000000 | 0x00000080 | 0x00000008, self.class_name, "Aviso de Elipro UPS",
-            0x80000000 | 0x00800000, 0, 0, self._scale(420), self._scale(190), None, None, self.instance, None)
+            0x80000000 | 0x00800000, 0, 0, self._scale(420), self._scale(230), None, None, self.instance, None)
         if not self.popup_hwnd:
             raise OSError("No se pudo crear el aviso de escritorio de Elipro")
         child_style = 0x40000000 | 0x10000000
@@ -461,8 +496,11 @@ class _Win32Backend:
             child_style, self._scale(16), self._scale(142), self._scale(180), self._scale(30), self.popup_hwnd, ctypes.c_void_p(101), self.instance, None)
         close_button = self.user.CreateWindowExW(0, "BUTTON", "Entendido",
             child_style, self._scale(212), self._scale(142), self._scale(190), self._scale(30), self.popup_hwnd, ctypes.c_void_p(102), self.instance, None)
-        self.popup_buttons = (open_button, close_button)
-        if not all((self.popup_title, self.popup_body, open_button, close_button)):
+        self.popup_cancel = self.user.CreateWindowExW(0, "BUTTON", "Cancelar protección",
+            0x40000000, self._scale(16), self._scale(182), self._scale(386), self._scale(30),
+            self.popup_hwnd, ctypes.c_void_p(103), self.instance, None)
+        self.popup_buttons = (open_button, close_button, self.popup_cancel)
+        if not all((self.popup_title, self.popup_body, *self.popup_buttons)):
             self._destroy_popup()
             raise OSError("No se pudieron crear los controles del aviso de Elipro")
         self._set_popup_font()
@@ -470,10 +508,14 @@ class _Win32Backend:
     def _show_popup(self, title, message, persistent=False, key=None, *, validity_callback=None):
         if self.owner._stop.is_set() or self.owner._session_currently_available() is False:
             return False
+        previous_key = self.popup_persistent_key
         if self.popup_persistent_key is not None and key != self.popup_persistent_key:
-            # An informational fallback must not replace an active critical
-            # window. There is always at most one custom window.
-            return False
+            current = self.owner._persistent_message(self.popup_persistent_key)
+            incoming = self.owner._persistent_message(key) if persistent else None
+            if (not persistent or incoming is None or current is not None
+                    and not self.owner._persistent_acknowledged(self.popup_persistent_key)
+                    and incoming.get("priority", 0) <= current.get("priority", 0)):
+                return False
         if not self.popup_hwnd:
             self._create_popup()
         dpi = self._window_dpi(self.popup_hwnd)
@@ -482,7 +524,7 @@ class _Win32Backend:
         work = RECT()
         if not self.user.SystemParametersInfoW(0x0030, 0, ctypes.byref(work), 0):  # SPI_GETWORKAREA
             raise OSError("No se pudo localizar el área de trabajo para el aviso")
-        width, height = min(self._scale(420), work.right - work.left), min(self._scale(190), work.bottom - work.top)
+        width, height = min(self._scale(420), work.right - work.left), min(self._scale(230), work.bottom - work.top)
         if width <= 0 or height <= 0:
             raise OSError("El área de trabajo para avisos no está disponible")
         self.user.SetWindowTextW(self.popup_title, "Elipro UPS · " + _utf16_clip(title, 80))
@@ -497,21 +539,64 @@ class _Win32Backend:
             raise OSError("Windows no pudo mostrar el aviso de Elipro")
         self.popup_persistent_key = key if persistent else None
         self.user.KillTimer(self.popup_hwnd, 1)
+        self.user.KillTimer(self.popup_hwnd, 3)
+        if self.popup_cancel:
+            self.user.ShowWindow(self.popup_cancel, 0)
         if not persistent:
             if not self.user.SetTimer(self.popup_hwnd, 1, 12000, None):
                 self._hide_popup()
                 raise OSError("No se pudo programar el cierre del aviso de Elipro")
         self.owner._record_popup_event("shown")
+        if persistent:
+            notice = self.owner._persistent_message(key) or {}
+            if key in self._shown_keys and previous_key != key:
+                # Restoring an earlier incident does not produce another sound.
+                self.owner._persistent_sound_at[key] = time.monotonic()
+            self._shown_keys.add(key)
+            self._update_persistent_contents(notice)
+            if "priority" in notice:
+                if not self.user.SetTimer(self.popup_hwnd, 3, 1000, None):
+                    self._hide_popup()
+                    raise OSError("No se pudo programar la actualización del aviso de Elipro")
+                self._persistent_sound(key, notice)
         return True
 
     def _hide_popup(self):
         if self.popup_hwnd:
             self.user.KillTimer(self.popup_hwnd, 1)
+            self.user.KillTimer(self.popup_hwnd, 3)
             self.user.ShowWindow(self.popup_hwnd, 0)
             self.owner._record_popup_event("hidden")
         self.popup_persistent_key = None
 
+    def _update_persistent_contents(self, notice):
+        title, message = notice["title"], notice["message"]
+        countdown = notice.get("countdown")
+        if countdown is not None:
+            current = countdown["valid_for_ms"] > 0 and countdown["remaining_seconds"] > 0
+            if current:
+                action = "Hibernación" if countdown["action"] == "hibernate" else "Apagado"
+                title = f"URGENTE · {action} en {math.ceil(countdown['remaining_seconds'])} segundos"
+                message = "Guarda tu trabajo. Puedes cancelar esta cuenta antes de que termine."
+            else:
+                title = "Estado sin confirmar"
+                message = "No se confirma que la protección haya terminado. Abre Elipro para comprobar el estado."
+            feedback, inflight = self.owner._countdown_feedback(countdown["countdown_id"])
+            if feedback:
+                message += " " + feedback
+            if self.popup_cancel:
+                self.user.ShowWindow(self.popup_cancel, 5)
+                self.user.SetWindowTextW(self.popup_cancel, "Cancelando…" if inflight else "Cancelar protección")
+                self.user.EnableWindow(self.popup_cancel, bool(current and countdown["cancelable"]
+                    and callable(self.owner.cancel_countdown_callback) and not inflight
+                    and self.owner._session_currently_available()))
+        elif self.popup_cancel:
+            self.user.ShowWindow(self.popup_cancel, 0)
+        self.user.SetWindowTextW(self.popup_title, "Elipro UPS · " + _utf16_clip(title, 100))
+        self.user.SetWindowTextW(self.popup_body, _utf16_clip(message, 400))
+
     def sync_persistent(self):
+        self._shown_keys.intersection_update(self.owner._persistent_keys())
         if self.last_notice is not None:
             validator = self.last_notice.get("validity_callback")
             if validator is not None and validator() is not True:
@@ -537,19 +622,24 @@ class _Win32Backend:
             # Acknowledging one item reveals the next unread incident.
             self.sync_persistent()
             return
-        # Refresh countdown text without showing/activating again or producing
-        # sound. The reader publishes this state independently of the panel.
-        self.user.SetWindowTextW(self.popup_title, "Elipro UPS · " + _utf16_clip(notice["title"], 80))
-        self.user.SetWindowTextW(self.popup_body, _utf16_clip(notice["message"], 400))
+        winner = self.owner._next_persistent(key)
+        if winner is not None and winner[0] != key:
+            self._query_user_notification_state()
+            if self.user_notification_code == 5:
+                self._show_popup(winner[1]["title"], winner[1]["message"], persistent=True, key=winner[0])
+            return
+        self._update_persistent_contents(notice)
 
     def _destroy_popup(self):
         if self.popup_hwnd:
             hwnd = self.popup_hwnd
             self.user.KillTimer(hwnd, 1)
+            self.user.KillTimer(hwnd, 3)
             self.user.DestroyWindow(hwnd)
             self.popup_hwnd = None
             self.popup_title = self.popup_body = None
             self.popup_buttons = ()
+            self.popup_cancel = None
         if self.popup_font and self.gdi is not None:
             self.gdi.DeleteObject(self.popup_font)
             self.popup_font = None
@@ -665,6 +755,14 @@ class _Win32Backend:
                         else:
                             self._hide_popup()
                         return 0
+                    if command == 103:
+                        if self.popup_persistent_key is not None:
+                            self.owner._cancel_persistent_countdown(self.popup_persistent_key)
+                            self.sync_persistent()
+                        return 0
+                elif message == WM_TIMER and wparam == 3:
+                    self.sync_persistent()
+                    return 0
                 elif message in (WM_CLOSE, WM_TIMER):
                     if self.popup_persistent_key is not None:
                         return 0  # Only the explicit Entendido button acknowledges.
@@ -754,6 +852,8 @@ class WindowsNotifier:
     unconfirmed; this does not by itself prove the notification was suppressed.
     """
 
+    supports_notification_priority = True
+
     def __init__(self, url, cancel_callback=None, exit_callback=None, *,
                  exit_label=DEFAULT_EXIT_LABEL, exit_message=DEFAULT_EXIT_MESSAGE,
                  tray_tip=DEFAULT_TRAY_TIP):
@@ -768,6 +868,7 @@ class WindowsNotifier:
             raise ValueError("Los textos de la bandeja deben ser cadenas no vacías")
         self.url = url
         self.cancel_callback = cancel_callback
+        self.cancel_countdown_callback = None
         self.exit_callback = exit_callback
         self.exit_label, self.exit_message, self.tray_tip = exit_label, exit_message, tray_tip
         self._queue = queue.Queue(maxsize=32)
@@ -788,6 +889,9 @@ class WindowsNotifier:
         self._last_popup_shown_at = None
         self._last_popup_hidden_at = None
         self._persistent_messages = {}
+        self._persistent_received = {}
+        self._persistent_countdowns = {}
+        self._persistent_sound_at = {}
         self._persistent_dismissed = set()
         self._persistent_versions = {}
         self._persistent_serial = 0
@@ -801,6 +905,8 @@ class WindowsNotifier:
         self._delivery_receipts = deque(maxlen=256)
         self.acknowledge_callback = None
         self._ack_inflight = set()
+        self._countdown_cancel_inflight = set()
+        self._countdown_cancel_feedback = {}
 
     def start(self):
         with self._lock:
@@ -964,7 +1070,7 @@ class WindowsNotifier:
                 self._backend = None
 
     def notify(self, title, message, severity="info", sound=True, *, persistent=False, key=None,
-               delivery_id=None):
+               delivery_id=None, priority=None):
         if severity not in SEVERITIES:
             raise ValueError("Nivel de aviso inválido")
         if not isinstance(title, str) or not isinstance(message, str) or not title or not message:
@@ -973,6 +1079,8 @@ class WindowsNotifier:
             raise ValueError("El aviso persistente necesita una clave válida")
         if delivery_id is not None and (not isinstance(delivery_id, str) or not 1 <= len(delivery_id) <= 128):
             raise ValueError("El identificador de entrega debe tener entre 1 y 128 caracteres")
+        if priority is not None and (type(priority) is not int or not 0 <= priority <= 3):
+            raise ValueError("Prioridad de aviso inválida")
         with self._lock:
             if self._stop.is_set() or not self._ready or not self._session_available:
                 return False
@@ -981,6 +1089,8 @@ class WindowsNotifier:
             item = (title, message, severity, bool(sound))
             item = (*item, True, key, generation) if persistent else item
             duplicate_pending = False
+            if priority is not None:
+                item = {"notification": item, "priority": priority}
             if delivery_id is not None:
                 now = time.monotonic()
                 while self._completed_deliveries and next(iter(self._completed_deliveries.values()))[0] < now - 300:
@@ -990,7 +1100,8 @@ class WindowsNotifier:
                     return True
                 duplicate_pending = delivery_id in self._pending_deliveries
                 self._delivery_serial += 1
-                item = {"notification": item, "delivery_id": delivery_id,
+                item = {"notification": item["notification"] if isinstance(item, dict) else item,
+                        "priority": priority or 0, "delivery_id": delivery_id,
                         "session_generation": self._session_generation, "ticket": self._delivery_serial}
             if not duplicate_pending:
                 try:
@@ -1006,6 +1117,8 @@ class WindowsNotifier:
         return True
 
     def sync_persistent(self, messages):
+        now = time.monotonic()
+        normalized = {key: normalize_notice_metadata(value) for key, value in messages.items()}
         with self._lock:
             if self._stop.is_set():
                 return
@@ -1014,7 +1127,23 @@ class WindowsNotifier:
                     self._persistent_serial += 1
                     self._persistent_versions[key] = self._persistent_serial
             self._persistent_versions = {key: self._persistent_versions[key] for key in messages}
-            self._persistent_messages = {key: dict(value) for key, value in messages.items()}
+            for key, value in normalized.items():
+                countdown = value.get("countdown")
+                if countdown is not None:
+                    previous = self._persistent_countdowns.get(key)
+                    deadline = now + countdown["remaining_seconds"]
+                    if previous is not None and previous[0] == countdown["countdown_id"]:
+                        deadline = min(previous[1], deadline)
+                    self._persistent_countdowns[key] = (countdown["countdown_id"], deadline)
+                else:
+                    self._persistent_countdowns.pop(key, None)
+            self._persistent_countdowns = {key: value for key, value in self._persistent_countdowns.items() if key in normalized}
+            self._persistent_messages = normalized
+            self._persistent_received = {key: now for key in normalized}
+            self._persistent_sound_at = {key: value for key, value in self._persistent_sound_at.items() if key in normalized}
+            countdown_ids = {value["countdown"]["countdown_id"] for value in normalized.values() if "countdown" in value}
+            self._countdown_cancel_feedback = {key: value for key, value in self._countdown_cancel_feedback.items()
+                                              if key in countdown_ids}
             self._persistent_dismissed.intersection_update(messages)
             backend = self._backend
         if backend is not None:
@@ -1025,10 +1154,29 @@ class WindowsNotifier:
             return (not self._stop.is_set() and key in self._persistent_messages and
                     (generation is None or self._persistent_versions.get(key) == generation))
 
+    def _persistent_keys(self):
+        with self._lock:
+            return set(self._persistent_messages)
+
     def _persistent_message(self, key):
         with self._lock:
-            value = self._persistent_messages.get(key)
-            return dict(value) if value is not None else None
+            return self._persistent_message_locked(key, time.monotonic())
+
+    def _persistent_message_locked(self, key, now):
+        value = self._persistent_messages.get(key)
+        if value is None:
+            return None
+        result = age_notice_metadata(value, now - self._persistent_received.get(key, now))
+        countdown = result.get("countdown")
+        if countdown is not None:
+            previous = self._persistent_countdowns.get(key)
+            if previous is not None and previous[0] == countdown["countdown_id"]:
+                countdown["remaining_seconds"] = min(countdown["remaining_seconds"], max(0, previous[1] - now))
+                if countdown["remaining_seconds"] <= 0:
+                    countdown["cancelable"] = False
+                    result["confirmed"] = False
+                    result["priority"] = min(result.get("priority", 0), 1)
+        return result
 
     def _persistent_acknowledged(self, key):
         with self._lock:
@@ -1048,14 +1196,18 @@ class WindowsNotifier:
                     self._last_error = "No se pudo guardar Entendido; abre Elipro para confirmar el aviso."
                     return
                 self._ack_inflight.add(key)
+                generation = self._persistent_versions.get(key)
             def acknowledge():
                 try:
                     callback([notice_id])
                     with self._lock:
-                        self._persistent_dismissed.add(key)
-                        self._last_error = None
+                        if self._persistent_versions.get(key) == generation:
+                            self._persistent_dismissed.add(key)
+                            self._last_error = None
                 except Exception as exc:
-                    self._set_error("No se guardó Entendido: " + str(exc)[:300])
+                    with self._lock:
+                        if self._persistent_versions.get(key) == generation:
+                            self._last_error = "No se guardó Entendido: " + str(exc)[:300]
                 finally:
                     with self._lock:
                         self._ack_inflight.discard(key)
@@ -1068,10 +1220,57 @@ class WindowsNotifier:
             if key in self._persistent_messages:
                 self._persistent_dismissed.add(key)
 
-    def _next_persistent(self):
+    def _next_persistent(self, current_key=None):
         with self._lock:
-            return next(((key, dict(value)) for key, value in self._persistent_messages.items()
-                         if key not in self._persistent_dismissed), None)
+            now = time.monotonic()
+            candidates = [(key, self._persistent_message_locked(key, now)) for key in self._persistent_messages
+                          if key not in self._persistent_dismissed]
+            if not candidates:
+                return None
+            best = max(candidates, key=lambda item: item[1].get("priority", 0))
+            current = next((item for item in candidates if item[0] == current_key), None)
+            return current if current is not None and current[1].get("priority", 0) >= best[1].get("priority", 0) else best
+
+    def _countdown_feedback(self, countdown_id):
+        with self._lock:
+            return self._countdown_cancel_feedback.get(countdown_id), countdown_id in self._countdown_cancel_inflight
+
+    def _cancel_persistent_countdown(self, key):
+        if not self._session_currently_available():
+            return
+        notice = self._persistent_message(key)
+        countdown = notice.get("countdown") if notice is not None else None
+        if (not countdown or not countdown["cancelable"] or countdown["remaining_seconds"] <= 0
+                or countdown["valid_for_ms"] <= 0 or not callable(self.cancel_countdown_callback)):
+            return
+        countdown_id = countdown["countdown_id"]
+        with self._lock:
+            if self._stop.is_set() or countdown_id in self._countdown_cancel_inflight:
+                return
+            self._countdown_cancel_inflight.add(countdown_id)
+            self._countdown_cancel_feedback.pop(countdown_id, None)
+            generation = self._persistent_versions.get(key)
+        def cancel():
+            feedback = None
+            try:
+                result = self.cancel_countdown_callback(countdown_id)
+                if (not isinstance(result, dict) or result.get("cancelled_countdown_id") != countdown_id
+                        or result.get("protection", {}).get("state") in ("countdown", "executed")):
+                    raise ValueError("El monitor no confirmó esta cuenta.")
+                feedback = "El monitor confirmó la cancelación."
+            except Exception as exc:
+                feedback = "No se confirmó la cancelación. " + str(exc)[:60]
+            finally:
+                with self._lock:
+                    self._countdown_cancel_inflight.discard(countdown_id)
+                    current = self._persistent_message_locked(key, time.monotonic())
+                    if (not self._stop.is_set() and self._persistent_versions.get(key) == generation
+                            and (current or {}).get("countdown", {}).get("countdown_id") == countdown_id):
+                        self._countdown_cancel_feedback[countdown_id] = feedback
+                    backend = self._backend
+                if backend is not None:
+                    backend.wake()
+        threading.Thread(target=cancel, name="elipro-countdown-cancel", daemon=True).start()
 
     def _request_exit(self):
         callback = self.exit_callback
@@ -1089,6 +1288,13 @@ class WindowsNotifier:
         threading.Thread(target=request, name="elipro-tray-exit", daemon=True).start()
 
     def _drain(self, backend):
+        # Select from the complete current state before a FIFO ticket can steal
+        # the desktop or hide a newer, more urgent condition.
+        if getattr(backend, "supports_notification_priority", False) is True and self._session_currently_available():
+            try:
+                backend.sync_persistent()
+            except Exception as exc:
+                self._set_error(str(exc))
         while not self._stop.is_set():
             if not self._session_currently_available():
                 self.set_session_available(False)
@@ -1176,6 +1382,9 @@ class WindowsNotifier:
         with self._lock:
             backend, thread = self._backend, self._thread
             self._persistent_messages.clear()
+            self._persistent_received.clear()
+            self._persistent_countdowns.clear()
+            self._persistent_sound_at.clear()
             self._persistent_dismissed.clear()
             self._persistent_versions.clear()
             for delivery_id in self._pending_deliveries:

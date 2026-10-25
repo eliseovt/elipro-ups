@@ -99,6 +99,20 @@ function snapshot(settings = {}) {
   };
 }
 
+let countdownFixtureSerial = 0;
+
+// Modern service fixtures include the identity and freshness required to cancel
+// a real episode. Explicit null values exercise legacy and malformed services.
+function modernCountdownFixture(data, url, options) {
+  if (data?.protection?.state === "countdown" && data.protection.simulation !== true) {
+    if (!("countdown_id" in data.protection)) data.protection.countdown_id = (++countdownFixtureSerial).toString(16).padStart(32, "0");
+    if (!("valid_for_ms" in data.protection)) data.protection.valid_for_ms = 3000;
+  }
+  if (url === "/api/protection/countdown/cancel" && data?.protection && data.protection.state !== "countdown"
+      && !("cancelled_countdown_id" in data)) data.cancelled_countdown_id = JSON.parse(options.body).countdown_id;
+  return data;
+}
+
 function harness(historyOptions = {}) {
   let documentRef;
   let now = historyOptions.now ?? Date.now();
@@ -174,6 +188,7 @@ function harness(historyOptions = {}) {
   };
   [...elements.values(), body, rootElement, ...nav, ...shortcuts, ...metrics].forEach((element) => { element.ownerDocument = documentRef; });
   const context = vm.createContext({
+    performance: { now: () => now },
     document: documentRef,
     window: { location, addEventListener: (name, callback) => { windowListeners[name] = callback; },
       scrollTo: (options) => { navigationScrolls.push(options); },
@@ -212,7 +227,7 @@ function harness(historyOptions = {}) {
       }
       return new Promise((resolve, reject) => calls.push({
         url, options, reject,
-        respond: (data, ok = true) => resolve({ ok, status: ok ? 200 : 400, json: async () => data }),
+        respond: (data, ok = true) => resolve({ ok, status: ok ? 200 : 400, json: async () => modernCountdownFixture(data, url, options) }),
         respondBlob: (blob) => resolve({ ok: true, status: 200, blob: async () => blob }),
       }));
     },
@@ -1975,6 +1990,117 @@ function pendingNotice(ui, changes = {}) {
     timestamp: new Date(ui.now()).toISOString(), resolved_at: null, ...changes };
 }
 
+test("notification priorities promote critical alarms and the real countdown without acknowledging displaced incidents", async () => {
+  const { ui, data } = await currentUi();
+  const outage = pendingNotice(ui, { priority: 1 });
+  data.notifications.pending = [outage];
+  await pushStatus(ui, data);
+  const fault = pendingNotice(ui, { id: 102, kind: "ups_fault", title: "Falla del UPS", priority: 2 });
+  data.notifications.pending.push(fault);
+  await pushStatus(ui, data);
+  assert.equal(ui.get("critical-title").textContent, "Falla del UPS");
+  assert.deepEqual(ui.get("critical-list").children.map((row) => row.dataset.notificationId), ["102", "101"]);
+  const countdown = pendingNotice(ui, { id: 103, kind: "policy_countdown", priority: 3 });
+  data.notifications.pending.push(countdown);
+  data.policy.action = "hibernate";
+  data.protection = { state: "countdown", simulation: false, countdown_remaining: 30 };
+  await pushStatus(ui, data);
+  assert.equal(ui.get("critical-title").textContent, "Hibernación programada");
+  assert.equal(ui.get("critical-urgency").hidden, false);
+  assert.deepEqual(ui.get("critical-list").children.map((row) => row.dataset.notificationId), ["103", "102", "101"]);
+  assert.equal(ui.get("critical-dialog").modalShows, 1);
+  data.notifications.pending[2] = { ...countdown, requires_attention: false, resolved_at: new Date(ui.now()).toISOString() };
+  data.protection = { state: "cancelled" };
+  await pushStatus(ui, data);
+  assert.equal(ui.get("critical-title").textContent, "Falla del UPS");
+  assert.equal(ui.get("critical-urgency").hidden, true);
+  assert.equal(data.notifications.pending.length, 3);
+  assert.equal(ui.calls.some((call) => call.options.method === "POST"), false);
+});
+
+test("equal-priority arrivals keep the visible incident stable and simulations cannot displace a real critical alarm", async () => {
+  const { ui, data } = await currentUi();
+  data.notifications.pending = [pendingNotice(ui, { id: 102, kind: "ups_fault", title: "Falla del UPS", priority: 2 })];
+  await pushStatus(ui, data);
+  data.notifications.pending.unshift(pendingNotice(ui, { id: 101, kind: "overload", title: "Sobrecarga", priority: 2,
+    timestamp: new Date(ui.now() - 10000).toISOString() }));
+  data.protection = { state: "countdown", simulation: true, countdown_remaining: 30 };
+  await pushStatus(ui, data);
+  assert.equal(ui.get("critical-title").textContent, "Falla del UPS");
+  assert.equal(ui.get("critical-list").children[0].dataset.notificationId, "102");
+  assert.equal(ui.get("critical-urgency").hidden, true);
+});
+
+test("a real countdown without an episode identity cannot use the general cancellation endpoint", async () => {
+  const { ui, data } = await currentUi();
+  data.protection = { state: "countdown", simulation: false, countdown_id: null, countdown_remaining: 30 };
+  await pushStatus(ui, data);
+  assert.equal(ui.get("critical-dialog").open, true);
+  assert.equal(ui.get("critical-cancel").disabled, true);
+  assert.equal(ui.get("critical-title").textContent, "Cuenta atrás sin confirmar");
+  await ui.get("critical-cancel").emit("click");
+  assert.equal(ui.calls.some((call) => call.options.method === "POST"), false);
+});
+
+test("native-style countdown freshness also disables panel cancellation after three seconds without resolving the incident", async () => {
+  const { ui, data } = await currentUi();
+  data.notifications.pending = [pendingNotice(ui, { kind: "policy_countdown", priority: 3 })];
+  data.protection = { state: "countdown", simulation: false, countdown_remaining: 30 };
+  await pushStatus(ui, data);
+  assert.equal(ui.get("critical-cancel").disabled, false);
+  ui.advance(3000); ui.tick();
+  assert.equal(ui.get("critical-cancel").disabled, true);
+  assert.equal(ui.get("critical-title").textContent, "Cuenta atrás sin confirmar");
+  assert.equal(ui.get("critical-dialog").open, true);
+  assert.equal(data.notifications.pending.length, 1);
+  await ui.get("critical-cancel").emit("click");
+  assert.equal(ui.calls.some((call) => call.options.method === "POST"), false);
+});
+
+test("real cancellation requires a matching confirmation and never retries through the legacy endpoint", async () => {
+  const { ui, data } = await currentUi();
+  data.protection = { state: "countdown", simulation: false, countdown_remaining: 30 };
+  await pushStatus(ui, data);
+  const id = data.protection.countdown_id;
+  const cancellation = ui.get("critical-cancel").emit("click");
+  const call = ui.calls.at(-1);
+  assert.equal(call.url, "/api/protection/countdown/cancel");
+  assert.deepEqual(JSON.parse(call.options.body), { countdown_id: id });
+  call.respond({ ...data, protection: { state: "cancelled" }, cancelled_countdown_id: "f".repeat(32) });
+  await cancellation;
+  assert.equal(ui.get("critical-dialog").open, true);
+  assert.match(ui.get("critical-feedback").textContent, /No se confirmó la cancelación/);
+  assert.equal(ui.calls.filter((request) => request.options.method === "POST").length, 1);
+  assert.equal(ui.calls.some((request) => request.url === "/api/protection/cancel"), false);
+});
+
+test("the same countdown cannot gain seconds when its rounded deadline changes", async () => {
+  const { ui, data } = await currentUi();
+  data.protection = { state: "countdown", simulation: false, countdown_remaining: 30 };
+  await pushStatus(ui, data);
+  ui.advance(1000); ui.tick();
+  assert.equal(ui.get("critical-countdown-time").textContent, "00:29");
+  data.protection.countdown_remaining = 31;
+  await pushStatus(ui, data);
+  assert.equal(ui.get("critical-countdown-time").textContent, "00:29");
+  const oldId = data.protection.countdown_id;
+  data.protection = { state: "countdown", simulation: false, countdown_remaining: 60 };
+  await pushStatus(ui, data);
+  assert.notEqual(data.protection.countdown_id, oldId);
+  assert.equal(ui.get("critical-countdown-time").textContent, "01:00");
+});
+
+test("an elapsed real countdown never claims that Windows completed its action", async () => {
+  const { ui, data } = await currentUi();
+  data.protection = { state: "countdown", simulation: false, countdown_remaining: 1 };
+  await pushStatus(ui, data);
+  ui.advance(1000); ui.tick();
+  assert.equal(ui.get("critical-title").textContent, "Cuenta atrás sin confirmar");
+  assert.equal(ui.get("critical-cancel").disabled, true);
+  assert.equal(ui.get("critical-dialog").open, true);
+  assert.equal(ui.calls.some((call) => call.options.method === "POST"), false);
+});
+
 test("a five-second outage closes on recovery while unread incidents and event history remain intact", async () => {
   const { ui, data } = await currentUi({}, { navigation: true });
   const outage = pendingNotice(ui);
@@ -2194,7 +2320,7 @@ test("cancelling protection never acknowledges an unread electricity incident", 
   data.protection = { state: "countdown", simulation: false, deadline: new Date(ui.now() + 60000).toISOString() };
   await pushStatus(ui, data);
   const cancellation = ui.get("critical-cancel").emit("click");
-  assert.equal(ui.calls.at(-1).url, "/api/protection/cancel");
+  assert.equal(ui.calls.at(-1).url, "/api/protection/countdown/cancel");
   data.protection = { state: "cancelled", simulation: false };
   ui.calls.at(-1).respond(data); await cancellation;
   assert.equal(ui.get("critical-dialog").open, true);
@@ -2353,6 +2479,7 @@ test("Escape cannot acknowledge or cancel a countdown and a later countdown open
   await pushStatus(ui, data);
   assert.equal(ui.get("critical-dialog").open, false, "reconnection cannot duplicate an acknowledged countdown");
   data.protection.deadline = new Date(ui.now() + 120000).toISOString();
+  data.protection.countdown_id = (++countdownFixtureSerial).toString(16).padStart(32, "0");
   await pushStatus(ui, data);
   assert.equal(ui.get("critical-dialog").open, true);
   assert.equal(ui.get("critical-dialog").modalShows, 2);
@@ -2401,7 +2528,7 @@ test("critical countdown cancellation uses the confirmed endpoint and does not a
   assert.equal(ui.get("critical-cancel").disabled, false);
   const cancellation = ui.get("critical-cancel").emit("click");
   const request = ui.calls.at(-1);
-  assert.equal(request.url, "/api/protection/cancel");
+  assert.equal(request.url, "/api/protection/countdown/cancel");
   assert.equal(request.options.headers["X-UPS-Token"], "test-token");
   assert.equal(ui.get("critical-dialog").open, true);
   assert.equal(ui.get("critical-cancel").disabled, true);
@@ -2472,7 +2599,7 @@ test("a refreshed deadline in the same active countdown cannot erase an unconfir
   await pushStatus(ui, data);
   assert.equal(ui.get("critical-feedback").hidden, false);
   assert.equal(ui.get("critical-feedback").textContent, feedback);
-  assert.equal(ui.get("critical-countdown-time").textContent, "01:01");
+  assert.equal(ui.get("critical-countdown-time").textContent, "01:00", "rounding must not prolong the same episode");
 });
 
 test("a new countdown clears feedback about an earlier confirmed cancellation in the still-open dialog", async () => {
@@ -3236,8 +3363,8 @@ test("the only protection-cancel button cancels Windows and UPS through one endp
   assert.equal(ui.calls.some((call) => call.options.method === "POST"), false);
   const pending = ui.get("critical-cancel").emit("click");
   const request = ui.calls.at(-1);
-  assert.equal(request.url, "/api/protection/cancel");
-  assert.deepEqual(JSON.parse(request.options.body), {});
+  assert.equal(request.url, "/api/protection/countdown/cancel");
+  assert.deepEqual(JSON.parse(request.options.body), { countdown_id: data.protection.countdown_id });
   request.respond({ ...data, protection: { state: "cancelled", suppressed: true }, ups_poweroff: { ...data.ups_poweroff, operation: { state: "idle" } } });
   await pending;
   assert.equal(ui.get("critical-dialog").open, false);

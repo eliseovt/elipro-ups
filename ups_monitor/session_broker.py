@@ -12,6 +12,8 @@ import secrets
 import threading
 import time
 
+from .notification_priority import age_notice_metadata, normalize_notice_metadata, notification_priority
+
 
 DELIVERY_FIELDS = {"last_error": 200, "last_sound_error": 200, "popup_error": 200,
                    "last_delivered_at": 80, "last_popup_shown_at": 80}
@@ -35,6 +37,8 @@ def delivery_diagnostics(value):
 
 
 class SessionBroker:
+    supports_notification_priority = True
+
     def __init__(self, *, clock=time.monotonic, retention_seconds=86400, capacity=32):
         if type(capacity) is not int or not 1 <= capacity <= 256:
             raise ValueError("Capacidad de avisos inválida.")
@@ -53,6 +57,7 @@ class SessionBroker:
         self._dropped = 0
         self._clients = {}
         self._persistent = {}
+        self._persistent_at = None
         self._serial = 0
         self._heartbeat_serial = 0
         self._started = False
@@ -86,7 +91,7 @@ class SessionBroker:
             receiver["acked"].intersection_update(live_ids)
             receiver["offered"].intersection_update(live_ids)
 
-    def notify(self, title, message, severity="info", sound=True, *, persistent=False, key=None):
+    def notify(self, title, message, severity="info", sound=True, *, persistent=False, key=None, priority=None):
         with self._lock:
             now = self._clock()
             self._prune(now)
@@ -95,10 +100,11 @@ class SessionBroker:
             self._serial += 1
             self._queue.append({"id": self._serial, "created": now, "title": str(title)[:160],
                                 "message": str(message)[:2000], "severity": severity,
-                                "sound": bool(sound), "persistent": bool(persistent), "key": key})
+                                "sound": bool(sound), "persistent": bool(persistent), "key": key,
+                                **({"priority": priority} if type(priority) is int and 0 <= priority <= 3 else {})})
             return True
 
-    def publish_event(self, kind, title, message, severity="info", sound=True, *, persistent=False, key=None, repeat=False):
+    def publish_event(self, kind, title, message, severity="info", sound=True, *, persistent=False, key=None, repeat=False, priority=None):
         """Retain new electrical events in RAM, independently of desktop readiness.
 
         Acceptance here confirms bounded broker storage, never Windows display.
@@ -106,7 +112,7 @@ class SessionBroker:
         replayed: dispatch derives its wording from freshly synchronized state.
         """
         if kind not in RETAINED_EVENTS:
-            return self.notify(title, message, severity, sound, persistent=persistent, key=key)
+            return self.notify(title, message, severity, sound, persistent=persistent, key=key, priority=priority)
         with self._lock:
             now = self._clock()
             self._prune(now)
@@ -120,6 +126,8 @@ class SessionBroker:
                 if previous is not None and not previous["delivered_any"]:
                     previous.update(title=str(title)[:160], message=str(message)[:2000],
                                     severity=severity, sound=bool(sound), persistent=bool(persistent), key=key)
+                    if type(priority) is int and 0 <= priority <= 3:
+                        previous["priority"] = priority
                     return True
             self._serial += 1
             if len(self._retained) == self._retained.maxlen:
@@ -127,15 +135,15 @@ class SessionBroker:
             self._retained.append({"id": self._serial, "created": now, "title": str(title)[:160],
                                    "message": str(message)[:2000], "severity": severity,
                                    "sound": bool(sound), "persistent": bool(persistent), "key": key,
-                                   "kind": kind, "delivered_any": False})
+                                   "kind": kind, "delivered_any": False,
+                                   **({"priority": priority} if type(priority) is int and 0 <= priority <= 3 else {})})
             return True
 
     def sync_conditions(self, messages, *, power_state="unknown", connection_state="unknown", enabled=True):
         """Current confirmed conditions; unrelated to sticky-popup preferences."""
         with self._lock:
-            self._conditions = {str(key)[:80]: {"title": str(value["title"])[:160],
-                                               "message": str(value["message"])[:2000]}
-                                for key, value in list(messages.items())[:16]}
+            normalized = [(str(key)[:80], normalize_notice_metadata(value)) for key, value in messages.items()]
+            self._conditions = dict(sorted(normalized, key=lambda item: -item[1].get("priority", 0))[:16])
             self._conditions_at = self._clock()
             self._power_state = power_state if power_state in ("online", "battery") else "unknown"
             self._connection_state = connection_state if connection_state in ("connected", "disconnected") else "unknown"
@@ -145,6 +153,9 @@ class SessionBroker:
     def _delivery(self, item):
         result = {key: value for key, value in item.items()
                   if key not in ("created", "delivered_any")}
+        current = self._persistent.get(item.get("key"))
+        if current is not None:
+            result.update(age_notice_metadata(current, self._clock() - self._persistent_at))
         kind = item.get("kind")
         if not kind:
             return result
@@ -155,8 +166,11 @@ class SessionBroker:
         conditions_fresh = self._conditions_at is not None and self._clock() - self._conditions_at <= 3
         power_state = self._power_state if conditions_fresh else "unknown"
         connection_state = self._connection_state if conditions_fresh else "unknown"
-        if kind in self._conditions and conditions_fresh:
-            result.update(self._conditions[kind])
+        condition = (age_notice_metadata(self._conditions[kind], self._clock() - self._conditions_at)
+                     if kind in self._conditions and conditions_fresh else None)
+        condition_confirmed = condition is not None and condition.get("confirmed", True) is True
+        if condition_confirmed:
+            result.update(condition)
             if kind == "policy_countdown":
                 result["message"] = "Elipro confirma una cuenta regresiva de protección activa. Abre el panel para consultar el tiempo actual o cancelarla."
         elif kind == "power_lost" and power_state == "battery":
@@ -178,13 +192,22 @@ class SessionBroker:
         elif kind in ("power_lost", "power_restored"):
             result.update(title="Energía: aviso registrado", severity="warning",
                           message="Se registró un cambio de suministro eléctrico. Abre Elipro para comprobar el estado actual del UPS.")
+        if "priority" not in result:
+            result["priority"] = notification_priority(kind, countdown_active=condition_confirmed)
+            if kind == "policy_countdown" and not condition_confirmed:
+                result["priority"] = 1
         return result
+
+    def _persistent_snapshot(self):
+        elapsed = self._clock() - self._persistent_at if self._persistent_at is not None else 0
+        values = [(key, age_notice_metadata(value, elapsed)) for key, value in self._persistent.items()]
+        return dict(sorted(values, key=lambda item: -item[1].get("priority", 0)))
 
     def sync_persistent(self, messages):
         with self._lock:
-            self._persistent = {str(key)[:80]: {"title": str(value["title"])[:160],
-                                               "message": str(value["message"])[:2000]}
-                                for key, value in list(messages.items())[:200]}
+            normalized = [(str(key)[:80], normalize_notice_metadata(value)) for key, value in messages.items()]
+            self._persistent = dict(sorted(normalized, key=lambda item: -item[1].get("priority", 0))[:200])
+            self._persistent_at = self._clock()
             # A user ACK removes the durable inbox entry. Older transport
             # tickets must not turn it into a new historical balloon later.
             self._retained = deque((item for item in self._retained
@@ -227,7 +250,8 @@ class SessionBroker:
                 delivery["session_state"] = data["session_state"]
                 delivery["ready"] = delivery["ready"] and data["session_state"] == "active"
             self._clients[client_id] = {"seen": now, "heartbeat": self._heartbeat_serial, **delivery}
-            all_items = sorted((*self._queue, *self._retained), key=lambda item: item["id"])
+            all_items = sorted((*self._queue, *self._retained),
+                               key=lambda item: (-self._delivery(item).get("priority", 0), item["id"]))
             if v2:
                 if client_id not in self._receivers:
                     if len(self._receivers) >= 32:
@@ -257,14 +281,14 @@ class SessionBroker:
                         if len(messages) == 32:
                             break
                 return {"protocol": 2, "epoch": self._epoch, "cursor": self._serial,
-                        "messages": messages[:32], "persistent": dict(self._persistent) if delivery["ready"] else {},
+                        "messages": messages[:32], "persistent": self._persistent_snapshot() if delivery["ready"] else {},
                         "running": True, "acknowledgement": "windows-api-accepted"}
             messages = [] if new_client or after is None or after > self._serial else [
                 self._delivery(item)
                 for item in all_items if item["id"] > after and (
                     not item["persistent"] or item["key"] in self._persistent)]
             return {"cursor": self._serial, "messages": messages,
-                    "persistent": {key: dict(value) for key, value in self._persistent.items()},
+                    "persistent": self._persistent_snapshot(),
                     "running": True}
 
     def status(self):

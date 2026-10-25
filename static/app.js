@@ -83,6 +83,8 @@
     criticalItems: new Map(),
     pendingNotifications: new Map(),
     criticalOpen: false,
+    criticalDominantKey: null,
+    countdownView: null,
     criticalFocusTarget: null,
     criticalBatterySources: new Set(),
     criticalCountdownVisible: false,
@@ -104,6 +106,7 @@
   const dateFormat = new Intl.DateTimeFormat("es-PE", { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit", hour12: false });
   const recordDateFormat = new Intl.DateTimeFormat("es-PE", { year: "numeric", day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false });
   const finite = (value) => typeof value === "number" && Number.isFinite(value);
+  const monotonicNow = () => typeof performance !== "undefined" && typeof performance.now === "function" ? performance.now() : Date.now();
   const percentage = (value) => finite(value) && value >= 0 && value <= 100;
   const estimatedBattery = (sample) => percentage(sample?.battery_percent_estimate) && typeof sample?.battery_estimate_method === "string" && sample.battery_estimate_method.trim().length > 0;
   const batteryCharge = (sample) => percentage(sample?.battery_percent) ? { value: sample.battery_percent, source: "reported" }
@@ -166,6 +169,7 @@
       kinds: [...state.criticalItems.keys()],
       resultKey: protectionResultKey(protection),
       countdown: protection?.state === "countdown" ? {
+        id: protection.countdown_id || null,
         deadline: parseDate(protection.deadline)?.getTime() ?? null,
         remaining: finite(protection.countdown_remaining) ? protection.countdown_remaining : null,
         simulation: !!protection.simulation,
@@ -183,7 +187,7 @@
     const seenCountdown = acknowledgment.countdown;
     const sameCountdown = currentCountdown && seenCountdown && currentCountdown.simulation === seenCountdown.simulation
       && currentCountdown.action === seenCountdown.action && currentCountdown.phase === seenCountdown.phase
-      && (currentCountdown.deadline !== null && seenCountdown.deadline !== null
+      && (currentCountdown.id && seenCountdown.id ? currentCountdown.id === seenCountdown.id : currentCountdown.deadline !== null && seenCountdown.deadline !== null
         ? Math.abs(currentCountdown.deadline - seenCountdown.deadline) <= 2000
         : currentCountdown.deadline === seenCountdown.deadline && currentCountdown.remaining <= seenCountdown.remaining + 2);
     if (sameCountdown) state.criticalCountdownAcknowledged = seenCountdown;
@@ -201,6 +205,7 @@
   function closeCriticalDialog() {
     if (!state.criticalOpen) return;
     state.criticalOpen = false;
+    state.criticalDominantKey = null;
     const dialog = $("critical-dialog");
     if (dialog.open) dialog.close();
     const previous = state.criticalFocusTarget;
@@ -259,8 +264,10 @@
         if (!requiresAttention) continue;
         const item = state.pendingNotifications.get(notice.id) || { notificationId: notice.id };
         item.definition = { kind: String(notice.kind || "notification"), title: String(notice.title || eventLabel(notice.kind)) };
-        item.status = "active";
+        item.status = notice.confirmed === false ? "unconfirmed" : "active";
         const timestamp = parseDate(notice.timestamp);
+        item.priority = Number.isInteger(notice.priority) && notice.priority >= 0 && notice.priority <= 3 ? notice.priority : 0;
+        item.timestamp = timestamp?.getTime() ?? 0;
         const resolved = parseDate(notice.resolved_at);
         item.message = `${String(notice.message || eventLabel(notice.kind))}${timestamp ? ` Registrado: ${recordDateFormat.format(timestamp)}.` : ""}${resolved ? ` Recuperado: ${recordDateFormat.format(resolved)}.` : ""}`;
         next.set(notice.id, item);
@@ -270,6 +277,29 @@
     if (!state.serviceAvailable) {
       for (const item of state.pendingNotifications.values()) if (item.status !== "resolved") item.status = "unconfirmed";
     }
+  }
+
+  function syncCountdownView(protection, elapsed = 0) {
+    const id = protection?.countdown_id;
+    if (protection?.state !== "countdown" || protection.simulation || typeof id !== "string" || !/^[a-f0-9]{32}$/.test(id)) {
+      state.countdownView = null;
+      return;
+    }
+    const now = monotonicNow();
+    const seconds = finite(protection.countdown_remaining) ? protection.countdown_remaining
+      : Math.max(0, ((parseDate(protection.deadline)?.getTime() ?? Date.now()) - Date.now()) / 1000);
+    const deadline = now + Math.max(0, seconds * 1000 - elapsed);
+    state.countdownView = { id, deadline: state.countdownView?.id === id ? Math.min(state.countdownView.deadline, deadline) : deadline,
+      freshUntil: now + Math.max(0, Math.min(3000, finite(protection.valid_for_ms) ? protection.valid_for_ms : 0) - elapsed) };
+  }
+
+  function canCancelCountdown() {
+    const protection = state.status?.protection;
+    if (!state.serviceAvailable || !state.token || state.mutation || protection?.state !== "countdown"
+        || protection.cancelable === false || simulationPhase() === "ups_delay") return false;
+    if (protection.simulation) return true;
+    const view = state.countdownView;
+    return !!view && view.id === protection.countdown_id && monotonicNow() < Math.min(view.deadline, view.freshUntil);
   }
 
   function renderCriticalCountdown() {
@@ -294,7 +324,7 @@
     setText("critical-countdown-label", `${label}. ${phase === "ups_delay" ? "Esta fase solo representa la espera del UPS." : "Cerrar el aviso no cancela la protección."}${!state.serviceAvailable ? " Estado sin confirmar." : ""}`);
     setText("critical-countdown-time", $("countdown").textContent);
     $("critical-cancel").textContent = "Cancelar protección";
-    $("critical-cancel").disabled = !state.serviceAvailable || !state.token || !!state.mutation || !cancelable;
+    $("critical-cancel").disabled = !cancelable || !canCancelCountdown();
   }
 
   function protectionResultKey(protection) {
@@ -355,7 +385,8 @@
     // The service reconstructs its wall-clock deadline from rounded seconds on every poll.
     const newDeadline = deadline !== null && finite(acknowledged?.deadline) && Math.abs(deadline - acknowledged.deadline) > 2000;
     const increasedRemaining = deadline === null && finite(protection.countdown_remaining) && finite(acknowledged?.remaining) && protection.countdown_remaining > acknowledged.remaining + 2;
-    if (countdown && state.serviceAvailable && acknowledged && (newDeadline || increasedRemaining || acknowledged.simulation !== !!protection.simulation || acknowledged.action !== state.status?.policy?.action)) state.criticalCountdownAcknowledged = null;
+    const changedEpisode = protection.countdown_id && acknowledged?.id ? protection.countdown_id !== acknowledged.id : newDeadline || increasedRemaining;
+    if (countdown && state.serviceAvailable && acknowledged && (changedEpisode || acknowledged.simulation !== !!protection.simulation || acknowledged.action !== state.status?.policy?.action)) state.criticalCountdownAcknowledged = null;
     if (hadPendingNotifications && !state.pendingNotifications.size && state.mutation !== "ack-notifications"
         && !state.criticalItems.size && countdown && acknowledgedCountdownElsewhere && !resultAttention) {
       // Entendido in the native window is the same explicit action as in this panel.
@@ -371,12 +402,19 @@
     const pending = [...state.pendingNotifications.values()];
     const pendingKinds = new Set(pending.map((item) => item.definition.kind));
     const items = [...criticalDefinitions.filter((definition) => !pendingKinds.has(definition.kind)).map((definition) => state.criticalItems.get(definition.kind)).filter(Boolean), ...pending];
+    const itemKey = (item) => item.notificationId ?? item.definition.kind;
+    const itemPriority = (item) => item.priority ?? 2;
+    items.sort((left, right) => itemPriority(right) - itemPriority(left)
+      || Number(itemKey(right) === state.criticalDominantKey) - Number(itemKey(left) === state.criticalDominantKey)
+      || (left.timestamp ?? 0) - (right.timestamp ?? 0) || (left.notificationId ?? 0) - (right.notificationId ?? 0));
+    state.criticalDominantKey = items.length ? itemKey(items[0]) : null;
     const active = items.filter((item) => item.status === "active");
     const unconfirmed = items.some((item) => item.status === "unconfirmed");
-    let title = active.length ? active[0].definition.title : unconfirmed ? "Estado sin confirmar" : "Alerta resuelta";
+    const dominant = items[0];
+    let title = dominant?.status === "unconfirmed" ? "Estado sin confirmar" : dominant?.definition.title || "Alerta resuelta";
     let description = active.length ? "El UPS requiere tu atención. Revisa las condiciones detectadas." : unconfirmed ? "No hay información suficiente para confirmar las condiciones detectadas. Revisa el estado y la conexión con el monitor." : "El UPS ya no reporta estas condiciones. El incidente permanece en el registro.";
     if (pending.length) {
-      title = active.length ? active[0].definition.title : unconfirmed ? "Estado sin confirmar" : "Avisos pendientes de Entendido";
+      title = dominant?.status === "unconfirmed" ? "Estado sin confirmar" : dominant?.definition.title || "Avisos pendientes de Entendido";
       description = "El aviso se cierra automáticamente cuando se confirma la recuperación. El incidente se conserva en el historial. Entendido confirma su lectura sin cancelar la protección.";
     }
     if (!items.length) {
@@ -389,6 +427,16 @@
         description = state.stopAcknowledged ? "Detuviste el monitor. La vigilancia se reanudará cuando vuelvas a iniciar Elipro." : simulationPhase() === "complete" ? "Windows y el UPS permanecen encendidos. La secuencia solo se ha representado." : protection.reason || "El monitor ya no reporta una cuenta atrás activa.";
       }
     }
+    const dominantCountdown = countdown && !protection.simulation && !state.criticalCountdownAcknowledged
+      && (!items.length || items[0].definition.kind === "policy_countdown" || itemPriority(items[0]) < 3);
+    if (dominantCountdown) {
+      const confirmed = state.serviceAvailable && !!state.countdownView
+        && monotonicNow() < Math.min(state.countdownView.deadline, state.countdownView.freshUntil);
+      title = !confirmed ? "Cuenta atrás sin confirmar" : state.status?.policy?.action === "hibernate" ? "Hibernación programada" : "Apagado programado";
+      description = `${protection.reason || "Se alcanzó un límite de protección."} Guarda tu trabajo. ${confirmed ? "Puedes cancelar esta cuenta mientras siga vigente." : "La cuenta atrás puede seguir activa; su cancelación no está confirmada."}`;
+    }
+    $("critical-dialog").dataset.priority = String(dominantCountdown ? 3 : items.length ? itemPriority(items[0]) : 0);
+    $("critical-urgency").hidden = !dominantCountdown;
     setText("critical-title", title);
     setText("critical-description", description);
     const list = $("critical-list");
@@ -539,6 +587,7 @@
   }
 
   async function request(path, options = {}) {
+    const started = monotonicNow();
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 8000);
     try {
@@ -556,6 +605,7 @@
         if (typeof data.code === "string") error.code = data.code;
         throw error;
       }
+      if (data && typeof data === "object") Object.defineProperty(data, "_requestElapsedMs", { value: Math.max(0, monotonicNow() - started), configurable: true });
       return data;
     } catch (error) {
       if (error.name === "AbortError" || error instanceof TypeError) {
@@ -585,8 +635,7 @@
     const transition = powerTransition();
     const physicalTest = upsPhysicalTestActive();
     $("save-policy").disabled = unavailable || busy || physicalTest;
-    $("critical-cancel").disabled = unavailable || busy || state.status?.protection?.state !== "countdown"
-      || state.status?.protection?.cancelable === false || simulationPhase() === "ups_delay";
+    $("critical-cancel").disabled = !canCancelCountdown();
     $("critical-ack").disabled = busy;
     setText("critical-ack", state.mutation === "ack-notifications" ? "Confirmando…" : "Entendido");
     $("test-shutdown").disabled = unavailable || busy || enabled || state.policyDirty || !!transition || physicalTest;
@@ -1644,7 +1693,8 @@
       return;
     }
     const deadline = parseDate(protection.deadline);
-    const seconds = deadline ? Math.max(0, Math.ceil((deadline.getTime() - Date.now()) / 1000)) : finite(protection.countdown_remaining) ? Math.max(0, Math.ceil(protection.countdown_remaining)) : null;
+    const seconds = state.countdownView ? Math.max(0, Math.ceil((state.countdownView.deadline - monotonicNow()) / 1000))
+      : deadline ? Math.max(0, Math.ceil((deadline.getTime() - Date.now()) / 1000)) : finite(protection.countdown_remaining) ? Math.max(0, Math.ceil(protection.countdown_remaining)) : null;
     setText("countdown", seconds === null ? "—" : `${String(Math.floor(seconds / 60)).padStart(2, "0")}:${String(seconds % 60).padStart(2, "0")}`);
     $("countdown").title = !state.serviceAvailable ? "Referencia del último plazo confirmado. La ejecución y la cancelación requieren confirmación del monitor." : "Tiempo restante comunicado por el monitor.";
     renderCriticalCountdown();
@@ -1654,6 +1704,7 @@
     if (!data || typeof data !== "object" || !data.connection || !data.policy || !data.protection) throw new Error("El monitor devolvió un estado incompleto.");
     const recovered = !state.serviceAvailable;
     const historyRecovered = state.status?.history?.available === false && data.history?.available === true;
+    syncCountdownView(data.protection, data._requestElapsedMs || 0);
     state.status = data;
     state.upsPowerReviewNeedsStatus = false;
     state.serviceAvailable = true;
@@ -2146,15 +2197,20 @@
     }
   });
   async function cancelProtection() {
-    if (!state.serviceAvailable || state.mutation || state.status?.protection?.state !== "countdown"
-        || state.status?.protection?.cancelable === false || simulationPhase() === "ups_delay") return;
+    if (!canCancelCountdown()) return;
+    const simulation = !!state.status.protection.simulation;
+    const countdownId = simulation ? null : state.status.protection.countdown_id;
     state.mutation = "cancel";
     state.statusGeneration += 1;
     updateMutationControls();
     $("critical-feedback").hidden = true;
     try {
-      const simulation = !!state.status?.protection?.simulation;
-      const result = await post("/api/protection/cancel", {});
+      const result = await post(simulation ? "/api/protection/cancel" : "/api/protection/countdown/cancel",
+        simulation ? {} : { countdown_id: countdownId });
+      if (!simulation && result.cancelled_countdown_id !== countdownId) throw new Error("El monitor no confirmó la cancelación de esta cuenta.");
+      if (!simulation && state.status?.protection?.state === "countdown" && state.status.protection.countdown_id !== countdownId) {
+        throw new Error("El monitor ya informa otra cuenta. Se conserva su estado actual.");
+      }
       applyStatus(result);
       if (["countdown", "executed"].includes(result.protection.state)) throw new Error("El monitor aún reporta una cuenta atrás o una acción enviada a Windows.");
       if (state.criticalOpen && !state.criticalItems.size && !state.pendingNotifications.size) finishCriticalAcknowledgment(captureCriticalAcknowledgment());
