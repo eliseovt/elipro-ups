@@ -8,6 +8,8 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from ups_monitor import windows_notifications as wn
+from ups_monitor.alerts import AlertManager
+from ups_monitor.core import Store
 
 
 class LoopBackend:
@@ -746,6 +748,57 @@ class NativeShellTests(unittest.TestCase):
         self.assertIsNone(self.backend.popup_persistent_key)
         self.assertIsNotNone(notifier.status()["last_popup_hidden_at"])
         self.assertIsNone(self.backend.last_notice)
+
+    def test_outage_recovery_closes_native_notice_without_ack_and_recovery_popup_expires(self):
+        notifier = self.configure_popup()
+        notifier._set_ready(True)
+        store = Store(":memory:")
+        self.addCleanup(store.close)
+        alerts = AlertManager(store, notifier)
+        alerts.update_settings({"sound_enabled": False})
+        with patch.object(store, "acknowledge_notifications", wraps=store.acknowledge_notifications) as acknowledge:
+            alerts.on_event("power_lost", "El UPS usa batería")
+            notifier._drain(self.backend)
+            outage = alerts.status()["pending"][0]
+            self.assertEqual(self.backend.popup_persistent_key, f"notice:{outage['id']}")
+            popup = self.backend.popup_hwnd
+
+            alerts.on_event("power_restored", "Volvió la red")
+            notifier._drain(self.backend)
+            self.assertIsNone(self.backend.popup_persistent_key)
+            self.user.ShowWindow.assert_any_call(popup, 0)
+            pending = alerts.status()["pending"]
+            self.assertEqual({item["kind"] for item in pending}, {"power_lost", "power_restored"})
+            self.assertIsNotNone(next(item for item in pending if item["kind"] == "power_lost")["resolved_at"])
+            self.assertTrue(all(item["acknowledged_at"] is None for item in pending))
+            self.assertTrue(all(not item["requires_attention"] for item in pending))
+
+            # A Windows-suppressed balloon falls back to a temporary popup.
+            requested = self.backend.last_notice["requested_at"]
+            with patch.object(wn.time, "monotonic", return_value=requested + 1.01):
+                self.backend._check_unconfirmed_popup()
+            self.user.SetTimer.assert_any_call(popup, 1, 12000, None)
+            self.assertIsNone(self.backend.popup_persistent_key)
+            self.backend._window_proc(popup, wn.WM_TIMER, 1, 0)
+            acknowledge.assert_not_called()
+            notifier.cancel_callback.assert_not_called()
+            self.assertEqual(len(store.pending_notifications()), 2)
+
+    def test_recovery_before_native_queue_drains_discards_obsolete_outage_window(self):
+        notifier = self.configure_popup()
+        notifier._set_ready(True)
+        store = Store(":memory:")
+        self.addCleanup(store.close)
+        alerts = AlertManager(store, notifier)
+        alerts.update_settings({"sound_enabled": False})
+        alerts.on_event("power_lost", "El UPS usa batería")
+        alerts.on_event("power_restored", "Volvió la red")
+        notifier._drain(self.backend)
+        self.assertIsNone(self.backend.popup_hwnd)
+        self.assertEqual(self.backend.last_notice["title"], "Suministro eléctrico recuperado")
+        self.assertEqual(notifier._persistent_messages, {})
+        self.assertEqual(len(store.pending_notifications()), 2)
+        notifier.cancel_callback.assert_not_called()
 
     def test_durable_notice_close_does_not_ack_and_understood_waits_for_disk(self):
         notifier = self.configure_popup()

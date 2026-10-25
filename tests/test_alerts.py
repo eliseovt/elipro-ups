@@ -85,7 +85,7 @@ class AlertTests(unittest.TestCase):
         self.manager.update_settings({"sound_enabled": False})
         self.assertTrue(self.new_manager().status()["settings"]["persistent_critical"])
 
-    def test_persistent_conditions_remain_after_recovery_until_user_understood(self):
+    def test_recovery_closes_persistent_window_without_acknowledging_notice(self):
         self.persistent_notifier()
         self.manager.on_event("battery_low", "Batería baja")
         notice = self.manager.status()["pending"][0]
@@ -96,12 +96,57 @@ class AlertTests(unittest.TestCase):
         self.update(low_battery=True)
         self.assertIn(key, self.notifier.live)
         self.update()
-        self.assertIn(key, self.notifier.live)
-        self.assertIsNotNone(self.manager.status()["pending"][0]["resolved_at"])
+        self.assertNotIn(key, self.notifier.live)
+        recovered = self.manager.status()["pending"][0]
+        self.assertIsNotNone(recovered["resolved_at"])
+        self.assertIsNone(recovered["acknowledged_at"])
+        self.assertFalse(recovered["requires_attention"])
+        self.assertIn("guardado en el historial", recovered["message"])
+        self.assertNotIn("Entendido", recovered["message"])
         self.manager.acknowledge([notice["id"]])
         self.assertEqual(self.notifier.live, {})
 
-    def test_countdown_becomes_historical_without_sound_after_cancel_or_stale(self):
+    def test_recovered_power_and_connection_windows_close_with_temporary_recovery_notice(self):
+        self.persistent_notifier()
+        for lost, restored in (("power_lost", "power_restored"), ("connection_lost", "connection_restored")):
+            with self.subTest(kind=lost):
+                self.manager.on_event(lost, "Incidente detectado")
+                incident = next(item for item in self.manager.status()["pending"] if item["kind"] == lost)
+                key = "notice:" + str(incident["id"])
+                self.assertIn(key, self.notifier.live)
+                self.assertTrue(incident["requires_attention"])
+                self.clock.advance(5)
+                self.manager.on_event(restored, "Condición recuperada")
+                self.assertNotIn(key, self.notifier.live)
+                self.assertNotIn("persistent", self.notifier.messages[-1])
+                self.assertNotIn("key", self.notifier.messages[-1])
+                self.assertFalse(self.manager.status()["last_notification"]["persistent"])
+                records = {item["kind"]: item for item in self.manager.status()["pending"]}
+                self.assertFalse(records[lost]["requires_attention"])
+                self.assertFalse(records[restored]["requires_attention"])
+                self.assertIsNone(records[lost]["acknowledged_at"])
+                self.assertIsNone(records[restored]["acknowledged_at"])
+
+    def test_completed_information_is_temporary_but_unconfirmed_information_requires_attention(self):
+        self.persistent_notifier()
+        for kind in ("monitor_restarted", "policy_cancelled", "ups_poweroff_reviewed"):
+            with self.subTest(kind=kind):
+                self.manager.on_event(kind, "Evento informativo")
+                notice = next(item for item in self.manager.status()["pending"] if item["kind"] == kind)
+                self.assertFalse(notice["requires_attention"])
+                self.assertNotIn("notice:" + str(notice["id"]), self.notifier.live)
+                self.assertNotIn("persistent", self.notifier.messages[-1])
+                self.assertNotIn("key", self.notifier.messages[-1])
+        for kind in ("ups_battery_test_windows_unconfirmed", "windows_action_unconfirmed"):
+            with self.subTest(kind=kind):
+                self.manager.on_event(kind, "Resultado pendiente de revisión")
+                notice = next(item for item in self.manager.status()["pending"] if item["kind"] == kind)
+                self.assertEqual(notice["severity"], "info")
+                self.assertTrue(notice["requires_attention"])
+                self.assertIn("notice:" + str(notice["id"]), self.notifier.live)
+                self.assertTrue(self.notifier.messages[-1]["persistent"])
+
+    def test_countdown_closes_after_cancel_but_unknown_telemetry_does_not_confirm_recovery(self):
         self.persistent_notifier()
         protection = {"state": "countdown", "countdown_remaining": 60, "action": "shutdown"}
         self.update(protection, on_battery=True)
@@ -113,10 +158,18 @@ class AlertTests(unittest.TestCase):
         self.assertEqual(len(self.notifier.messages), 1)
         self.assertIn("tiempo actual", self.notifier.live[key]["message"])
         self.manager.on_event("policy_cancelled", "Cancelado")
-        self.assertIn("anterior", self.notifier.live[key]["message"])
+        self.assertNotIn(key, self.notifier.live)
+        cancelled = next(item for item in self.manager.status()["pending"] if item["kind"] == "policy_countdown")
+        self.assertFalse(cancelled["requires_attention"])
+        self.assertIsNotNone(cancelled["resolved_at"])
+        self.assertIsNone(cancelled["acknowledged_at"])
         self.update(protection, on_battery=True)
+        key = next(iter(self.notifier.live))
         self.manager.update(protection, "disconnected", None)
         self.assertIn("anterior", self.notifier.live[key]["message"])
+        active = next(item for item in self.manager.status()["pending"] if "notice:" + str(item["id"]) == key)
+        self.assertTrue(active["requires_attention"])
+        self.assertIsNone(active["resolved_at"])
 
     def test_loss_of_data_preserves_pending_and_disabled_desktop_retains_inbox(self):
         self.persistent_notifier()
@@ -128,6 +181,70 @@ class AlertTests(unittest.TestCase):
         self.manager.update_settings({"enabled": False})
         self.assertEqual(self.notifier.live, {})
         self.assertGreaterEqual(len(self.manager.status()["pending"]), 4)
+
+    def test_recent_sample_with_missing_metrics_does_not_resolve_or_repeat_conditions(self):
+        self.persistent_notifier()
+        self.update(low_battery=True, battery_percent=10, fault=True, load_percent=100)
+        original_ids = {item["id"] for item in self.manager.status()["pending"]}
+        delivered = len(self.notifier.messages)
+        self.clock.advance(31)
+        self.update(low_battery=None, battery_percent=None, fault=None, load_percent=None)
+        pending = self.manager.status()["pending"]
+        self.assertEqual({item["id"] for item in pending}, original_ids)
+        self.assertTrue(all(item["requires_attention"] and item["resolved_at"] is None for item in pending))
+        self.assertEqual(len(self.notifier.live), 3)
+        self.assertEqual(len(self.notifier.messages), delivered)
+        self.assertEqual(self.manager._active, {})
+        self.update(low_battery=False, battery_percent=80, fault=False, load_percent=20)
+        self.assertEqual(self.notifier.live, {})
+        self.assertTrue(all(not item["requires_attention"] and item["acknowledged_at"] is None
+                            for item in self.manager.status()["pending"]))
+
+    def test_battery_low_requires_recovery_of_each_source_that_triggered_the_episode(self):
+        self.persistent_notifier()
+        self.update(low_battery=True, battery_percent=10)
+        notice_id = self.manager.status()["pending"][0]["id"]
+        self.assertEqual(self.store.pending_notifications()[0]["condition_sources"], ["reported_percentage", "signal"])
+        for changes in ({"low_battery": False, "battery_percent": None},
+                        {"low_battery": None, "battery_percent": 80}):
+            with self.subTest(changes=changes):
+                self.clock.advance(31)
+                before = len(self.notifier.messages)
+                self.update(**changes)
+                pending = self.manager.status()["pending"][0]
+                self.assertEqual(pending["id"], notice_id)
+                self.assertTrue(pending["requires_attention"])
+                self.assertIsNone(pending["resolved_at"])
+                self.assertEqual(len(self.notifier.messages), before)
+        self.update(low_battery=False, battery_percent=80)
+        self.assertFalse(self.manager.status()["pending"][0]["requires_attention"])
+        self.assertEqual(self.notifier.live, {})
+
+    def test_percentage_only_battery_alarm_ignores_a_normal_signal_until_percentage_recovers(self):
+        self.persistent_notifier()
+        self.update(low_battery=None, battery_percent=10)
+        self.update(low_battery=False, battery_percent=None)
+        self.assertTrue(self.manager.status()["pending"][0]["requires_attention"])
+        self.update(low_battery=None, battery_percent=80)
+        self.assertFalse(self.manager.status()["pending"][0]["requires_attention"])
+        self.assertEqual(self.notifier.live, {})
+
+    def test_estimated_percentage_alarm_survives_missing_estimate_until_it_recovers_or_returns_to_line(self):
+        self.persistent_notifier()
+        protection = {"policy": {"low_battery_percent": 20}}
+        self.update(protection, on_battery=True, battery_percent_estimate=10, battery_estimate_method="nt2402pro-pmv-qs-v1")
+        notice_id = self.manager.status()["pending"][0]["id"]
+        self.clock.advance(31)
+        delivered = len(self.notifier.messages)
+        self.update(protection, on_battery=True, battery_percent_estimate=None)
+        self.assertTrue(self.manager.status()["pending"][0]["requires_attention"])
+        self.assertEqual(len(self.notifier.messages), delivered)
+        self.update(protection, on_battery=False, battery_percent_estimate=None)
+        notice = self.manager.status()["pending"][0]
+        self.assertEqual(notice["id"], notice_id)
+        self.assertFalse(notice["requires_attention"])
+        self.assertIsNone(notice["acknowledged_at"])
+        self.assertEqual(self.notifier.live, {})
 
     def test_simulation_and_visual_test_are_never_persistent(self):
         self.persistent_notifier()

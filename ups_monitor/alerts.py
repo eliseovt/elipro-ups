@@ -48,9 +48,13 @@ _EVENTS = {
 }
 _PERSISTENT = frozenset(("battery_low", "battery_low_percentage", "overload", "ups_fault", "policy_countdown"))
 # Acknowledgement and recovery are independent. Every real incident remains in
-# this inbox until a user explicitly presses Entendido; desktop delivery is
-# merely another view of these records, never an acknowledgement.
+# this inbox until a user explicitly presses Entendido. A recovered condition
+# can close its desktop window without acknowledging or deleting the record.
 _INBOX_EVENTS = frozenset(_EVENTS) - {"simulation"}
+_INFORMATIONAL_EVENTS = frozenset((
+    "power_restored", "connection_restored", "monitor_restarted",
+    "policy_cancelled", "ups_poweroff_reviewed",
+))
 # These observations form persistence barriers. The history worker flushes
 # queued telemetry and the transition together; selecting an alert never waits
 # for SQLite or asks the desktop notifier to make a durability decision.
@@ -71,6 +75,11 @@ _CONDITION_MESSAGES = {
     "overload": "El UPS continúa indicando una carga igual o superior al 100 %.",
     "ups_fault": "El UPS continúa reportando una falla. Revisa el equipo.",
 }
+
+
+def _requires_attention(notice):
+    """Keep recovery separate from user acknowledgement and event severity."""
+    return notice.get("resolved_at") is None and notice["kind"] not in _INFORMATIONAL_EVENTS
 
 
 def validate_notification_settings(value):
@@ -117,6 +126,7 @@ class AlertManager:
         self._pending = {}
         self._incidents = {}
         self._incident_records = {}
+        self._battery_low_sources = set()
         self._dirty = set()
         self._last_persist_retry = None
         self._inbox_error = None
@@ -125,11 +135,17 @@ class AlertManager:
             self._incident_records = {item["id"]: dict(item) for item in store.notification_incidents()}
         except Exception as exc:
             self._inbox_error = "No se pudieron cargar los avisos pendientes: " + str(exc)[:300]
+        # Both views must share a record. Sources learned after a restart must
+        # survive a later acknowledgement taken from the pending inbox.
+        self._incident_records.update(self._pending)
         for item in self._incident_records.values():
             # Prior countdowns never assert that a current action is pending.
             # First live observations will confirm recovery independently.
             if item.get("resolved_at") is None and item["kind"] in (_PERSISTENT | {"power_lost", "connection_lost", "monitor_error", "policy_migration_review"}):
                 self._incidents[item["kind"]] = item["id"]
+                if item["kind"] == "battery_low":
+                    self._battery_low_sources.update(source for source in item.get("condition_sources", [])
+                                                     if source in ("signal", "reported_percentage"))
         self._loaded_notice_ids = set(self._pending) | set(self._incident_records)
         self.notifier.acknowledge_callback = self.acknowledge
         try:
@@ -185,6 +201,8 @@ class AlertManager:
                 notice = {"id": notice_id, "kind": kind, "title": title, "message": str(message),
                           "severity": severity, "timestamp": iso_utc(self._utc_clock()),
                           "resolved_at": None, "acknowledged_at": None}
+                if kind == "battery_low" and self._battery_low_sources:
+                    notice["condition_sources"] = sorted(self._battery_low_sources)
                 self._pending[notice_id] = notice
                 self._loaded_notice_ids.add(notice_id)
                 self._incident_records[notice_id] = notice
@@ -205,7 +223,8 @@ class AlertManager:
             return False
         try:
             options = {"severity": severity, "sound": sound}
-            if notice is not None and callable(getattr(self.notifier, "sync_persistent", None)):
+            if (notice is not None and _requires_attention(notice)
+                    and callable(getattr(self.notifier, "sync_persistent", None))):
                 options.update(persistent=True, key="notice:" + str(notice["id"]))
             elif kind not in _INBOX_EVENTS and self._settings["persistent_critical"] and kind in _PERSISTENT:
                 options.update(persistent=True, key=kind)
@@ -220,7 +239,7 @@ class AlertManager:
             "kind": kind, "title": title, "message": message, "severity": severity,
             "sound": sound, "timestamp": iso_utc(self._utc_clock()),
             "repeat": repeat, "accepted": accepted,
-            "persistent": notice is not None or (self._settings["persistent_critical"] and kind in _PERSISTENT),
+            "persistent": options.get("persistent", False),
         }
         return accepted
 
@@ -251,6 +270,9 @@ class AlertManager:
                 self._pending[item["id"]] = value
             if value.get("resolved_at") is None and value["kind"] in (_PERSISTENT | {"power_lost", "connection_lost", "monitor_error", "policy_migration_review"}):
                 self._incidents.setdefault(value["kind"], value["id"])
+                if value["kind"] == "battery_low" and self._incidents["battery_low"] == value["id"]:
+                    self._battery_low_sources.update(source for source in value.get("condition_sources", [])
+                                                     if source in ("signal", "reported_percentage"))
 
     def _resolve(self, *kinds):
         stamp = iso_utc(self._utc_clock())
@@ -260,15 +282,17 @@ class AlertManager:
             if notice is not None and notice.get("resolved_at") is None:
                 notice["resolved_at"] = stamp
                 self._save_notice(notice)
+            if kind == "battery_low":
+                self._battery_low_sources.clear()
 
     def _notice_message(self, notice):
         kind = notice["kind"]
+        if notice.get("resolved_at") is not None:
+            return notice["message"] + " La condición terminó; el aviso quedó guardado en el historial."
         if kind == "policy_countdown":
             if kind in self._active:
                 return "Elipro confirma una cuenta regresiva de protección activa. Abre el panel para consultar el tiempo actual o cancelarla."
             return "Se registró una cuenta regresiva de protección anterior. Revisa el estado actual y su resultado en Elipro."
-        if notice.get("resolved_at") is not None:
-            return notice["message"] + " La condición terminó; el aviso sigue pendiente de Entendido."
         return notice["message"]
 
     def acknowledge(self, ids):
@@ -304,7 +328,8 @@ class AlertManager:
         if not callable(synchronize):
             return
         messages = ({"notice:" + str(item["id"]): {"title": item["title"], "message": self._notice_message(item)}
-                     for item in sorted(self._pending.values(), key=lambda value: (value["timestamp"], value["id"]))}
+                     for item in sorted(self._pending.values(), key=lambda value: (value["timestamp"], value["id"]))
+                     if _requires_attention(item)}
                     if self._settings["enabled"] else {})
         try:
             synchronize(messages)
@@ -385,6 +410,28 @@ class AlertManager:
                 if self._number(remaining) else
                 f"Elipro tiene una cuenta regresiva activa para {action} Windows. Abre el panel para revisarla.")
 
+    def _battery_low_condition(self, sample, threshold, percent, percent_source):
+        """Require the sources that raised this incident to confirm recovery."""
+        signal = sample.get("low_battery")
+        reported = percent_source == "reported_percentage"
+        if signal is True:
+            self._battery_low_sources.add("signal")
+        if threshold > 0 and reported and percent <= threshold:
+            self._battery_low_sources.add("reported_percentage")
+        notice = self._incident_records.get(self._incidents.get("battery_low"))
+        if notice is not None and self._battery_low_sources:
+            sources = sorted(self._battery_low_sources)
+            if notice.get("condition_sources") != sources:
+                notice["condition_sources"] = sources
+                self._save_notice(notice)
+        if signal is True or threshold > 0 and reported and percent <= threshold:
+            return True
+        normal = {"signal": signal is False,
+                  "reported_percentage": threshold == 0 or reported and percent > threshold}
+        if self._battery_low_sources:
+            return False if all(normal[source] for source in self._battery_low_sources) else None
+        return False if signal is False or reported and (threshold == 0 or percent > threshold) else None
+
     def _fresh(self, sample, connection):
         if not isinstance(sample, dict) or sample.get("connected", True) is not True:
             return False
@@ -412,20 +459,24 @@ class AlertManager:
             self._context_connection = "connected" if fresh else "unknown"
             self._context_power = ("battery" if sample.get("on_battery") is True else
                                    "online" if sample.get("on_battery") is False else "unknown") if fresh else "unknown"
-            conditions = {"battery_low": False, "battery_low_percentage": False, "overload": False, "ups_fault": False}
+            conditions = {"battery_low": None, "battery_low_percentage": None, "overload": None, "ups_fault": None}
             if fresh:
                 load = sample.get("load_percent")
                 threshold = protection.get("policy", {}).get("low_battery_percent", 20)
                 if type(threshold) is not int or not 0 <= threshold <= 100:
                     threshold = 20
                 percent, percent_source = battery_percentage(sample)
+                estimated_low = (False if sample.get("on_battery") is False or threshold == 0
+                                 or percent_source == "reported_percentage" else
+                                 percent <= threshold if sample.get("on_battery") is True
+                                 and percent_source == "estimated_percentage" else None)
                 conditions = {
-                    "battery_low": sample.get("low_battery") is True or (threshold > 0
-                        and percent_source == "reported_percentage" and percent <= threshold),
-                    "battery_low_percentage": sample.get("on_battery") is True and threshold > 0
-                        and percent_source == "estimated_percentage" and percent <= threshold,
-                    "overload": self._number(load) and load >= 100,
-                    "ups_fault": sample.get("fault") is True,
+                    "battery_low": self._battery_low_condition(sample, threshold, percent, percent_source),
+                    "battery_low_percentage": estimated_low,
+                    "overload": load >= 100 if self._number(load) else None,
+                    "ups_fault": (True if sample.get("fault") is True else False
+                                  if sample.get("fault") is False or sample.get("raw_status") in
+                                  ("Line mode", "AVR mode", "Battery mode", "Battery test mode", "Shutdown mode") else None),
                 }
             # A countdown must be real and backed by current telemetry. A visual
             # browser simulation is deliberately not a repeated protection alert.
@@ -433,9 +484,9 @@ class AlertManager:
             conditions["policy_countdown"] = countdown
             emissions = []
             for kind, active in conditions.items():
-                if not active:
+                if active is not True:
                     self._active.pop(kind, None)
-                    if fresh:
+                    if active is False and fresh:
                         self._resolve(kind)
                         # Recovery ends this incident. A new alarm must be
                         # immediate even if it starts inside the old cooldown.
@@ -498,6 +549,7 @@ class AlertManager:
                 "settings": dict(self._settings), "delivery": delivery,
                 "last_notification": dict(self._last_notification) if self._last_notification else None,
                 "last_error": self._inbox_error or self._last_error,
-                "pending": [{**item, "message": self._notice_message(item)} for item in
+                "pending": [{**item, "message": self._notice_message(item),
+                             "requires_attention": _requires_attention(item)} for item in
                             sorted(self._pending.values(), key=lambda value: (value["timestamp"], value["id"]))],
             }

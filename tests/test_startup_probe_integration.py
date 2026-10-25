@@ -167,7 +167,7 @@ class StartupProbeIntegrationTests(unittest.TestCase):
         self.assertIsNone(self.monitor.engine.status()["countdown_remaining"])
         self.assert_policy_and_actions_unchanged()
 
-    def test_occupied_endpoint_timeout_blocks_usb_and_loss_and_recovery_reach_late_agent(self):
+    def test_occupied_endpoint_timeout_blocks_usb_and_late_agent_gets_temporary_recovery(self):
         self.table.side_effect = [ABSENT, OCCUPIED, OCCUPIED, OCCUPIED, ABSENT]
         self.build_monitor()
         self.tick(100)
@@ -194,15 +194,22 @@ class StartupProbeIntegrationTests(unittest.TestCase):
         self.assertEqual(self.transport.return_value.query_status.call_count, 2)
         agent, client, desktop = self.late_agent()
         messages = client.responses[-1]["messages"]
-        self.assertEqual([item["kind"] for item in messages], ["connection_lost", "connection_restored"])
-        self.assertEqual(len(desktop.messages), 2)
+        self.assertEqual([item["kind"] for item in messages], ["connection_restored"])
+        self.assertEqual(len(desktop.messages), 1)
         self.assertTrue(all(item["title"] == "Comunicación: aviso registrado" for item in messages))
         self.assertTrue(all("vuelve a entregar datos recientes" in item["message"] for item in messages))
-        # A successful desktop receipt still controls acknowledgement; the
-        # probe retry change must not discard genuine retained incidents.
+        self.assertTrue(all(item["persistent"] is False for item in messages))
+        self.assertEqual(client.responses[-1]["persistent"], {})
+        incidents = self.alerts.status()["pending"]
+        self.assertEqual({item["kind"] for item in incidents}, {"connection_lost", "connection_restored"})
+        self.assertTrue(all(item["acknowledged_at"] is None for item in incidents))
+        self.assertTrue(all(item["requires_attention"] is False for item in incidents))
+        self.assertEqual(len([event for event in self.monitor.events() if event["kind"] == "connection_lost"]), 1)
+        # Receipt confirms transport delivery only. Recovery retires the old
+        # desktop warning while both durable incident records remain unread.
         agent.step()
         self.assertEqual(self.broker.status()["pending_retained"], 0)
-        self.assertEqual(len(desktop.messages), 2)
+        self.assertEqual(len(desktop.messages), 1)
         self.assert_policy_and_actions_unchanged()
 
     def test_windows_table_error_blocks_without_udp_and_remains_a_notifiable_failure(self):
