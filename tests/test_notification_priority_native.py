@@ -135,6 +135,80 @@ class NativePriorityTests(unittest.TestCase):
             self.backend._window_proc(self.backend.popup_hwnd, wn.WM_COMMAND, 103, 0)
             notifier.cancel_countdown_callback.assert_not_called()
 
+    def test_visual_ticks_update_clock_without_relayout_reposition_or_button_churn(self):
+        notifier = self.configure_popup()
+        notifier.cancel_countdown_callback = Mock()
+        notice = self.notice("Protección", 3, countdown="a" * 32)
+        with patch.object(wn.time, "monotonic", return_value=100) as clock:
+            notifier.sync_persistent({"notice:1": notice})
+            self.backend.sync_persistent()
+            popup, view = self.backend.popup_hwnd, self.backend.popup_view
+            self.user.SetTimer.assert_any_call(popup, 3, 100, None)
+            self.user.SetWindowPos.reset_mock()
+            self.user.SetWindowTextW.reset_mock()
+            self.user.EnableWindow.reset_mock()
+            self.user.ShowWindow.reset_mock()
+            self.user.SetTimer.reset_mock()
+            self.user.KillTimer.reset_mock()
+            with patch.object(view, "layout", wraps=view.layout) as layout, \
+                    patch.object(self.backend, "_play_sound") as sound:
+                for instant in (100.1, 100.2, 100.9, 101.01, 101.1, 101.9, 102.01, 102.9):
+                    clock.return_value = instant
+                    self.backend._window_proc(popup, wn.WM_TIMER, 3, 0)
+                layout.assert_not_called()
+                sound.assert_not_called()
+            self.user.SetWindowPos.assert_not_called()
+            self.user.EnableWindow.assert_not_called()
+            self.user.ShowWindow.assert_not_called()
+            self.user.SetTimer.assert_not_called()
+            self.user.KillTimer.assert_not_called()
+            updates = [(call.args[0], call.args[1]) for call in self.user.SetWindowTextW.call_args_list]
+            self.assertEqual(updates, [(self.backend.popup_countdown, "00:29"),
+                                       (self.backend.popup_countdown, "00:28")])
+            self.assertEqual(self.backend.popup_persistent_key, "notice:1")
+            self.assertEqual(self.backend._popup_refresh_interval, 100)
+
+    def test_refresh_interval_changes_only_when_visible_notice_switches_countdown_mode(self):
+        notifier = self.configure_popup()
+        notifier.cancel_countdown_callback = Mock()
+        with patch.object(wn.time, "monotonic", return_value=100):
+            notifier.sync_persistent({"notice:1": self.notice("Corte", 1)})
+            self.backend.sync_persistent()
+            popup = self.backend.popup_hwnd
+            self.user.SetTimer.assert_any_call(popup, 3, 1000, None)
+            self.user.SetTimer.reset_mock()
+            notifier.sync_persistent({"notice:1": self.notice("Cuenta", 3, countdown="a" * 32)})
+            self.backend.sync_persistent()
+            self.user.SetTimer.assert_called_once_with(popup, 3, 100, None)
+            self.user.SetTimer.reset_mock()
+            self.backend.sync_persistent()
+            self.user.SetTimer.assert_not_called()
+            notifier.sync_persistent({"notice:1": self.notice("Revisión", 2)})
+            self.backend.sync_persistent()
+            self.user.SetTimer.assert_called_once_with(popup, 3, 1000, None)
+            self.user.SetTimer.reset_mock()
+            self.backend.sync_persistent()
+            self.user.SetTimer.assert_not_called()
+
+    def test_high_frequency_ticks_preserve_expiry_and_never_enable_stale_cancellation(self):
+        notifier = self.configure_popup()
+        notifier.cancel_countdown_callback = Mock()
+        notice = self.notice("Protección", 3, countdown="a" * 32)
+        notice["countdown"]["valid_for_ms"] = 250
+        with patch.object(wn.time, "monotonic", return_value=100) as clock:
+            notifier.sync_persistent({"notice:1": notice})
+            self.backend.sync_persistent()
+            self.user.EnableWindow.reset_mock()
+            clock.return_value = 100.26
+            self.backend._window_proc(self.backend.popup_hwnd, wn.WM_TIMER, 3, 0)
+            self.assertEqual(fixtures.latest_control_text(self.user, self.backend.popup_countdown), "—:—")
+            self.user.EnableWindow.assert_called_once_with(self.backend.popup_cancel, False)
+            clock.return_value = 100.4
+            self.backend._window_proc(self.backend.popup_hwnd, wn.WM_TIMER, 3, 0)
+            self.user.EnableWindow.assert_called_once_with(self.backend.popup_cancel, False)
+            self.backend._window_proc(self.backend.popup_hwnd, wn.WM_COMMAND, 103, 0)
+            notifier.cancel_countdown_callback.assert_not_called()
+
     def test_zero_never_claims_windows_action_completed(self):
         notifier = self.configure_popup()
         notice = self.notice("Protección", 3, countdown="a" * 32)

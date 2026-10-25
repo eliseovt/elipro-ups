@@ -1,0 +1,154 @@
+[
+  {
+    "theme": "light",
+    "seconds_observed": 6,
+    "frame_count": 120,
+    "size": [
+      480,
+      416
+    ],
+    "clock_transitions": [
+      {
+        "elapsed": 0.0,
+        "clock": "00:19"
+      },
+      {
+        "elapsed": 0.766,
+        "clock": "00:18"
+      },
+      {
+        "elapsed": 1.86,
+        "clock": "00:17"
+      },
+      {
+        "elapsed": 2.719,
+        "clock": "00:16"
+      },
+      {
+        "elapsed": 3.797,
+        "clock": "00:15"
+      },
+      {
+        "elapsed": 4.797,
+        "clock": "00:14"
+      },
+      {
+        "elapsed": 5.75,
+        "clock": "00:13"
+      }
+    ],
+    "complete_second_intervals": [
+      1.094,
+      0.859,
+      1.078,
+      1.0,
+      0.953
+    ],
+    "calls_after_setup": {
+      "parent_set_window_pos": 0,
+      "enable_window": 0,
+      "cancel_text": 0,
+      "clock_text": 6,
+      "other_text": 0
+    },
+    "outside_dynamic_changed_frames": 0,
+    "max_changed_pixels_outside_clock_and_progress": 0,
+    "outside_change_bbox": null,
+    "last_error": null,
+    "excluded_rectangles": [
+      [
+        240,
+        187,
+        446,
+        238
+      ],
+      [
+        36,
+        248,
+        446,
+        253
+      ]
+    ],
+    "gif_validation": {
+      "frames": 28,
+      "minimum_visible_digit_ink_pixels": 571,
+      "blank_clock_frames": 0
+    }
+  },
+  {
+    "theme": "dark",
+    "seconds_observed": 6,
+    "frame_count": 120,
+    "size": [
+      480,
+      416
+    ],
+    "clock_transitions": [
+      {
+        "elapsed": 0.0,
+        "clock": "00:19"
+      },
+      {
+        "elapsed": 0.813,
+        "clock": "00:18"
+      },
+      {
+        "elapsed": 1.797,
+        "clock": "00:17"
+      },
+      {
+        "elapsed": 2.735,
+        "clock": "00:16"
+      },
+      {
+        "elapsed": 3.735,
+        "clock": "00:15"
+      },
+      {
+        "elapsed": 4.735,
+        "clock": "00:14"
+      },
+      {
+        "elapsed": 5.797,
+        "clock": "00:13"
+      }
+    ],
+    "complete_second_intervals": [
+      0.984,
+      0.938,
+      1.0,
+      1.0,
+      1.062
+    ],
+    "calls_after_setup": {
+      "parent_set_window_pos": 0,
+      "enable_window": 0,
+      "cancel_text": 0,
+      "clock_text": 6,
+      "other_text": 0
+    },
+    "outside_dynamic_changed_frames": 0,
+    "max_changed_pixels_outside_clock_and_progress": 0,
+    "outside_change_bbox": null,
+    "last_error": null,
+    "excluded_rectangles": [
+      [
+        240,
+        187,
+        446,
+        238
+      ],
+      [
+        36,
+        248,
+        446,
+        253
+      ]
+    ],
+    "gif_validation": {
+      "frames": 28,
+      "minimum_visible_digit_ink_pixels": 617,
+      "blank_clock_frames": 0
+    }
+  }
+]

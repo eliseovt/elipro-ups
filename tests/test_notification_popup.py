@@ -168,6 +168,257 @@ class PopupPresentationTests(unittest.TestCase):
             remaining_seconds=10))
         self.assertEqual(self.view._countdown_total, 10)
 
+    def capture_invalidations(self):
+        invalidations = []
+
+        def record(hwnd, rectangle, erase):
+            copied = None
+            if rectangle is not None:
+                value = ctypes.cast(rectangle, ctypes.POINTER(popup.RECT)).contents
+                copied = (value.left, value.top, value.right, value.bottom)
+            invalidations.append((hwnd, copied, bool(erase)))
+            return True
+
+        self.user.InvalidateRect.reset_mock()
+        self.user.InvalidateRect.side_effect = record
+        return invalidations
+
+    def prepare_countdown(self):
+        self.view.set_content("Protección", "Guarda tu trabajo.", countdown=self.countdown())
+        self.view.layout(True)
+        self.user.SetWindowTextW.reset_mock()
+        self.user.ShowWindow.reset_mock()
+        self.user.SetWindowPos.reset_mock()
+        return self.capture_invalidations()
+
+    def test_countdown_tick_repaints_only_digits_and_progress_without_background_erase(self):
+        invalidations = self.prepare_countdown()
+        self.assertTrue(self.view.set_content("Protección", "Guarda tu trabajo.",
+            countdown=self.countdown(remaining_seconds=29, valid_for_ms=2000)))
+        self.user.SetWindowTextW.assert_called_once_with(self.view.controls["countdown"], "00:29")
+        self.user.ShowWindow.assert_not_called()
+        self.user.SetWindowPos.assert_not_called()
+        self.assertTrue(invalidations, "A visible countdown tick must request repainting")
+        for hwnd, rectangle, erase in invalidations:
+            self.assertFalse(erase, "Repeated countdown frames must not erase an intermediate background")
+            self.assertIn(hwnd, (self.backend.popup_hwnd, self.view.controls["countdown"]))
+            if hwnd == self.backend.popup_hwnd:
+                self.assertIsNotNone(rectangle, "A tick must never invalidate the complete parent window")
+                x, y, width, height = self.view.bounds["progress"]
+                expected = (self.backend._scale(x), self.backend._scale(y),
+                            self.backend._scale(x + width), self.backend._scale(y + height))
+                self.assertEqual(rectangle, expected)
+
+    def test_fractional_countdown_progress_does_not_redraw_unchanged_digit(self):
+        invalidations = self.prepare_countdown()
+        self.assertTrue(self.view.set_content("Protección", "Guarda tu trabajo.",
+            countdown=self.countdown(remaining_seconds=29.5, valid_for_ms=2500)))
+        self.assertEqual(self.view.texts["countdown"], "00:30")
+        self.user.SetWindowTextW.assert_not_called()
+        self.assertTrue(invalidations)
+        self.assertTrue(all(hwnd == self.backend.popup_hwnd and rectangle is not None and not erase
+                            for hwnd, rectangle, erase in invalidations))
+
+    def test_metadata_and_subpixel_changes_do_not_request_another_frame(self):
+        self.prepare_countdown()
+        self.view.set_content("Protección", "Guarda tu trabajo.",
+            countdown=self.countdown(remaining_seconds=19.5, valid_for_ms=2000))
+        invalidations = self.capture_invalidations()
+        self.user.SetWindowTextW.reset_mock()
+        self.assertFalse(self.view.set_content("Protección", "Guarda tu trabajo.",
+            countdown=self.countdown(remaining_seconds=19.4999, valid_for_ms=1999)))
+        self.assertFalse(invalidations)
+        self.user.SetWindowTextW.assert_not_called()
+        self.assertAlmostEqual(self.view.countdown["remaining_seconds"], 19.4999,
+                               msg="Latest source metadata is retained even when it does not affect a pixel")
+
+    def test_expiry_still_updates_uncertainty_and_requests_a_complete_presentation(self):
+        invalidations = self.prepare_countdown()
+        self.assertTrue(self.view.set_content("Protección", "No se confirma el estado.",
+            countdown=self.countdown(remaining_seconds=29, valid_for_ms=0)))
+        self.assertEqual(self.view.texts["title"], "Estado sin confirmar")
+        self.assertEqual(self.view.texts["countdown"], "—:—")
+        self.assertEqual(self.view.texts["badge"], "SIN CONFIRMAR")
+        self.assertTrue(any(hwnd == self.backend.popup_hwnd and rectangle is None
+                            for hwnd, rectangle, _erase in invalidations))
+
+    def test_clock_is_owner_drawn_while_retaining_native_accessible_text(self):
+        creation = next(call.args for call in self.user.CreateWindowExW.call_args_list
+                        if call.args[2] == "00:00")
+        self.assertEqual(creation[1], "STATIC")
+        self.assertEqual(creation[3] & 0x1F, 0x0D, "SS_OWNERDRAW avoids separate text erase/paint passes")
+        self.view.set_content("Protección", "Guarda tu trabajo.", countdown=self.countdown(remaining_seconds=19))
+        self.user.SetWindowTextW.assert_any_call(self.view.controls["countdown"], "00:19")
+
+    def test_clock_text_update_disables_intermediate_redraw_then_invalidates_without_erase(self):
+        self.prepare_countdown()
+        clock = self.view.controls["countdown"]
+        self.user.reset_mock()
+        self.view.set_content("Protección", "Guarda tu trabajo.",
+            countdown=self.countdown(remaining_seconds=29))
+        operations = [item for item in self.user.mock_calls if item[0] in ("SendMessageW", "SetWindowTextW")]
+        self.assertEqual([(item[0], item.args) for item in operations], [
+            ("SendMessageW", (clock, popup.WM_SETREDRAW, 0, 0)),
+            ("SetWindowTextW", (clock, "00:29")),
+            ("SendMessageW", (clock, popup.WM_SETREDRAW, 1, 0)),
+        ])
+        self.user.InvalidateRect.assert_any_call(clock, None, False)
+
+    def test_unchanged_cancel_button_state_is_not_set_or_enabled_again(self):
+        cancel = self.view.controls["cancel"]
+        self.view.set_action("cancel", "Cancelar protección", True)
+        self.user.SetWindowTextW.reset_mock()
+        self.user.EnableWindow.reset_mock()
+        self.view.set_action("cancel", "Cancelar protección", True)
+        self.user.SetWindowTextW.assert_not_called()
+        self.user.EnableWindow.assert_not_called()
+        self.view.set_action("cancel", "Cancelando…", False)
+        self.user.SetWindowTextW.assert_called_once_with(cancel, "Cancelando…")
+        self.user.EnableWindow.assert_called_once_with(cancel, False)
+        self.user.SetWindowTextW.reset_mock()
+        self.user.EnableWindow.reset_mock()
+        self.view.set_action("cancel", "Cancelando…", False)
+        self.user.SetWindowTextW.assert_not_called()
+        self.user.EnableWindow.assert_not_called()
+
+    def test_countdown_frames_reuse_layout_without_measuring_or_moving_static_content(self):
+        self.view.set_content("Protección", "Guarda tu trabajo.", countdown=self.countdown())
+        first_height = self.view.layout(True)
+        with patch.object(self.view, "_measure", wraps=self.view._measure) as measure:
+            self.user.GetDC.reset_mock()
+            self.user.SetWindowPos.reset_mock()
+            self.view.set_content("Protección", "Guarda tu trabajo.",
+                countdown=self.countdown(remaining_seconds=29))
+            self.assertFalse(self.view.layout_dirty)
+            self.assertEqual(self.view.layout(True), first_height)
+            measure.assert_not_called()
+            self.user.GetDC.assert_not_called()
+            self.user.SetWindowPos.assert_not_called()
+            self.view.set_content("Protección", "No se confirmó la cancelación. Comprueba el estado.",
+                countdown=self.countdown(remaining_seconds=29))
+            self.assertTrue(self.view.layout_dirty)
+            self.view.layout(True)
+            self.assertTrue(measure.called, "Changed feedback must still reflow when needed")
+
+    def prepare_paint_buffer(self):
+        self.user.BeginPaint.return_value = 77
+
+        def client_rectangle(_hwnd, output):
+            rectangle = ctypes.cast(output, ctypes.POINTER(popup.RECT)).contents
+            rectangle.left, rectangle.top, rectangle.right, rectangle.bottom = 0, 0, 480, 400
+            return True
+
+        self.user.GetClientRect.side_effect = client_rectangle
+        self.gdi.CreateCompatibleDC.return_value = 88
+        self.gdi.CreateCompatibleBitmap.return_value = 99
+        self.gdi.SelectObject.return_value = 66
+        self.gdi.BitBlt.return_value = True
+        self.gdi.DeleteObject.reset_mock()
+        self.gdi.DeleteDC.reset_mock()
+
+    def test_background_erase_is_acknowledged_without_drawing_an_intermediate_frame(self):
+        with patch.object(self.view, "_paint") as paint:
+            self.assertEqual(self.view.handle_message(popup.WM_ERASEBKGND, 77, 0), 1)
+        paint.assert_not_called()
+        self.user.FillRect.assert_not_called()
+
+    def test_window_paint_presents_one_complete_buffer_and_releases_temporary_gdi_resources(self):
+        self.prepare_paint_buffer()
+        with patch.object(self.view, "_paint") as paint:
+            self.assertEqual(self.view.handle_message(popup.WM_PAINT, 0, 0), 0)
+        paint.assert_called_once_with(88)
+        self.gdi.CreateCompatibleDC.assert_called_once_with(77)
+        self.gdi.CreateCompatibleBitmap.assert_called_once_with(77, 480, 400)
+        self.gdi.BitBlt.assert_called_once_with(77, 0, 0, 480, 400, 88, 0, 0, 0x00CC0020)
+        self.gdi.SelectObject.assert_any_call(88, 66)
+        self.gdi.DeleteObject.assert_called_once_with(99)
+        self.gdi.DeleteDC.assert_called_once_with(88)
+        self.user.EndPaint.assert_called_once_with(self.backend.popup_hwnd, ANY)
+
+    def test_buffered_paint_failure_still_releases_bitmap_dc_and_ends_paint(self):
+        self.prepare_paint_buffer()
+        with patch.object(self.view, "_paint", side_effect=OSError("falló el dibujo")):
+            with self.assertRaisesRegex(OSError, "falló el dibujo"):
+                self.view.handle_message(popup.WM_PAINT, 0, 0)
+        self.gdi.BitBlt.assert_not_called()
+        self.gdi.SelectObject.assert_any_call(88, 66)
+        self.gdi.DeleteObject.assert_called_once_with(99)
+        self.gdi.DeleteDC.assert_called_once_with(88)
+        self.user.EndPaint.assert_called_once_with(self.backend.popup_hwnd, ANY)
+
+    def test_clock_presents_text_and_background_in_one_right_aligned_buffer(self):
+        self.prepare_paint_buffer()
+        self.view.set_content("Protección", "Guarda tu trabajo.", countdown=self.countdown(remaining_seconds=19))
+        item = popup.DRAWITEMSTRUCT()
+        item.CtlType, item.CtlID = 5, 104  # ODT_STATIC and the native clock identifier.
+        item.hwndItem, item.hDC = self.view.controls["countdown"], 77
+        item.rcItem = popup.RECT(0, 0, 204, 49)
+        self.user.DrawTextW.reset_mock()
+        self.assertEqual(self.view.handle_message(popup.WM_DRAWITEM, 104, ctypes.addressof(item)), 1)
+        self.gdi.CreateCompatibleBitmap.assert_called_once_with(77, 204, 49)
+        self.user.DrawTextW.assert_called_once_with(88, "00:19", -1, ANY,
+            popup.DT_RIGHT | popup.DT_VCENTER | popup.DT_SINGLELINE | popup.DT_NOPREFIX)
+        self.gdi.SelectObject.assert_any_call(88, self.view.fonts["timer"])
+        self.gdi.BitBlt.assert_called_once_with(77, 0, 0, 204, 49, 88, 0, 0, 0x00CC0020)
+        self.gdi.DeleteObject.assert_called_once_with(99)
+        self.gdi.DeleteDC.assert_called_once_with(88)
+        unknown = popup.DRAWITEMSTRUCT()
+        unknown.CtlType, unknown.CtlID = 5, 104
+        unknown.hwndItem, unknown.hDC = 999, 77
+        self.assertIsNone(self.view.handle_message(popup.WM_DRAWITEM, 104, ctypes.addressof(unknown)))
+
+    def test_failed_memory_dc_uses_direct_paint_without_leaking_resources(self):
+        self.prepare_paint_buffer()
+        self.gdi.CreateCompatibleDC.return_value = 0
+        with patch.object(self.view, "_paint") as paint:
+            self.assertEqual(self.view.handle_message(popup.WM_PAINT, 0, 0), 0)
+        paint.assert_called_once_with(77)
+        self.gdi.CreateCompatibleBitmap.assert_not_called()
+        self.gdi.BitBlt.assert_not_called()
+        self.gdi.DeleteObject.assert_not_called()
+        self.gdi.DeleteDC.assert_not_called()
+        self.user.EndPaint.assert_called_once_with(self.backend.popup_hwnd, ANY)
+
+    def test_failed_buffer_bitmap_uses_direct_paint_and_releases_memory_dc(self):
+        self.prepare_paint_buffer()
+        self.gdi.CreateCompatibleBitmap.return_value = 0
+        with patch.object(self.view, "_paint") as paint:
+            self.assertEqual(self.view.handle_message(popup.WM_PAINT, 0, 0), 0)
+        paint.assert_called_once_with(77)
+        self.gdi.SelectObject.assert_not_called()
+        self.gdi.BitBlt.assert_not_called()
+        self.gdi.DeleteObject.assert_not_called()
+        self.gdi.DeleteDC.assert_called_once_with(88)
+        self.user.EndPaint.assert_called_once_with(self.backend.popup_hwnd, ANY)
+
+    def test_failed_bitmap_selection_never_restores_an_invalid_gdi_object(self):
+        for failure in (0, -1, ctypes.c_void_p(-1).value):
+            with self.subTest(failure=failure):
+                self.prepare_paint_buffer()
+                self.user.EndPaint.reset_mock()
+                self.gdi.BitBlt.reset_mock()
+                self.gdi.SelectObject.reset_mock()
+                self.gdi.SelectObject.return_value = failure
+                with patch.object(self.view, "_paint") as paint:
+                    self.assertEqual(self.view.handle_message(popup.WM_PAINT, 0, 0), 0)
+                paint.assert_called_once_with(77)
+                self.gdi.SelectObject.assert_called_once_with(88, 99)
+                self.gdi.BitBlt.assert_not_called()
+                self.gdi.DeleteObject.assert_called_once_with(99)
+                self.gdi.DeleteDC.assert_called_once_with(88)
+                self.user.EndPaint.assert_called_once_with(self.backend.popup_hwnd, ANY)
+
+    def test_failed_buffer_copy_falls_back_to_current_frame_and_releases_resources(self):
+        self.prepare_paint_buffer()
+        self.gdi.BitBlt.return_value = False
+        with patch.object(self.view, "_paint") as paint:
+            self.assertEqual(self.view.handle_message(popup.WM_PAINT, 0, 0), 0)
+        self.assertEqual([item.args[0] for item in paint.call_args_list], [88, 77])
+        self.gdi.SelectObject.assert_any_call(88, 66)
+        self.gdi.DeleteObject.assert_called_once_with(99)
+        self.gdi.DeleteDC.assert_called_once_with(88)
+        self.user.EndPaint.assert_called_once_with(self.backend.popup_hwnd, ANY)
+
     def test_expired_countdown_shows_uncertainty_instead_of_claiming_completion(self):
         self.view.set_content("Protección", "No se confirma el estado.", countdown=self.countdown(valid_for_ms=0))
         self.assertEqual(self.view.texts["title"], "Estado sin confirmar")

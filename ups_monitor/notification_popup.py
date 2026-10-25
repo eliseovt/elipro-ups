@@ -21,7 +21,9 @@ PTR = ctypes.c_void_p
 WM_PAINT, WM_ERASEBKGND = 0x000F, 0x0014
 WM_DRAWITEM, WM_CTLCOLORSTATIC = 0x002B, 0x0138
 WM_SETFONT, STM_SETICON = 0x0030, 0x0170
+WM_SETREDRAW = 0x000B
 DT_CENTER, DT_VCENTER, DT_SINGLELINE = 0x0001, 0x0004, 0x0020
+DT_RIGHT = 0x0002
 DT_WORDBREAK, DT_CALCRECT, DT_NOPREFIX = 0x0010, 0x0400, 0x0800
 DT_END_ELLIPSIS = 0x8000
 ODS_SELECTED, ODS_DISABLED, ODS_FOCUS, ODS_NOFOCUSRECT = 1, 4, 16, 512
@@ -117,6 +119,11 @@ def bind_popup_apis(user, gdi):
         (gdi, "SetBkMode", [PTR, ctypes.c_int], ctypes.c_int),
         (gdi, "SetBkColor", [PTR, DWORD], DWORD), (gdi, "SetTextColor", [PTR, DWORD], DWORD),
         (gdi, "RoundRect", [PTR] + [ctypes.c_int] * 6, BOOL),
+        (gdi, "CreateCompatibleDC", [PTR], PTR),
+        (gdi, "CreateCompatibleBitmap", [PTR, ctypes.c_int, ctypes.c_int], PTR),
+        (gdi, "DeleteDC", [PTR], BOOL),
+        (gdi, "BitBlt", [PTR, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                         PTR, ctypes.c_int, ctypes.c_int, DWORD], BOOL),
     ):
         function = getattr(dll, name)
         function.argtypes, function.restype = args, result
@@ -135,6 +142,9 @@ class PopupView:
         self.controls, self.fonts, self.brushes, self.pens = {}, {}, {}, {}
         self.bounds, self.texts = {}, {}
         self._visibility = {}
+        self._enabled = {}
+        self.layout_dirty = True
+        self._layout_key = None
         self.width, self.height = 480, 400
         self.title, self.message, self.footer = "", "", ""
         self.countdown, self._countdown_total = None, None
@@ -156,7 +166,7 @@ class PopupView:
             ("title", "STATIC", "Elipro UPS", 0x0080, None),
             ("body", "STATIC", "", 0x0080, None),
             ("countdown_label", "STATIC", "Tiempo restante", 0x0080, None),
-            ("countdown", "STATIC", "00:00", 0x0080 | 0x0002, None),
+            ("countdown", "STATIC", "00:00", 0x0080 | 0x000D, 104),
             ("footer", "STATIC", "", 0x0080, None),
             ("open", "BUTTON", "Abrir Elipro", 0x000B | 0x10000, 101),
             ("ack", "BUTTON", "Entendido", 0x000B | 0x10000, 102),
@@ -214,6 +224,7 @@ class PopupView:
                     "open": "button", "ack": "button", "cancel": "button"}.get(key, "small")
             self.user.SendMessageW(handle, WM_SETFONT, fresh[role], 1)
         self._font_dpi = self.backend.popup_dpi
+        self.layout_dirty = True
         for font in set(old.values()):
             self.gdi.DeleteObject(font)
 
@@ -279,19 +290,48 @@ class PopupView:
 
     def _invalidate(self):
         if self.backend.popup_hwnd and self.gdi is not None:
-            self.user.InvalidateRect(self.backend.popup_hwnd, None, True)
+            self.user.InvalidateRect(self.backend.popup_hwnd, None, False)
             for handle in self.controls.values():
-                self.user.InvalidateRect(handle, None, True)
+                self.user.InvalidateRect(handle, None, False)
 
     def _set_text(self, key, value):
         value = str(value)
         if self.texts.get(key) != value:
             self.texts[key] = value
             if self.controls.get(key):
-                self.user.SetWindowTextW(self.controls[key], value)
+                handle = self.controls[key]
+                buffered_clock = key == "countdown" and self._visibility.get(key, True)
+                if buffered_clock:
+                    self.user.SendMessageW(handle, WM_SETREDRAW, 0, 0)
+                try:
+                    self.user.SetWindowTextW(handle, value)
+                finally:
+                    if buffered_clock:
+                        self.user.SendMessageW(handle, WM_SETREDRAW, 1, 0)
+                        self.user.InvalidateRect(handle, None, False)
+            return True
+        return False
+
+    def set_action(self, key, label, enabled):
+        self._set_text(key, label)
+        if self._enabled.get(key) != bool(enabled):
+            self._enabled[key] = bool(enabled)
+            self.user.EnableWindow(self.controls[key], bool(enabled))
+
+    def _progress_pixels(self):
+        if self.countdown is None or not self.bounds.get("progress") or not self._countdown_total:
+            return 0
+        if self.countdown.get("valid_for_ms", 0) <= 0:
+            return 0
+        remaining = max(0, self.countdown.get("remaining_seconds", 0))
+        width = self._rect(self.bounds["progress"])
+        return max(0, min(width.right - width.left,
+                         round((width.right - width.left) * remaining / self._countdown_total)))
 
     def set_content(self, title, message, severity="warning", countdown=None, footer=""):
-        previous = (self.title, self.message, self.severity, self.countdown, self.footer)
+        previous = (self.title, self.message, self.severity, self.countdown is not None, self.footer)
+        previous_pixels = self._progress_pixels()
+        clock_changed = False
         self.severity = severity if severity in ("warning", "critical", "error", "info") else "warning"
         self.countdown = dict(countdown) if isinstance(countdown, dict) else None
         active = self.countdown is not None
@@ -300,7 +340,7 @@ class PopupView:
             title = ("Hibernación programada" if self.countdown.get("action") == "hibernate" else "Apagado programado") if valid else "Estado sin confirmar"
             badge = "URGENTE" if valid else "SIN CONFIRMAR"
             clock = format_countdown(self.countdown.get("remaining_seconds")) if valid else "—:—"
-            self._set_text("countdown", clock)
+            clock_changed = self._set_text("countdown", clock)
             identifier = self.countdown.get("countdown_id")
             if valid and (getattr(self, "_countdown_id", None) != identifier or self._countdown_total is None):
                 self._countdown_total = max(1, self.countdown.get("remaining_seconds", 1))
@@ -312,16 +352,22 @@ class PopupView:
         default_footer = ("Entendido reconoce el aviso; la protección continúa." if valid
                           else "Entendido no cancela la protección.") if active else "Entendido confirma la lectura de este aviso."
         self.footer = str(footer or default_footer)
-        for key, value in (("title", self.title), ("body", self.message), ("badge", badge), ("footer", self.footer)):
-            self._set_text(key, value)
+        structural = previous != (self.title, self.message, self.severity, active, self.footer)
+        if structural:
+            self.layout_dirty = True
+            for key, value in (("title", self.title), ("body", self.message), ("badge", badge), ("footer", self.footer)):
+                self._set_text(key, value)
         for key in ("countdown_label", "countdown", "cancel"):
             if self.controls.get(key) and self._visibility.get(key) != active:
                 self.user.ShowWindow(self.controls[key], 5 if active else 0)
                 self._visibility[key] = active
-        changed = previous != (self.title, self.message, self.severity, self.countdown, self.footer)
-        if changed:
+        progress_changed = previous_pixels != self._progress_pixels()
+        if structural:
             self._invalidate()
-        return changed
+        elif progress_changed and self.gdi is not None and self.bounds.get("progress"):
+            rectangle = self._rect(self.bounds["progress"])
+            self.user.InvalidateRect(self.backend.popup_hwnd, ctypes.byref(rectangle), False)
+        return structural or clock_changed or progress_changed
 
     def _measure(self, text, width, role, line_height):
         """DrawText uses the same selected font as its STATIC control."""
@@ -346,6 +392,9 @@ class PopupView:
     def layout(self, countdown, width=480, max_height=None):
         self.width = max(240, int(width))
         self.set_fonts()
+        signature = (self.title, self.message, self.footer, countdown, self.width, max_height, self.backend.popup_dpi)
+        if not self.layout_dirty and signature == self._layout_key:
+            return self.height
         padding = 22 if self.width >= 400 else 16
         content_width = self.width - padding * 2
         title_height = self._measure(self.title or "Elipro UPS", content_width, "title", 27)
@@ -451,6 +500,8 @@ class PopupView:
             self._invalidate()
         self._layout_dpi = self.backend.popup_dpi
         self.height = height
+        self._layout_key = signature
+        self.layout_dirty = False
         return height
 
     def _brush(self, key):
@@ -487,6 +538,37 @@ class PopupView:
             return "critical", "critical_background"
         return "teal", "teal_background"
 
+    def _buffered(self, dc, rectangle, draw):
+        """Present a complete frame once; never expose its background erase."""
+        width, height = rectangle.right - rectangle.left, rectangle.bottom - rectangle.top
+        if width <= 0 or height <= 0:
+            return
+        memory = self.gdi.CreateCompatibleDC(dc)
+        if not _handle(memory):
+            draw(dc)
+            return
+        bitmap, previous = None, None
+        try:
+            bitmap = self.gdi.CreateCompatibleBitmap(dc, width, height)
+            if not _handle(bitmap):
+                draw(dc)
+                return
+            previous = self.gdi.SelectObject(memory, bitmap)
+            if not _handle(previous) or previous in (-1, ctypes.c_void_p(-1).value):
+                previous = None
+                draw(dc)
+                return
+            draw(memory)
+            if not self.gdi.BitBlt(dc, rectangle.left, rectangle.top, width, height,
+                                   memory, 0, 0, 0x00CC0020):  # SRCCOPY
+                draw(dc)
+        finally:
+            if _handle(previous):
+                self.gdi.SelectObject(memory, previous)
+            if _handle(bitmap):
+                self.gdi.DeleteObject(bitmap)
+            self.gdi.DeleteDC(memory)
+
     def _paint(self, dc):
         saved = self.gdi.SaveDC(dc)
         try:
@@ -502,13 +584,11 @@ class PopupView:
                 self._rounded(dc, self._rect((x - 5, y - 4, width + 10, height + 8)), background, background, 6)
             if self.countdown is not None and self.bounds.get("countdown_box"):
                 self._rounded(dc, self._rect(self.bounds["countdown_box"]), "warning_background", "warning_background", 8)
-                self._fill(dc, self._rect(self.bounds["progress"]), "track")
-                remaining = max(0, self.countdown.get("remaining_seconds", 0))
-                valid = self.countdown.get("valid_for_ms", 0) > 0
-                ratio = min(1, remaining / self._countdown_total) if valid and self._countdown_total else 0
-                if ratio:
-                    x, y, width, height = self.bounds["progress"]
-                    self._fill(dc, self._rect((x, y, max(1, width * ratio), height)), "primary")
+                track = self._rect(self.bounds["progress"])
+                self._fill(dc, track, "track")
+                pixels = self._progress_pixels()
+                if pixels:
+                    self._fill(dc, RECT(track.left, track.top, track.left + pixels, track.bottom), "primary")
         finally:
             if type(saved) is int and saved:
                 self.gdi.RestoreDC(dc, saved)
@@ -548,18 +628,41 @@ class PopupView:
                 self.gdi.RestoreDC(dc, saved)
         return 1
 
+    def _clock(self, item):
+        if item.CtlType != 5 or item.hwndItem != self.controls.get("countdown"):  # ODT_STATIC
+            return None
+        rectangle = RECT(0, 0, item.rcItem.right - item.rcItem.left, item.rcItem.bottom - item.rcItem.top)
+
+        def draw(dc):
+            saved = self.gdi.SaveDC(dc)
+            try:
+                self._fill(dc, rectangle, "warning_background")
+                self.gdi.SetBkMode(dc, 1)
+                self.gdi.SetTextColor(dc, self.palette["warning"])
+                if self.fonts.get("timer"):
+                    self.gdi.SelectObject(dc, self.fonts["timer"])
+                self.user.DrawTextW(dc, self.texts.get("countdown", "—:—"), -1,
+                    ctypes.byref(rectangle), DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX)
+            finally:
+                if type(saved) is int and saved:
+                    self.gdi.RestoreDC(dc, saved)
+
+        self._buffered(item.hDC, item.rcItem, draw)
+        return 1
+
     def handle_message(self, message, wparam, lparam):
         if self.gdi is None or not _handle(self._brush("background")):
             return None
         if message == WM_ERASEBKGND:
-            self._paint(wparam)
             return 1
         if message == WM_PAINT:
             paint = PAINTSTRUCT()
             dc = self.user.BeginPaint(self.backend.popup_hwnd, ctypes.byref(paint))
             try:
                 if dc:
-                    self._paint(dc)
+                    rectangle = RECT()
+                    self.user.GetClientRect(self.backend.popup_hwnd, ctypes.byref(rectangle))
+                    self._buffered(dc, rectangle, self._paint)
             finally:
                 self.user.EndPaint(self.backend.popup_hwnd, ctypes.byref(paint))
             return 0
@@ -577,7 +680,9 @@ class PopupView:
             self.gdi.SetBkMode(wparam, 1)
             return self._brush(background)
         if message == WM_DRAWITEM and lparam:
-            return self._button(ctypes.cast(lparam, ctypes.POINTER(DRAWITEMSTRUCT)).contents)
+            item = ctypes.cast(lparam, ctypes.POINTER(DRAWITEMSTRUCT)).contents
+            clock = self._clock(item)
+            return clock if clock is not None else self._button(item)
         return None
 
     def close(self):

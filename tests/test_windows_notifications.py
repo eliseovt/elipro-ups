@@ -678,6 +678,51 @@ class NativeShellTests(unittest.TestCase):
             self.assertTrue(args[3] & 0x00010000, "Native buttons must remain keyboard-reachable")
             self.assertEqual(args[3] & 0xF, 0xB, "Branded actions use BS_OWNERDRAW")
 
+    def test_empty_wakeup_synchronizes_native_notice_only_once(self):
+        notifier = self.configure_popup()
+        with patch.object(self.backend, "sync_persistent") as synchronize:
+            notifier._drain(self.backend)
+            synchronize.assert_called_once_with()
+
+    def test_wakeup_with_delivery_preserves_final_synchronization(self):
+        notifier = self.configure_popup()
+        notifier._queue.put(("Prueba", "Texto", "info", False))
+        with patch.object(self.backend, "sync_persistent") as synchronize, \
+                patch.object(self.backend, "deliver", return_value=True) as deliver:
+            notifier._drain(self.backend)
+            self.assertEqual(synchronize.call_count, 2)
+            deliver.assert_called_once_with("Prueba", "Texto", "info", False)
+
+    def test_same_visible_popup_is_not_repositioned_but_hidden_popup_can_show_again(self):
+        self.configure_popup()
+        self.backend._show_popup("Prueba", "Aviso estable")
+        popup = self.backend.popup_hwnd
+        self.user.SetWindowPos.reset_mock()
+        self.backend._position_popup()
+        self.backend._position_popup(show=True)
+        self.user.SetWindowPos.assert_not_called()
+        self.backend._hide_popup()
+        self.backend._show_popup("Prueba", "Aviso estable")
+        shown = [call for call in self.user.SetWindowPos.call_args_list
+                 if call.args[0] == popup and call.args[-1] & 0x0040]
+        self.assertEqual(len(shown), 1)
+        self.assertTrue(self.backend._popup_visible)
+
+    def test_workarea_change_reflows_and_moves_popup_once(self):
+        self.configure_popup()
+        self.backend._show_popup("Prueba", "Aviso estable")
+        self.user.SetWindowPos.reset_mock()
+        work = wn.RECT(0, 0, 1280, 900)
+        self.assertTrue(self.backend._layout_popup(96, work))
+        self.assertTrue(self.backend._position_popup(work))
+        self.assertFalse(self.backend._layout_popup(96, work))
+        self.assertFalse(self.backend._position_popup(work))
+        positions = [call for call in self.user.SetWindowPos.call_args_list if call.args[0] == self.backend.popup_hwnd]
+        self.assertEqual(len(positions), 1)
+        left, top, width, height = positions[0].args[2:6]
+        self.assertLessEqual(left + width, work.right)
+        self.assertLessEqual(top + height, work.bottom)
+
     def test_static_text_uses_its_surface_background_in_both_themes(self):
         self.configure_popup()
         self.backend.gdi = Mock()

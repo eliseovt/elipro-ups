@@ -63,3 +63,15 @@ Resultados locales del 25 de octubre de 2026:
 ![Selector de tema en el panel con datos simulados](assets/screenshots/elipro-avisos-tema.png)
 
 Tras el push a `main`, el flujo **Windows x64 installer** ejecuta de nuevo las suites, empaqueta el ejecutable y valida el instalador con un servicio simulado y acciones de energía bloqueadas. Su resultado y el artefacto de esa revisión se consultan en GitHub Actions. La instalación en el equipo del usuario queda a su cargo; esta entrega no ejecuta el instalador ni modifica el servicio instalado. Los resultados físicos anteriores conservan su alcance y no acreditan nuevas pruebas de energía.
+
+## Corrección del parpadeo en 0.9.23
+
+El contador invalidaba la ventana completa y sus controles con borrado de fondo cada vez que cambiaban los tiempos de vigencia, incluso sin cambiar el número visible. Además, cada actualización de estado podía sincronizar dos veces, volver a escribir el botón de cancelación, medir el contenido y reposicionar la ventana. El temporizador visual de un segundo no seguía con suficiente precisión los cambios de dígito.
+
+La corrección limita los repintados al contador y los píxeles de progreso que cambian. Tanto el fondo como el reloj se dibujan primero en memoria y se presentan completos; se omite el borrado intermedio. El reloj mantiene su texto nativo accesible. La distribución, posición, botones y temporizadores se reutilizan mientras su estado permanece igual. El refresco visual de 100 ms usa el mismo plazo monotónico, sin prolongarlo ni habilitar cancelaciones con datos caducados. El sondeo del servicio conserva su intervalo.
+
+- **1038 pruebas Python aprobadas**, incluyendo repintado parcial, doble búfer y limpieza ante errores gráficos, cachés, ausencia de sincronizaciones duplicadas, caducidad y cancelación segura.
+- **Prueba nativa en Claro y Oscuro:** seis segundos y 120 capturas a 20 fps por tema; cuenta de `00:19` a `00:13` sin omitir ni repetir valores. Cero píxeles cambiaron fuera del contador y la barra; no hubo reposicionamientos ni reescrituras o cambios de habilitación del botón durante la cuenta vigente. Ningún cuadro del GIF muestra el contador en blanco.
+- Informe verificable: [notification-countdown-validation.json](notification-countdown-validation.json). Harness y capturas completas locales: `.test-data/notification-smoothness/`. Estos avisos usan datos simulados y no ejecutan el monitor ni acciones sobre el UPS o Windows.
+
+![Captura animada de la ventana nativa con el contador estable](assets/screenshots/elipro-cuenta-fluida.gif)

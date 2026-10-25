@@ -253,6 +253,10 @@ class _Win32Backend:
         self.popup_width = 480
         self.popup_height = 360
         self._popup_theme = None
+        self._popup_layout_signature = None
+        self._popup_position = None
+        self._popup_visible = False
+        self._popup_refresh_interval = None
         self.popup_persistent_key = None
         self.last_notice = None
         self._shown_keys = set()
@@ -501,26 +505,51 @@ class _Win32Backend:
             self._popup_theme = preference
 
     def _layout_popup(self, dpi, work=None):
+        if self.popup_view is None:
+            return False
+        work = work if work is not None else self._popup_workarea()
+        signature = (dpi, work.left, work.top, work.right, work.bottom, self.popup_has_countdown)
+        if signature == self._popup_layout_signature and not self.popup_view.layout_dirty:
+            return False
         self.popup_dpi = dpi
         self._set_popup_font()
-        if self.popup_view is None:
-            return
-        work = work if work is not None else self._popup_workarea()
         available_width = (work.right - work.left) * 96 // dpi
         available_height = (work.bottom - work.top) * 96 // dpi
         self.popup_width = min(480, max(1, available_width - 32))
         self.popup_height = self.popup_view.layout(self.popup_has_countdown,
             width=self.popup_width, max_height=max(1, available_height - 32))
+        self._popup_layout_signature = signature
+        return True
 
     def _position_popup(self, work=None, *, show=False):
         work = work if work is not None else self._popup_workarea()
         width = min(self._scale(self.popup_width), work.right - work.left)
         height = min(self._scale(self.popup_height), work.bottom - work.top)
+        left = max(work.left, work.right - width - self._scale(16))
+        top = max(work.top, work.bottom - height - self._scale(16))
+        position = (left, top, width, height, work.left, work.top, work.right, work.bottom)
+        if position == self._popup_position and (not show or self._popup_visible):
+            return False
         if not self.user.SetWindowPos(self.popup_hwnd, ctypes.c_void_p(-1),
-                max(work.left, work.right - width - self._scale(16)),
-                max(work.top, work.bottom - height - self._scale(16)), width, height,
+                left, top, width, height,
                 0x0010 | (0x0040 if show else 0)):
             raise OSError("Windows no pudo mostrar el aviso de Elipro")
+        self._popup_position = position
+        self._popup_visible = self._popup_visible or show
+        return True
+
+    def _set_popup_refresh_timer(self, interval):
+        if interval == self._popup_refresh_interval:
+            return
+        if interval is None:
+            if self.popup_hwnd:
+                self.user.KillTimer(self.popup_hwnd, 3)
+            self._popup_refresh_interval = None
+            return
+        if not self.user.SetTimer(self.popup_hwnd, 3, interval, None):
+            self._hide_popup()
+            raise OSError("No se pudo programar la actualización del aviso de Elipro")
+        self._popup_refresh_interval = interval
 
     def _create_popup(self):
         # A tool window stays out of the taskbar; NOACTIVATE preserves whichever
@@ -577,8 +606,8 @@ class _Win32Backend:
         self._position_popup(work, show=True)
         self.popup_persistent_key = key if persistent else None
         self.user.KillTimer(self.popup_hwnd, 1)
-        self.user.KillTimer(self.popup_hwnd, 3)
         if not persistent:
+            self._set_popup_refresh_timer(None)
             if not self.user.SetTimer(self.popup_hwnd, 1, 12000, None):
                 self._hide_popup()
                 raise OSError("No se pudo programar el cierre del aviso de Elipro")
@@ -589,11 +618,11 @@ class _Win32Backend:
                 # Restoring an earlier incident does not produce another sound.
                 self.owner._persistent_sound_at[key] = time.monotonic()
             self._shown_keys.add(key)
-            if "priority" in notice:
-                if not self.user.SetTimer(self.popup_hwnd, 3, 1000, None):
-                    self._hide_popup()
-                    raise OSError("No se pudo programar la actualización del aviso de Elipro")
+            if self.popup_has_countdown or "priority" in notice:
+                self._set_popup_refresh_timer(100 if self.popup_has_countdown else 1000)
                 self._persistent_sound(key, notice)
+            else:
+                self._set_popup_refresh_timer(None)
         return True
 
     def _hide_popup(self):
@@ -603,6 +632,10 @@ class _Win32Backend:
             self.user.ShowWindow(self.popup_hwnd, 0)
             self.owner._record_popup_event("hidden")
         self.popup_persistent_key = None
+        self._popup_refresh_interval = None
+        self._popup_position = None
+        self._popup_layout_signature = None
+        self._popup_visible = False
 
     def _update_persistent_contents(self, notice, *, reposition=True):
         title, message = notice["title"], notice["message"]
@@ -623,8 +656,8 @@ class _Win32Backend:
             if feedback:
                 message += " " + feedback
             if self.popup_cancel:
-                self.user.SetWindowTextW(self.popup_cancel, "Cancelando…" if inflight else "Cancelar protección")
-                self.user.EnableWindow(self.popup_cancel, bool(current and countdown["cancelable"]
+                self.popup_view.set_action("cancel", "Cancelando…" if inflight else "Cancelar protección",
+                    bool(current and countdown["cancelable"]
                     and callable(self.owner.cancel_countdown_callback) and not inflight
                     and self.owner._session_currently_available()))
             if not current:
@@ -638,6 +671,8 @@ class _Win32Backend:
             work = self._popup_workarea()
             self._layout_popup(self.popup_dpi, work)
             self._position_popup(work)
+            self._set_popup_refresh_timer((100 if self.popup_has_countdown else 1000)
+                if self.popup_has_countdown or "priority" in notice else None)
 
     def sync_persistent(self):
         self._shown_keys.intersection_update(self.owner._persistent_keys())
@@ -692,6 +727,10 @@ class _Win32Backend:
         self._popup_theme = None
         self.popup_has_countdown = False
         self.popup_persistent_key = None
+        self._popup_refresh_interval = None
+        self._popup_position = None
+        self._popup_layout_signature = None
+        self._popup_visible = False
 
     def suspend_session(self):
         self.user.KillTimer(self.hwnd, 2)
@@ -789,6 +828,8 @@ class _Win32Backend:
                     width, height = suggested.right - suggested.left, suggested.bottom - suggested.top
                     if width <= 0 or height <= 0:
                         return 0
+                    self._popup_layout_signature = None
+                    self._popup_position = None
                     if not self.user.SetWindowPos(hwnd, ctypes.c_void_p(-1), suggested.left,
                                                   suggested.top, width, height, 0x0010 | 0x0004):
                         raise OSError("Windows no pudo aplicar el cambio de DPI del aviso")
@@ -1364,6 +1405,8 @@ class WindowsNotifier:
         threading.Thread(target=request, name="elipro-tray-exit", daemon=True).start()
 
     def _drain(self, backend):
+        synchronized = False
+        processed = False
         apply_theme = getattr(backend, "_apply_popup_theme", None)
         if callable(apply_theme):
             try:
@@ -1375,6 +1418,7 @@ class WindowsNotifier:
         if getattr(backend, "supports_notification_priority", False) is True and self._session_currently_available():
             try:
                 backend.sync_persistent()
+                synchronized = True
             except Exception as exc:
                 self._set_error(str(exc))
         while not self._stop.is_set():
@@ -1389,12 +1433,13 @@ class WindowsNotifier:
                     item = self._queue.get_nowait()
             except queue.Empty:
                 synchronize = getattr(backend, "sync_persistent", None)
-                if callable(synchronize):
+                if callable(synchronize) and (not synchronized or processed):
                     try:
                         synchronize()
                     except Exception as exc:
                         self._set_error(str(exc))
                 return
+            processed = True
             delivery_id = item.get("delivery_id") if isinstance(item, dict) else None
             notification = item["notification"] if isinstance(item, dict) else item
             session_generation = item.get("session_generation") if isinstance(item, dict) else None
