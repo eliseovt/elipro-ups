@@ -54,6 +54,7 @@ Resultados locales del 25 de octubre de 2026:
 - Panel real en Edge headless con respuestas locales simuladas: **1366, 1920 y 320 píxeles**, selector visible y sin desbordamiento horizontal ni errores JavaScript. La captura del panel usa datos simulados y no describe el estado del servicio instalado.
 - Pruebas dirigidas de alto contraste, asignaciones fallidas y liberación de fuentes, pinceles e iconos, ausencia de sonidos o ventanas duplicados, mantenimiento del episodio al cambiar tema y acciones dentro de un área lógica de **240 × 280**. En áreas tan pequeñas, la presentación compacta prioriza título, reloj y acciones; los detalles completos se consultan en el panel.
 - `git diff --check` sin incidencias. Evidencia local ampliada: `.test-data/notification-redesign/`.
+- La primera ejecución en GitHub detectó una comparación de metadatos de vigencia dependiente del reloj real en la prueba de autorización del acuse. Se fijó el reloj de esa fixture para que compare snapshots deterministas; la corrección afecta exclusivamente a la prueba.
 
 ![Notificación clara nativa verificada](assets/screenshots/elipro-notificacion-clara.png)
 

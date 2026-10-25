@@ -35,7 +35,9 @@ class NotificationIntegrationTests(unittest.TestCase):
     def setUp(self):
         self.store = Store(":memory:")
         self.notifier = FakeNotifier()
-        self.alerts = AlertManager(self.store, self.notifier)
+        # Authentication/validation tests compare complete notice snapshots.
+        # Their freshness metadata must not depend on Windows clock tick timing.
+        self.alerts = AlertManager(self.store, self.notifier, clock=lambda: 100.0)
         self.action = Mock()
         self.sample = {"timestamp": iso_utc(), "on_battery": False,
                        "load_percent": 7, "battery_voltage": 27.4,
