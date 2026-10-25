@@ -111,7 +111,7 @@ class NativePriorityTests(unittest.TestCase):
         self.assertNotEqual(receipts["epoch:1"], "accepted")
         self.assertEqual(receipts["epoch:2"], "accepted")
 
-    def test_live_countdown_does_not_extend_and_expired_metadata_disables_cancel(self):
+    def test_live_countdown_does_not_extend_and_bounded_gap_keeps_request_available(self):
         notifier = self.configure_popup()
         notifier.cancel_countdown_callback = Mock()
         notice = self.notice("Protección", 3, countdown="a" * 32)
@@ -137,14 +137,15 @@ class NativePriorityTests(unittest.TestCase):
             self.assertFalse(pending["confirmed"])
             self.assertEqual(pending["countdown"]["valid_for_ms"], 0)
             self.assertFalse(pending["countdown"]["cancelable"])
-            self.user.EnableWindow.assert_called_with(self.backend.popup_cancel, False)
-            self.backend._window_proc(self.backend.popup_hwnd, wn.WM_COMMAND, 103, 0)
-            notifier.cancel_countdown_callback.assert_not_called()
+            self.user.EnableWindow.assert_called_with(self.backend.popup_cancel, True)
             clock.return_value = 108.01
             self.backend._window_proc(self.backend.popup_hwnd, wn.WM_TIMER, 3, 0)
             self.assertEqual(fixtures.latest_control_text(self.user, self.backend.popup_title), "Actualización interrumpida")
             self.assertEqual(fixtures.latest_control_text(self.user, self.backend.popup_countdown), "—:—")
             self.assertEqual(fixtures.latest_control_text(self.user, self.backend.popup_badge), "SIN DATOS RECIENTES")
+            self.user.EnableWindow.assert_called_with(self.backend.popup_cancel, False)
+            self.backend._window_proc(self.backend.popup_hwnd, wn.WM_COMMAND, 103, 0)
+            notifier.cancel_countdown_callback.assert_not_called()
 
     def test_brief_refresh_gap_recovers_same_episode_without_extending_or_reflowing(self):
         notifier = self.configure_popup()
@@ -166,8 +167,7 @@ class NativePriorityTests(unittest.TestCase):
                 self.assertEqual(fixtures.latest_control_text(self.user, self.backend.popup_title), "Hibernación programada")
                 self.assertEqual(fixtures.latest_control_text(self.user, self.backend.popup_countdown), "00:27")
                 self.assertEqual(fixtures.latest_control_text(self.user, self.backend.popup_badge), "ACTUALIZANDO")
-                self.assertFalse(self.backend.popup_view._enabled["cancel"])
-                self.backend._window_proc(popup, wn.WM_COMMAND, 103, 0)
+                self.assertTrue(self.backend.popup_view._enabled["cancel"])
                 notifier.cancel_countdown_callback.assert_not_called()
                 clock.return_value = 103.5
                 # A newly confirmed but rounded payload cannot add time to the episode.
@@ -240,7 +240,7 @@ class NativePriorityTests(unittest.TestCase):
             self.backend.sync_persistent()
             self.user.SetTimer.assert_not_called()
 
-    def test_high_frequency_ticks_preserve_expiry_and_never_enable_stale_cancellation(self):
+    def test_high_frequency_ticks_keep_request_available_only_for_bounded_refresh_gap(self):
         notifier = self.configure_popup()
         notifier.cancel_countdown_callback = Mock()
         notice = self.notice("Protección", 3, countdown="a" * 32)
@@ -253,12 +253,91 @@ class NativePriorityTests(unittest.TestCase):
             self.backend._window_proc(self.backend.popup_hwnd, wn.WM_TIMER, 3, 0)
             self.assertEqual(fixtures.latest_control_text(self.user, self.backend.popup_countdown), "00:30")
             self.assertEqual(fixtures.latest_control_text(self.user, self.backend.popup_badge), "ACTUALIZANDO")
-            self.user.EnableWindow.assert_called_once_with(self.backend.popup_cancel, False)
+            self.user.EnableWindow.assert_not_called()
             clock.return_value = 100.4
+            self.backend._window_proc(self.backend.popup_hwnd, wn.WM_TIMER, 3, 0)
+            self.user.EnableWindow.assert_not_called()
+            clock.return_value = 104.26
             self.backend._window_proc(self.backend.popup_hwnd, wn.WM_TIMER, 3, 0)
             self.user.EnableWindow.assert_called_once_with(self.backend.popup_cancel, False)
             self.backend._window_proc(self.backend.popup_hwnd, wn.WM_COMMAND, 103, 0)
             notifier.cancel_countdown_callback.assert_not_called()
+
+    def test_refresh_gap_request_is_validated_once_and_stays_disabled_while_waiting(self):
+        notifier = self.configure_popup()
+        entered, release, completed = threading.Event(), threading.Event(), threading.Event()
+        self.addCleanup(release.set)
+        calls = []
+
+        def cancel(identifier):
+            calls.append(identifier)
+            entered.set()
+            release.wait(2)
+            return {"cancelled_countdown_id": identifier, "protection": {"state": "cancelled"}}
+
+        def wake():
+            if not notifier._countdown_cancel_inflight:
+                completed.set()
+
+        notifier.cancel_countdown_callback = cancel
+        notice = self.notice("Protección", 3, countdown="a" * 32)
+        with patch.object(wn.time, "monotonic", return_value=100) as clock, \
+                patch.object(notifier, "_backend", SimpleNamespace(wake=wake)):
+            notifier.sync_persistent({"notice:1": notice})
+            self.backend.sync_persistent()
+            clock.return_value = 103.2
+            self.backend.sync_persistent()
+            self.assertEqual(fixtures.latest_control_text(self.user, self.backend.popup_badge), "ACTUALIZANDO")
+            self.assertTrue(self.backend.popup_view._enabled["cancel"])
+            completed.clear()
+            self.backend._window_proc(self.backend.popup_hwnd, wn.WM_COMMAND, 103, 0)
+            self.assertTrue(entered.wait(1))
+            self.assertEqual(fixtures.latest_control_text(self.user, self.backend.popup_cancel), "Cancelando…")
+            self.assertFalse(self.backend.popup_view._enabled["cancel"])
+            self.backend._window_proc(self.backend.popup_hwnd, wn.WM_COMMAND, 103, 0)
+            self.assertEqual(calls, ["a" * 32])
+            self.assertFalse(completed.is_set(), "No success may be shown before the monitor replies")
+            self.assertIsNone(notifier._countdown_feedback("a" * 32)[0])
+            release.set()
+            self.assertTrue(completed.wait(1))
+            self.assertIn("confirmó la cancelación", notifier._countdown_feedback("a" * 32)[0])
+            self.backend.sync_persistent()
+            self.assertIsNone(self.backend.popup_persistent_key)
+            self.assertFalse(notifier._persistent_acknowledged("notice:1"))
+
+    def test_failed_refresh_gap_request_can_retry_without_claiming_cancellation(self):
+        notifier = self.configure_popup()
+        completed = threading.Event()
+        def wake():
+            if not notifier._countdown_cancel_inflight:
+                completed.set()
+        notifier.cancel_countdown_callback = Mock(side_effect=TimeoutError("Sin respuesta del monitor"))
+        notice = self.notice("Protección", 3, countdown="a" * 32)
+        with patch.object(wn.time, "monotonic", return_value=100) as clock, \
+                patch.object(notifier, "_backend", SimpleNamespace(wake=wake)):
+            notifier.sync_persistent({"notice:1": notice})
+            self.backend.sync_persistent()
+            clock.return_value = 103.2
+            self.backend.sync_persistent()
+            completed.clear()
+            self.backend._window_proc(self.backend.popup_hwnd, wn.WM_COMMAND, 103, 0)
+            self.assertTrue(completed.wait(1))
+            self.backend.sync_persistent()
+            self.assertIn("No se confirmó la cancelación", fixtures.latest_control_text(self.user, self.backend.popup_body))
+            self.assertTrue(self.backend.popup_view._enabled["cancel"])
+            self.assertEqual(self.backend.popup_view.texts["cancel"], "Cancelar protección")
+            self.assertEqual(notifier._countdown_cancel_inflight, set())
+            notifier.cancel_countdown_callback.assert_called_once_with("a" * 32)
+            completed.clear()
+            notifier.cancel_countdown_callback.side_effect = None
+            notifier.cancel_countdown_callback.return_value = {
+                "cancelled_countdown_id": "a" * 32, "protection": {"state": "cancelled"}}
+            self.backend._window_proc(self.backend.popup_hwnd, wn.WM_COMMAND, 103, 0)
+            self.assertTrue(completed.wait(1))
+            self.assertEqual(notifier.cancel_countdown_callback.call_count, 2)
+            self.assertIn("confirmó la cancelación", notifier._countdown_feedback("a" * 32)[0])
+            self.backend.sync_persistent()
+            self.assertIsNone(self.backend.popup_persistent_key)
 
     def test_zero_never_claims_windows_action_completed(self):
         notifier = self.configure_popup()
@@ -437,6 +516,19 @@ class CountdownClientTests(unittest.TestCase):
         client.cancel_countdown.return_value = {"cancelled_countdown_id": "a" * 32,
                                                "protection": {"state": "cancelled"}}
         self.assertEqual(agent.cancel_countdown("a" * 32)["cancelled_countdown_id"], "a" * 32)
+
+    def test_agent_requires_explicit_cancelled_state_before_reporting_success(self):
+        client = SimpleNamespace(cancel_countdown=Mock())
+        agent = Agent(client, Mock(), session_state=lambda: "active")
+        for state in (None, "idle", "blocked", "countdown", "executed"):
+            with self.subTest(state=state):
+                client.cancel_countdown.return_value = {
+                    "cancelled_countdown_id": "a" * 32, "protection": {"state": state}}
+                with self.assertRaises(ValueError):
+                    agent.cancel_countdown("a" * 32)
+        client.cancel_countdown.return_value = {
+            "cancelled_countdown_id": "a" * 32, "protection": {"state": "cancelled"}}
+        self.assertEqual(agent.cancel_countdown("a" * 32)["protection"]["state"], "cancelled")
 
     def test_slow_poll_cannot_rejuvenate_countdown_freshness(self):
         now = [100]

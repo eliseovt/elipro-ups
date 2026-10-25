@@ -157,8 +157,8 @@ class CountdownCancellationApiTests(unittest.TestCase):
         self.assertTrue(any(event["kind"] == "policy_cancelled" for event in result["events"]))
         self.action.assert_not_called()
 
-    def test_expired_or_stale_episode_returns_conflict_without_evaluating_or_executing(self):
-        for advance in (3, 30):
+    def test_expired_episode_returns_conflict_without_evaluating_or_executing(self):
+        for advance in (30, 31):
             with self.subTest(advance=advance):
                 self.clock.now = 100 + advance
                 handler = self.handler({"countdown_id": self.identifier})
@@ -167,6 +167,72 @@ class CountdownCancellationApiTests(unittest.TestCase):
                     evaluate.assert_not_called()
                 self.assertEqual(handler._json.call_args.args[1], 409)
                 self.assertFalse(self.monitor.engine.status()["suppressed"])
+        self.action.assert_not_called()
+
+    def test_live_monitor_cancels_pending_episode_after_snapshot_lease_expires(self):
+        self.clock.now += 3.2
+        current = self.monitor.engine.status()
+        self.assertEqual(current["state"], "countdown")
+        self.assertEqual(current["countdown_id"], self.identifier)
+        self.assertEqual(current["countdown_valid_for_ms"], 0)
+        self.assertFalse(current["cancelable"])
+        # Expired snapshot metadata remains unsuitable for advertising a
+        # confirmed button; the POST separately validates the current engine.
+        self.assertFalse(self.monitor._countdown_actionable(current))
+        handler = self.handler({"countdown_id": self.identifier})
+        with patch.object(self.monitor.engine, "evaluate", wraps=self.monitor.engine.evaluate) as evaluate, \
+                patch.object(self.adapter, "read", wraps=self.adapter.read) as read:
+            handler.do_POST()
+        evaluate.assert_not_called()
+        read.assert_not_called()
+        result = handler._json.call_args.args[0]
+        self.assertEqual(result["cancelled_countdown_id"], self.identifier)
+        self.assertEqual(result["protection"]["state"], "cancelled")
+        self.assertTrue(self.monitor.engine.status()["suppressed"])
+        self.action.assert_not_called()
+
+    def test_old_client_snapshot_can_request_cancel_after_monitor_received_fresh_reading(self):
+        old = self.monitor.snapshot()["protection"]
+        self.clock.now += 3.2
+        self.monitor.tick()
+        current = self.monitor.engine.status()
+        self.assertEqual(current["countdown_id"], old["countdown_id"])
+        self.assertTrue(current["cancelable"])
+        handler = self.handler({"countdown_id": old["countdown_id"]})
+        handler.do_POST()
+        result = handler._json.call_args.args[0]
+        self.assertEqual(result["cancelled_countdown_id"], self.identifier)
+        self.assertEqual(result["protection"]["state"], "cancelled")
+        self.action.assert_not_called()
+
+    def test_stale_telemetry_still_rejects_live_cancellation_without_reevaluation(self):
+        self.clock.now += 3.2
+        self.monitor.sample["timestamp"] = iso_utc(datetime.now(timezone.utc) - timedelta(seconds=16))
+        handler = self.handler({"countdown_id": self.identifier})
+        with patch.object(self.monitor.engine, "evaluate") as evaluate:
+            handler.do_POST()
+        evaluate.assert_not_called()
+        self.assertEqual(handler._json.call_args.args[1], 409)
+        self.assertFalse(self.monitor.engine.status()["suppressed"])
+        self.action.assert_not_called()
+
+    def test_disconnected_monitor_rejects_live_cancellation_even_with_pending_engine(self):
+        self.clock.now += 3.2
+        self.monitor.connection = "disconnected"
+        handler = self.handler({"countdown_id": self.identifier})
+        handler.do_POST()
+        self.assertEqual(handler._json.call_args.args[1], 409)
+        self.assertEqual(self.monitor.engine.status()["countdown_id"], self.identifier)
+        self.assertFalse(self.monitor.engine.status()["suppressed"])
+        self.action.assert_not_called()
+
+    def test_pending_simulation_rejects_live_cancellation_even_with_pending_engine(self):
+        self.clock.now += 3.2
+        self.monitor.test_deadline = time.monotonic() + 30
+        handler = self.handler({"countdown_id": self.identifier})
+        handler.do_POST()
+        self.assertEqual(handler._json.call_args.args[1], 409)
+        self.assertFalse(self.monitor.engine.status()["suppressed"])
         self.action.assert_not_called()
 
     def test_old_identifier_cannot_cancel_later_countdown(self):
@@ -243,6 +309,26 @@ class CountdownCancellationApiTests(unittest.TestCase):
         self.assertNotEqual(current["countdown_id"], self.identifier)
         self.assertEqual(current["state"], "countdown")
         self.assertFalse(current["suppressed"])
+        self.action.assert_not_called()
+
+    def test_deadline_is_checked_after_waiting_for_decision_lock(self):
+        self.clock.now = 129.9
+
+        def acquire(*, timeout):
+            self.assertEqual(timeout, .25)
+            self.clock.now = 130.0  # The deadline elapsed while acquiring the lock.
+            return True
+
+        lock = SimpleNamespace(acquire=Mock(side_effect=acquire), release=Mock())
+        handler = self.handler({"countdown_id": self.identifier})
+        with patch.object(self.monitor, "lock", lock), \
+                patch.object(self.monitor.engine, "evaluate") as evaluate:
+            handler.do_POST()
+        lock.acquire.assert_called_once_with(timeout=.25)
+        lock.release.assert_called_once_with()
+        evaluate.assert_not_called()
+        self.assertEqual(handler._json.call_args.args[1], 409)
+        self.assertFalse(self.monitor.engine.status()["suppressed"])
         self.action.assert_not_called()
 
     def test_history_write_failure_does_not_prevent_guarded_cancel(self):

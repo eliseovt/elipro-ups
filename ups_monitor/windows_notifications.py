@@ -657,9 +657,7 @@ class _Win32Backend:
                 message += " " + feedback
             if self.popup_cancel:
                 self.popup_view.set_action("cancel", "Cancelando…" if inflight else "Cancelar protección",
-                    bool(current and countdown["cancelable"]
-                    and callable(self.owner.cancel_countdown_callback) and not inflight
-                    and self.owner._session_currently_available()))
+                    bool(self.owner._countdown_cancel_request_allowed(notice) and not inflight))
         self.popup_view.set_content(_utf16_clip(title, 100), _utf16_clip(message, 400),
             severity=notice.get("severity", "warning"), countdown=countdown, footer=footer)
         if reposition:
@@ -986,6 +984,8 @@ class WindowsNotifier:
         self._persistent_received = {}
         self._persistent_countdowns = {}
         self._persistent_confirmations = {}
+        self._persistent_cancel_permissions = {}
+        self._confirmed_countdown_cancellations = OrderedDict()
         self._persistent_sound_at = {}
         self._persistent_dismissed = set()
         self._persistent_versions = {}
@@ -1106,6 +1106,7 @@ class WindowsNotifier:
             self._session_available = available
             if not available:
                 self._persistent_confirmations.clear()
+                self._persistent_cancel_permissions.clear()
                 # The broker owns deferred alerts and will rebuild their text
                 # on resume. Never replay an old local countdown after unlock.
                 for delivery_id in self._pending_deliveries:
@@ -1236,11 +1237,17 @@ class WindowsNotifier:
         with self._lock:
             if self._stop.is_set():
                 return
-            for key in messages:
+            while (self._confirmed_countdown_cancellations and
+                   next(iter(self._confirmed_countdown_cancellations.values())) < now - 300):
+                self._confirmed_countdown_cancellations.popitem(last=False)
+            normalized = {key: value for key, value in normalized.items()
+                          if (value.get("countdown") or {}).get("countdown_id")
+                          not in self._confirmed_countdown_cancellations}
+            for key in normalized:
                 if key not in self._persistent_messages:
                     self._persistent_serial += 1
                     self._persistent_versions[key] = self._persistent_serial
-            self._persistent_versions = {key: self._persistent_versions[key] for key in messages}
+            self._persistent_versions = {key: self._persistent_versions[key] for key in normalized}
             for key, value in normalized.items():
                 countdown = value.get("countdown")
                 if countdown is not None:
@@ -1252,24 +1259,28 @@ class WindowsNotifier:
                     confirmation = self._persistent_confirmations.get(key)
                     if confirmation is not None and confirmation[0] != countdown["countdown_id"]:
                         self._persistent_confirmations.pop(key, None)
+                        self._persistent_cancel_permissions.pop(key, None)
                     valid_for_ms = countdown["valid_for_ms"]
                     if "confirmed_for_ms" in value:
                         valid_for_ms = min(valid_for_ms, value["confirmed_for_ms"])
                     if (self._session_available and value.get("confirmed", True) is True
                             and countdown["remaining_seconds"] > 0 and valid_for_ms > 0):
                         self._persistent_confirmations[key] = (countdown["countdown_id"], now + valid_for_ms / 1000)
+                        self._persistent_cancel_permissions[key] = (countdown["countdown_id"], countdown["cancelable"])
                 else:
                     self._persistent_countdowns.pop(key, None)
                     self._persistent_confirmations.pop(key, None)
+                    self._persistent_cancel_permissions.pop(key, None)
             self._persistent_countdowns = {key: value for key, value in self._persistent_countdowns.items() if key in normalized}
             self._persistent_confirmations = {key: value for key, value in self._persistent_confirmations.items() if key in normalized}
+            self._persistent_cancel_permissions = {key: value for key, value in self._persistent_cancel_permissions.items() if key in normalized}
             self._persistent_messages = normalized
             self._persistent_received = {key: now for key in normalized}
             self._persistent_sound_at = {key: value for key, value in self._persistent_sound_at.items() if key in normalized}
             countdown_ids = {value["countdown"]["countdown_id"] for value in normalized.values() if "countdown" in value}
             self._countdown_cancel_feedback = {key: value for key, value in self._countdown_cancel_feedback.items()
                                               if key in countdown_ids}
-            self._persistent_dismissed.intersection_update(messages)
+            self._persistent_dismissed.intersection_update(normalized)
             backend = self._backend
         if backend is not None:
             backend.wake()
@@ -1368,15 +1379,35 @@ class WindowsNotifier:
         with self._lock:
             return self._countdown_cancel_feedback.get(countdown_id), countdown_id in self._countdown_cancel_inflight
 
+    def _countdown_cancel_request_allowed(self, notice):
+        """Permit a request, never infer cancellation from an old UI snapshot."""
+        countdown = notice.get("countdown") if isinstance(notice, dict) else None
+        if (not countdown or countdown["remaining_seconds"] <= 0
+                or not callable(self.cancel_countdown_callback) or not self._session_currently_available()):
+            return False
+        identifier, now = countdown["countdown_id"], time.monotonic()
+        with self._lock:
+            if (self._stop.is_set() or identifier in self._countdown_cancel_inflight
+                    or identifier in self._confirmed_countdown_cancellations):
+                return False
+            if (notice.get("confirmed", True) is True and countdown["valid_for_ms"] > 0
+                    and countdown["cancelable"] is True):
+                return True
+            if countdown.get("refresh_pending") is not True:
+                return False
+            for key, (episode, valid_until) in self._persistent_confirmations.items():
+                if (episode == identifier and now < valid_until + COUNTDOWN_REFRESH_GRACE_SECONDS
+                        and self._persistent_cancel_permissions.get(key) == (identifier, True)):
+                    deadline = self._persistent_countdowns.get(key)
+                    if deadline is not None and deadline[0] == identifier and deadline[1] > now:
+                        return True
+        return False
+
     def _cancel_persistent_countdown(self, key):
-        if not self._session_currently_available():
-            return
         notice = self._persistent_message(key)
-        countdown = notice.get("countdown") if notice is not None else None
-        if (not countdown or notice.get("confirmed", True) is not True
-                or not countdown["cancelable"] or countdown["remaining_seconds"] <= 0
-                or countdown["valid_for_ms"] <= 0 or not callable(self.cancel_countdown_callback)):
+        if not self._countdown_cancel_request_allowed(notice):
             return
+        countdown = notice["countdown"]
         countdown_id = countdown["countdown_id"]
         with self._lock:
             if self._stop.is_set() or countdown_id in self._countdown_cancel_inflight:
@@ -1386,11 +1417,14 @@ class WindowsNotifier:
             generation = self._persistent_versions.get(key)
         def cancel():
             feedback = None
+            confirmed = False
             try:
                 result = self.cancel_countdown_callback(countdown_id)
+                protection = result.get("protection") if isinstance(result, dict) else None
                 if (not isinstance(result, dict) or result.get("cancelled_countdown_id") != countdown_id
-                        or result.get("protection", {}).get("state") in ("countdown", "executed")):
+                        or not isinstance(protection, dict) or protection.get("state") != "cancelled"):
                     raise ValueError("El monitor no confirmó esta cuenta.")
+                confirmed = True
                 feedback = "El monitor confirmó la cancelación."
             except Exception as exc:
                 feedback = "No se confirmó la cancelación. " + str(exc)[:60]
@@ -1398,9 +1432,24 @@ class WindowsNotifier:
                 with self._lock:
                     self._countdown_cancel_inflight.discard(countdown_id)
                     current = self._persistent_message_locked(key, time.monotonic())
+                    if confirmed and not self._stop.is_set():
+                        self._confirmed_countdown_cancellations[countdown_id] = time.monotonic()
+                        self._confirmed_countdown_cancellations.move_to_end(countdown_id)
+                        while len(self._confirmed_countdown_cancellations) > 256:
+                            self._confirmed_countdown_cancellations.popitem(last=False)
                     if (not self._stop.is_set() and self._persistent_versions.get(key) == generation
                             and (current or {}).get("countdown", {}).get("countdown_id") == countdown_id):
                         self._countdown_cancel_feedback[countdown_id] = feedback
+                        if confirmed:
+                            # Close only this confirmed episode, without marking
+                            # its durable incident as read or touching a new one.
+                            for values in (self._persistent_messages, self._persistent_received,
+                                           self._persistent_countdowns, self._persistent_confirmations,
+                                           self._persistent_cancel_permissions, self._persistent_versions,
+                                           self._persistent_sound_at):
+                                values.pop(key, None)
+                            self._persistent_dismissed.discard(key)
+                            self._last_error = None
                     backend = self._backend
                 if backend is not None:
                     backend.wake()
@@ -1530,6 +1579,8 @@ class WindowsNotifier:
             self._persistent_received.clear()
             self._persistent_countdowns.clear()
             self._persistent_confirmations.clear()
+            self._persistent_cancel_permissions.clear()
+            self._confirmed_countdown_cancellations.clear()
             self._persistent_sound_at.clear()
             self._persistent_dismissed.clear()
             self._persistent_versions.clear()

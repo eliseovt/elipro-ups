@@ -1644,13 +1644,27 @@ class Monitor:
 
     def _countdown_actionable(self, raw):
         """Inspect current state under the decision lock, without new USB I/O."""
-        return (raw.get("state") == "countdown" and raw.get("cancelable") is True
+        return raw.get("cancelable") is True and self._countdown_cancel_context(raw)
+
+    def _countdown_cancel_context(self, raw):
+        return (raw.get("state") == "countdown"
                 and isinstance(raw.get("countdown_id"), str)
                 and not self.power_actions_blocked and self.test_deadline is None
                 and not self.stop_event.is_set() and not self._power_gate.is_set()
                 and not self._health_fault.is_set() and self.system_power_status()["state"] == "running"
                 and self.connection == "connected" and self._fresh_sample(self.sample)
                 and self.sample.get("on_battery") is True)
+
+    def _countdown_cancellable_on_request(self, raw):
+        """Validate a live request against the current engine, not a UI lease.
+
+        The caller holds the decision lock. Snapshot validity is deliberately
+        short, but an authenticated cancellation can stop the same pending
+        episode while the normal telemetry and monitor guards still hold.
+        """
+        remaining = raw.get("countdown_remaining")
+        return (type(remaining) in (int, float) and math.isfinite(remaining) and remaining > 0
+                and self._countdown_cancel_context(raw))
 
     def cancel_countdown(self, countdown_id):
         """Cancel exactly one still-current real countdown, never a later one."""
@@ -1661,7 +1675,7 @@ class Monitor:
             raise CountdownBusyError("El monitor está ocupado; no se confirmó la cancelación.")
         try:
             current = self.engine.status()
-            if current.get("countdown_id") != countdown_id or not self._countdown_actionable(current):
+            if current.get("countdown_id") != countdown_id or not self._countdown_cancellable_on_request(current):
                 raise CountdownConflictError("La cuenta cambió, terminó o ya no admite cancelación. Revisa el estado actual.")
             self.engine.cancel()
             self._update_alerts()

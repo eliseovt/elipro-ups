@@ -1,5 +1,7 @@
-"""Local countdown presentation continuity never extends cancellation validity."""
+"""Brief refresh gaps allow episode-bound requests, never local cancellation success."""
 from copy import deepcopy
+import threading
+from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 
@@ -39,6 +41,16 @@ class CountdownContinuityTests(unittest.TestCase):
 
     def current(self):
         return self.receiver._persistent_message(self.key)
+
+    def request_and_wait(self):
+        completed = threading.Event()
+        def wake():
+            if not self.receiver._countdown_cancel_inflight:
+                completed.set()
+        backend = SimpleNamespace(wake=wake)
+        with patch.object(self.receiver, "_backend", backend):
+            self.receiver._cancel_persistent_countdown(self.key)
+            self.assertTrue(completed.wait(1), "Cancellation worker must finish without blocking the UI")
 
     def test_normal_pipeline_phase_gap_is_refresh_pending_until_new_snapshot_arrives(self):
         store = Store(":memory:")
@@ -85,8 +97,11 @@ class CountdownContinuityTests(unittest.TestCase):
         self.assertFalse(pending["confirmed"])
         self.assertEqual(pending["countdown"]["valid_for_ms"], 0)
         self.assertFalse(pending["countdown"]["cancelable"])
-        self.receiver._cancel_persistent_countdown(self.key)
-        self.receiver.cancel_countdown_callback.assert_not_called()
+        self.assertTrue(self.receiver._countdown_cancel_request_allowed(pending))
+        self.receiver.cancel_countdown_callback.side_effect = TimeoutError("monitor ocupado")
+        self.request_and_wait()
+        self.receiver.cancel_countdown_callback.assert_called_once_with(pending["countdown"]["countdown_id"])
+        self.assertIn("No se confirmó", self.receiver._countdown_feedback(pending["countdown"]["countdown_id"])[0])
         self.clock.seconds = 3.9
         self.receiver.sync_persistent(poll())
         renewed = self.current()
@@ -109,6 +124,7 @@ class CountdownContinuityTests(unittest.TestCase):
             self.assertEqual(self.receiver._persistent_confirmations[self.key], confirmation)
         self.clock.seconds = confirmation[1] + COUNTDOWN_REFRESH_GRACE_SECONDS
         self.assertNotIn("refresh_pending", self.current()["countdown"])
+        self.assertFalse(self.receiver._countdown_cancel_request_allowed(self.current()))
 
     def test_stale_snapshots_never_renew_grace_or_deadline(self):
         self.receive(self.notice())
@@ -121,7 +137,7 @@ class CountdownContinuityTests(unittest.TestCase):
             self.assertEqual(self.receiver._persistent_countdowns[self.key], deadline)
         self.assertNotIn("refresh_pending", self.current()["countdown"])
 
-    def test_shorter_confirmed_lease_limits_grace_and_blocks_cancellation(self):
+    def test_shorter_confirmed_lease_limits_grace_for_monitor_validated_requests(self):
         self.receive(self.notice(confirmed_for_ms=500))
         self.assertEqual(self.receiver._persistent_confirmations[self.key], ("a" * 32, .5))
         self.clock.seconds = .6
@@ -129,10 +145,15 @@ class CountdownContinuityTests(unittest.TestCase):
         self.assertTrue(value["countdown"]["refresh_pending"])
         self.assertFalse(value["confirmed"])
         self.assertGreater(value["countdown"]["valid_for_ms"], 0)
-        self.receiver._cancel_persistent_countdown(self.key)
-        self.receiver.cancel_countdown_callback.assert_not_called()
+        self.assertTrue(self.receiver._countdown_cancel_request_allowed(value))
+        self.receiver.cancel_countdown_callback.return_value = {
+            "cancelled_countdown_id": "a" * 32, "protection": {"state": "cancelled"}}
+        self.request_and_wait()
+        self.receiver.cancel_countdown_callback.assert_called_once_with("a" * 32)
+        self.assertIn("confirmó la cancelación", self.receiver._countdown_feedback("a" * 32)[0])
+        self.assertIsNone(self.current(), "A confirmed cancellation must retire the matching local clock")
         self.clock.seconds = 4.5
-        self.assertNotIn("refresh_pending", self.current()["countdown"])
+        self.assertIsNone(self.current())
 
     def test_never_confirmed_or_slow_payload_cannot_seed_continuity(self):
         for notice in (self.notice(confirmed=False),
@@ -144,6 +165,7 @@ class CountdownContinuityTests(unittest.TestCase):
                 self.receive(notice)
                 self.assertEqual(self.receiver._persistent_confirmations, {})
                 self.assertNotIn("refresh_pending", self.current()["countdown"])
+                self.assertFalse(self.receiver._countdown_cancel_request_allowed(self.current()))
 
     def test_incoming_refresh_hint_is_not_trusted_or_persisted(self):
         source = self.notice(confirmed=False, confirmed_for_ms=0, valid_for_ms=0, refresh_pending=True)
@@ -151,6 +173,7 @@ class CountdownContinuityTests(unittest.TestCase):
         self.assertNotIn("refresh_pending", normalize_notice_metadata(source)["countdown"])
         self.receive(source)
         self.assertNotIn("refresh_pending", self.current()["countdown"])
+        self.assertFalse(self.receiver._countdown_cancel_request_allowed(self.current()))
         self.assertEqual(source, original)
 
     def test_new_episode_does_not_inherit_confirmation_and_fresh_episode_can_seed_its_own(self):
@@ -159,6 +182,7 @@ class CountdownContinuityTests(unittest.TestCase):
         self.receive(self.notice(identifier="b" * 32, confirmed=False, valid_for_ms=0))
         self.assertEqual(self.receiver._persistent_confirmations, {})
         self.assertNotIn("refresh_pending", self.current()["countdown"])
+        self.assertFalse(self.receiver._countdown_cancel_request_allowed(self.current()))
         self.receive(self.notice(identifier="b" * 32))
         self.clock.seconds = 6.3
         self.assertTrue(self.current()["countdown"]["refresh_pending"])
@@ -201,6 +225,108 @@ class CountdownContinuityTests(unittest.TestCase):
         self.receive(source)
         self.clock.seconds = 3.1
         self.assertTrue(self.current()["countdown"]["refresh_pending"])
+
+    def test_refresh_request_requires_last_genuine_permission_and_honors_revocation(self):
+        self.receive(self.notice(cancelable=False))
+        self.clock.seconds = 3.2
+        self.assertTrue(self.current()["countdown"]["refresh_pending"])
+        self.assertFalse(self.receiver._countdown_cancel_request_allowed(self.current()))
+        self.receiver._cancel_persistent_countdown(self.key)
+        self.receiver.cancel_countdown_callback.assert_not_called()
+
+        self.receiver.sync_persistent({})
+        self.clock.seconds = 10
+        self.receive(self.notice())
+        self.clock.seconds = 11
+        self.receive(self.notice(remaining_seconds=29, cancelable=False))
+        self.clock.seconds = 14.1
+        self.assertTrue(self.current()["countdown"]["refresh_pending"])
+        self.assertFalse(self.receiver._countdown_cancel_request_allowed(self.current()))
+
+    def test_aged_snapshot_does_not_revoke_last_genuine_permission_during_bounded_gap(self):
+        self.receive(self.notice())
+        self.clock.seconds = 3.2
+        self.receive(self.notice(confirmed=False, confirmed_for_ms=0, valid_for_ms=0,
+                                 remaining_seconds=26.8, cancelable=False))
+        value = self.current()
+        self.assertFalse(value["countdown"]["cancelable"])
+        self.assertTrue(self.receiver._countdown_cancel_request_allowed(value))
+        self.clock.seconds = 7.01
+        self.assertFalse(self.receiver._countdown_cancel_request_allowed(self.current()))
+
+    def test_session_loss_prevents_even_an_otherwise_current_request(self):
+        self.receive(self.notice())
+        self.receiver.set_session_available(False)
+        self.assertFalse(self.receiver._countdown_cancel_request_allowed(self.current()))
+        self.receiver._cancel_persistent_countdown(self.key)
+        self.receiver.cancel_countdown_callback.assert_not_called()
+
+    def test_only_explicit_matching_cancelled_result_reports_success(self):
+        self.receive(self.notice())
+        self.clock.seconds = 3.2
+        invalid_results = (
+            {"cancelled_countdown_id": "b" * 32, "protection": {"state": "cancelled"}},
+            {"cancelled_countdown_id": "a" * 32},
+            *({"cancelled_countdown_id": "a" * 32, "protection": {"state": state}}
+              for state in (None, "idle", "blocked", "countdown", "executed")),
+        )
+        for result in invalid_results:
+            with self.subTest(result=result):
+                self.receiver.cancel_countdown_callback.return_value = result
+                self.request_and_wait()
+                self.assertIn("No se confirmó", self.receiver._countdown_feedback("a" * 32)[0])
+                self.assertTrue(self.receiver._countdown_cancel_request_allowed(self.current()))
+        self.receiver.cancel_countdown_callback.return_value = {
+            "cancelled_countdown_id": "a" * 32, "protection": {"state": "cancelled"}}
+        self.request_and_wait()
+        self.assertIn("confirmó la cancelación", self.receiver._countdown_feedback("a" * 32)[0])
+
+    def test_confirmed_cancelled_episode_cannot_reappear_from_delayed_snapshots(self):
+        self.receive(self.notice())
+        self.clock.seconds = 3.2
+        self.receiver.cancel_countdown_callback.return_value = {
+            "cancelled_countdown_id": "a" * 32, "protection": {"state": "cancelled"}}
+        self.request_and_wait()
+        self.assertIsNone(self.current())
+        self.assertFalse(self.receiver._persistent_acknowledged(self.key), "Cancel is not a reading acknowledgement")
+        for previous_snapshot in (
+            self.notice(confirmed=False, confirmed_for_ms=0, valid_for_ms=0), self.notice()):
+            with self.subTest(previous_snapshot=previous_snapshot):
+                self.clock.seconds += .1
+                self.receive(previous_snapshot)
+                self.assertIsNone(self.current(), "An old poll must not restore a cancelled clock")
+        self.receive(self.notice(identifier="b" * 32))
+        self.assertEqual(self.current()["countdown"]["countdown_id"], "b" * 32)
+        self.assertTrue(self.receiver._countdown_cancel_request_allowed(self.current()))
+
+    def test_late_monitor_confirmation_does_not_retire_new_episode_using_same_notice_key(self):
+        entered, release, completed = threading.Event(), threading.Event(), threading.Event()
+        self.addCleanup(release.set)
+
+        def cancel(identifier):
+            entered.set()
+            release.wait(2)
+            return {"cancelled_countdown_id": identifier, "protection": {"state": "cancelled"}}
+
+        def wake():
+            if not self.receiver._countdown_cancel_inflight:
+                completed.set()
+
+        self.receive(self.notice())
+        self.clock.seconds = 3.2
+        self.receiver.cancel_countdown_callback = Mock(side_effect=cancel)
+        with patch.object(self.receiver, "_backend", SimpleNamespace(wake=wake)):
+            self.receiver._cancel_persistent_countdown(self.key)
+            self.assertTrue(entered.wait(1))
+            self.clock.seconds = 3.3
+            self.receive(self.notice(identifier="b" * 32))
+            self.assertEqual(self.current()["countdown"]["countdown_id"], "b" * 32)
+            release.set()
+            self.assertTrue(completed.wait(1))
+        self.assertEqual(self.current()["countdown"]["countdown_id"], "b" * 32)
+        self.assertIsNone(self.receiver._countdown_feedback("b" * 32)[0])
+        self.assertTrue(self.receiver._countdown_cancel_request_allowed(self.current()))
+        self.receiver.cancel_countdown_callback.assert_called_once_with("a" * 32)
 
 
 if __name__ == "__main__":

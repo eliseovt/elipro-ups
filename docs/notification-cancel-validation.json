@@ -1,0 +1,512 @@
+[
+  {
+    "theme": "light",
+    "dpi": 120,
+    "mode": "fake monitor replies; no HTTP, USB or power actions",
+    "scenes": [
+      {
+        "scene": "fresh",
+        "time": 100.0,
+        "visible": true,
+        "rectangle": [
+          1940,
+          864,
+          2540,
+          1360
+        ],
+        "size": [
+          600,
+          496
+        ],
+        "title": "Hibernación programada",
+        "clock": "01:00",
+        "badge": "URGENTE",
+        "label": "Tiempo restante",
+        "cancel_text": "Cancelar protección",
+        "cancel_enabled": true,
+        "body": "Guarda tu trabajo antes de que termine la cuenta.",
+        "notice_retired": false,
+        "metadata": {
+          "title": "Protección",
+          "message": "Cuenta simulada para revisión visual",
+          "priority": 3,
+          "severity": "critical",
+          "sound": false,
+          "confirmed": true,
+          "confirmed_for_ms": 3000,
+          "countdown": {
+            "countdown_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "action": "hibernate",
+            "remaining_seconds": 60,
+            "valid_for_ms": 3000,
+            "cancelable": true
+          }
+        },
+        "feedback": null,
+        "inflight": false,
+        "requested_ids": [],
+        "reading_ack_calls": 0,
+        "last_error": null
+      },
+      {
+        "scene": "pending",
+        "time": 103.2,
+        "visible": true,
+        "rectangle": [
+          1940,
+          864,
+          2540,
+          1360
+        ],
+        "size": [
+          600,
+          496
+        ],
+        "title": "Hibernación programada",
+        "clock": "00:57",
+        "badge": "ACTUALIZANDO",
+        "label": "Tiempo estimado",
+        "cancel_text": "Cancelar protección",
+        "cancel_enabled": true,
+        "body": "Guarda tu trabajo antes de que termine la cuenta.",
+        "notice_retired": false,
+        "metadata": {
+          "title": "Protección",
+          "message": "Cuenta simulada para revisión visual",
+          "priority": 1,
+          "severity": "critical",
+          "sound": false,
+          "confirmed": false,
+          "confirmed_for_ms": 0,
+          "countdown": {
+            "countdown_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "action": "hibernate",
+            "remaining_seconds": 56.8,
+            "valid_for_ms": 0,
+            "cancelable": false,
+            "refresh_pending": true
+          }
+        },
+        "feedback": null,
+        "inflight": false,
+        "requested_ids": [],
+        "reading_ack_calls": 0,
+        "last_error": null
+      },
+      {
+        "scene": "inflight",
+        "time": 103.2,
+        "visible": true,
+        "rectangle": [
+          1940,
+          864,
+          2540,
+          1360
+        ],
+        "size": [
+          600,
+          496
+        ],
+        "title": "Hibernación programada",
+        "clock": "00:57",
+        "badge": "ACTUALIZANDO",
+        "label": "Tiempo estimado",
+        "cancel_text": "Cancelando…",
+        "cancel_enabled": false,
+        "body": "Guarda tu trabajo antes de que termine la cuenta.",
+        "notice_retired": false,
+        "metadata": {
+          "title": "Protección",
+          "message": "Cuenta simulada para revisión visual",
+          "priority": 1,
+          "severity": "critical",
+          "sound": false,
+          "confirmed": false,
+          "confirmed_for_ms": 0,
+          "countdown": {
+            "countdown_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "action": "hibernate",
+            "remaining_seconds": 56.8,
+            "valid_for_ms": 0,
+            "cancelable": false,
+            "refresh_pending": true
+          }
+        },
+        "feedback": null,
+        "inflight": true,
+        "requested_ids": [
+          "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        ],
+        "reading_ack_calls": 0,
+        "last_error": null
+      },
+      {
+        "scene": "cancelled",
+        "time": 103.2,
+        "visible": false,
+        "rectangle": [
+          1940,
+          864,
+          2540,
+          1360
+        ],
+        "size": [
+          600,
+          496
+        ],
+        "title": "Hibernación programada",
+        "clock": "00:57",
+        "badge": "ACTUALIZANDO",
+        "label": "Tiempo estimado",
+        "cancel_text": "Cancelando…",
+        "cancel_enabled": false,
+        "body": "Guarda tu trabajo antes de que termine la cuenta.",
+        "notice_retired": true,
+        "metadata": null,
+        "feedback": "El monitor confirmó la cancelación.",
+        "inflight": false,
+        "requested_ids": [
+          "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        ],
+        "reading_ack_calls": 0,
+        "last_error": null
+      },
+      {
+        "scene": "error",
+        "time": 113.2,
+        "visible": true,
+        "rectangle": [
+          1940,
+          839,
+          2540,
+          1360
+        ],
+        "size": [
+          600,
+          521
+        ],
+        "title": "Hibernación programada",
+        "clock": "00:57",
+        "badge": "ACTUALIZANDO",
+        "label": "Tiempo estimado",
+        "cancel_text": "Cancelar protección",
+        "cancel_enabled": true,
+        "body": "Guarda tu trabajo antes de que termine la cuenta. No se confirmó la cancelación. El monitor no respondió a la solicitud simulada",
+        "notice_retired": false,
+        "metadata": {
+          "title": "Protección",
+          "message": "Cuenta simulada para revisión visual",
+          "priority": 1,
+          "severity": "critical",
+          "sound": false,
+          "confirmed": false,
+          "confirmed_for_ms": 0,
+          "countdown": {
+            "countdown_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "action": "hibernate",
+            "remaining_seconds": 56.8,
+            "valid_for_ms": 0,
+            "cancelable": false,
+            "refresh_pending": true
+          }
+        },
+        "feedback": "No se confirmó la cancelación. El monitor no respondió a la solicitud simulada",
+        "inflight": false,
+        "requested_ids": [
+          "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        ],
+        "reading_ack_calls": 0,
+        "last_error": null
+      },
+      {
+        "scene": "retried",
+        "time": 113.2,
+        "visible": false,
+        "rectangle": [
+          1940,
+          839,
+          2540,
+          1360
+        ],
+        "size": [
+          600,
+          521
+        ],
+        "title": "Hibernación programada",
+        "clock": "00:57",
+        "badge": "ACTUALIZANDO",
+        "label": "Tiempo estimado",
+        "cancel_text": "Cancelar protección",
+        "cancel_enabled": true,
+        "body": "Guarda tu trabajo antes de que termine la cuenta. No se confirmó la cancelación. El monitor no respondió a la solicitud simulada",
+        "notice_retired": true,
+        "metadata": null,
+        "feedback": "El monitor confirmó la cancelación.",
+        "inflight": false,
+        "requested_ids": [
+          "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        ],
+        "reading_ack_calls": 0,
+        "last_error": null
+      }
+    ]
+  },
+  {
+    "theme": "dark",
+    "dpi": 120,
+    "mode": "fake monitor replies; no HTTP, USB or power actions",
+    "scenes": [
+      {
+        "scene": "fresh",
+        "time": 100.0,
+        "visible": true,
+        "rectangle": [
+          1940,
+          864,
+          2540,
+          1360
+        ],
+        "size": [
+          600,
+          496
+        ],
+        "title": "Hibernación programada",
+        "clock": "01:00",
+        "badge": "URGENTE",
+        "label": "Tiempo restante",
+        "cancel_text": "Cancelar protección",
+        "cancel_enabled": true,
+        "body": "Guarda tu trabajo antes de que termine la cuenta.",
+        "notice_retired": false,
+        "metadata": {
+          "title": "Protección",
+          "message": "Cuenta simulada para revisión visual",
+          "priority": 3,
+          "severity": "critical",
+          "sound": false,
+          "confirmed": true,
+          "confirmed_for_ms": 3000,
+          "countdown": {
+            "countdown_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "action": "hibernate",
+            "remaining_seconds": 60,
+            "valid_for_ms": 3000,
+            "cancelable": true
+          }
+        },
+        "feedback": null,
+        "inflight": false,
+        "requested_ids": [],
+        "reading_ack_calls": 0,
+        "last_error": null
+      },
+      {
+        "scene": "pending",
+        "time": 103.2,
+        "visible": true,
+        "rectangle": [
+          1940,
+          864,
+          2540,
+          1360
+        ],
+        "size": [
+          600,
+          496
+        ],
+        "title": "Hibernación programada",
+        "clock": "00:57",
+        "badge": "ACTUALIZANDO",
+        "label": "Tiempo estimado",
+        "cancel_text": "Cancelar protección",
+        "cancel_enabled": true,
+        "body": "Guarda tu trabajo antes de que termine la cuenta.",
+        "notice_retired": false,
+        "metadata": {
+          "title": "Protección",
+          "message": "Cuenta simulada para revisión visual",
+          "priority": 1,
+          "severity": "critical",
+          "sound": false,
+          "confirmed": false,
+          "confirmed_for_ms": 0,
+          "countdown": {
+            "countdown_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "action": "hibernate",
+            "remaining_seconds": 56.8,
+            "valid_for_ms": 0,
+            "cancelable": false,
+            "refresh_pending": true
+          }
+        },
+        "feedback": null,
+        "inflight": false,
+        "requested_ids": [],
+        "reading_ack_calls": 0,
+        "last_error": null
+      },
+      {
+        "scene": "inflight",
+        "time": 103.2,
+        "visible": true,
+        "rectangle": [
+          1940,
+          864,
+          2540,
+          1360
+        ],
+        "size": [
+          600,
+          496
+        ],
+        "title": "Hibernación programada",
+        "clock": "00:57",
+        "badge": "ACTUALIZANDO",
+        "label": "Tiempo estimado",
+        "cancel_text": "Cancelando…",
+        "cancel_enabled": false,
+        "body": "Guarda tu trabajo antes de que termine la cuenta.",
+        "notice_retired": false,
+        "metadata": {
+          "title": "Protección",
+          "message": "Cuenta simulada para revisión visual",
+          "priority": 1,
+          "severity": "critical",
+          "sound": false,
+          "confirmed": false,
+          "confirmed_for_ms": 0,
+          "countdown": {
+            "countdown_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "action": "hibernate",
+            "remaining_seconds": 56.8,
+            "valid_for_ms": 0,
+            "cancelable": false,
+            "refresh_pending": true
+          }
+        },
+        "feedback": null,
+        "inflight": true,
+        "requested_ids": [
+          "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        ],
+        "reading_ack_calls": 0,
+        "last_error": null
+      },
+      {
+        "scene": "cancelled",
+        "time": 103.2,
+        "visible": false,
+        "rectangle": [
+          1940,
+          864,
+          2540,
+          1360
+        ],
+        "size": [
+          600,
+          496
+        ],
+        "title": "Hibernación programada",
+        "clock": "00:57",
+        "badge": "ACTUALIZANDO",
+        "label": "Tiempo estimado",
+        "cancel_text": "Cancelando…",
+        "cancel_enabled": false,
+        "body": "Guarda tu trabajo antes de que termine la cuenta.",
+        "notice_retired": true,
+        "metadata": null,
+        "feedback": "El monitor confirmó la cancelación.",
+        "inflight": false,
+        "requested_ids": [
+          "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        ],
+        "reading_ack_calls": 0,
+        "last_error": null
+      },
+      {
+        "scene": "error",
+        "time": 113.2,
+        "visible": true,
+        "rectangle": [
+          1940,
+          839,
+          2540,
+          1360
+        ],
+        "size": [
+          600,
+          521
+        ],
+        "title": "Hibernación programada",
+        "clock": "00:57",
+        "badge": "ACTUALIZANDO",
+        "label": "Tiempo estimado",
+        "cancel_text": "Cancelar protección",
+        "cancel_enabled": true,
+        "body": "Guarda tu trabajo antes de que termine la cuenta. No se confirmó la cancelación. El monitor no respondió a la solicitud simulada",
+        "notice_retired": false,
+        "metadata": {
+          "title": "Protección",
+          "message": "Cuenta simulada para revisión visual",
+          "priority": 1,
+          "severity": "critical",
+          "sound": false,
+          "confirmed": false,
+          "confirmed_for_ms": 0,
+          "countdown": {
+            "countdown_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "action": "hibernate",
+            "remaining_seconds": 56.8,
+            "valid_for_ms": 0,
+            "cancelable": false,
+            "refresh_pending": true
+          }
+        },
+        "feedback": "No se confirmó la cancelación. El monitor no respondió a la solicitud simulada",
+        "inflight": false,
+        "requested_ids": [
+          "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        ],
+        "reading_ack_calls": 0,
+        "last_error": null
+      },
+      {
+        "scene": "retried",
+        "time": 113.2,
+        "visible": false,
+        "rectangle": [
+          1940,
+          839,
+          2540,
+          1360
+        ],
+        "size": [
+          600,
+          521
+        ],
+        "title": "Hibernación programada",
+        "clock": "00:57",
+        "badge": "ACTUALIZANDO",
+        "label": "Tiempo estimado",
+        "cancel_text": "Cancelar protección",
+        "cancel_enabled": true,
+        "body": "Guarda tu trabajo antes de que termine la cuenta. No se confirmó la cancelación. El monitor no respondió a la solicitud simulada",
+        "notice_retired": true,
+        "metadata": null,
+        "feedback": "El monitor confirmó la cancelación.",
+        "inflight": false,
+        "requested_ids": [
+          "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        ],
+        "reading_ack_calls": 0,
+        "last_error": null
+      }
+    ]
+  }
+]

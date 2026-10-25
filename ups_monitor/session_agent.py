@@ -259,8 +259,9 @@ class Agent:
     def cancel_countdown(self, countdown_id):
         # Deliberately no fallback to the legacy, unqualified cancellation URL.
         response = self.client.cancel_countdown(countdown_id)
+        protection = response.get("protection") if isinstance(response, dict) else None
         if (not isinstance(response, dict) or response.get("cancelled_countdown_id") != countdown_id
-                or response.get("protection", {}).get("state") in ("countdown", "executed")):
+                or not isinstance(protection, dict) or protection.get("state") != "cancelled"):
             raise ValueError("El monitor no confirmó la cancelación de esta cuenta regresiva.")
         return response
 

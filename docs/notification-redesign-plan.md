@@ -89,3 +89,17 @@ Una interrupción que supera ese margen muestra **Actualización interrumpida / 
 - Informe: [notification-continuity-validation.json](notification-continuity-validation.json). Harness y capturas locales: `.test-data/countdown-continuity/`. Son ventanas con datos simulados, sin iniciar el monitor ni ejecutar acciones de energía.
 
 ![Cuenta estimada durante una actualización breve](assets/screenshots/elipro-cuenta-actualizando.png)
+
+## Cancelación validada por el monitor en 0.9.25
+
+Durante el margen breve de **Actualizando**, el escritorio permite solicitar la cancelación si el mismo episodio fue confirmado previamente como cancelable y el plazo conocido sigue pendiente. No renueva la validez de los metadatos: se trata de una solicitud al monitor. Un episodio nuevo, un permiso revocado, el fin del plazo, la pérdida de sesión o el agotamiento del margen deshabilitan la solicitud. Mientras está en curso, **Cancelando…** bloquea los clics duplicados.
+
+El endpoint autenticado comprueba el identificador y el estado actual bajo el mismo bloqueo de decisiones. Deben conservarse el plazo pendiente, la conexión y telemetría reciente, los permisos del monitor y la ausencia de suspensión, simulación o actuación ya iniciada. La caducidad de tres segundos del snapshot no invalida por sí sola una petición a una cuenta que el monitor aún mantiene pendiente. No se lee de nuevo el USB ni se reevalúa el motor para cancelar.
+
+El agente y la ventana exigen un identificador coincidente y `protection.state == "cancelled"` para aceptar el resultado. Sólo entonces se retira ese aviso local, sin marcar su incidente como leído. Una memoria acotada de identificadores confirmados evita que snapshots o tickets anteriores lo reabran. Las respuestas tardías de otro episodio, los rechazos, los timeouts y las respuestas incompletas no confirman la cancelación. Tras un error se permite reintentar si la solicitud sigue siendo admisible.
+
+- **1082 pruebas Python aprobadas**, incluyendo el API bajo bloqueo, caducidad durante la espera del lock, episodios sustituidos, permisos previos, doble clic, reintento y replay tras confirmación.
+- **Ocho capturas nativas a 120 DPI**, en Claro y Oscuro: cuenta vigente, retraso breve con botón habilitado, solicitud en curso con botón bloqueado y error recuperable. El acuse correcto oculta el aviso; un error conserva la cuenta y permite reintentar. Los identificadores observados fueron `[A, B, B]`, con cero acuses de lectura y sin acciones de energía.
+- Informe: [notification-cancel-validation.json](notification-cancel-validation.json). Capturas y harness locales: `.test-data/pending-cancel-native/`. La revisión usa respuestas simuladas; no contacta el servicio instalado ni inicia el monitor, HTTP, USB o sonido.
+
+![Solicitud de cancelación disponible durante la actualización breve](assets/screenshots/elipro-cancelar-actualizando.png)
