@@ -25,6 +25,10 @@ def metadata(**changes):
 
 
 class NativeAdapterTests(unittest.TestCase):
+    def setUp(self):
+        # Process identity is covered with a complete fake Win32 API separately.
+        self.enterContext(patch("ups_monitor.native_adapter.browser_only_owners", return_value=False))
+
     def test_reconnection_backoff_is_exponential_capped_and_success_resets(self):
         clock = Mock(return_value=100)
         adapter = NativeHidAdapter(clock=clock)

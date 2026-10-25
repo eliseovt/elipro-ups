@@ -152,6 +152,29 @@ class LocalClient:
         return self._request("/api/notifications/ack", {"ids": ids})
 
     def stop_monitor(self):
+        try:
+            return self._stop_monitor()
+        except HTTPError:
+            # An HTTP refusal is a live server response, not evidence of exit.
+            raise
+        except OSError:
+            # The monitor may already be gone (including after losing its stop
+            # response). Only Windows can confirm that the service is stopped;
+            # a refused HTTP connection alone does not prove monitoring ended.
+            if self._service_stopped():
+                return {"stopped": True}
+            raise
+
+    @staticmethod
+    def _service_stopped():
+        from .windows_service import manage
+
+        try:
+            return manage("status").get("state") in {"stopped", "absent"}
+        except (OSError, RuntimeError, ValueError):
+            return False
+
+    def _stop_monitor(self):
         if not self.token:
             self.connect()
         try:
@@ -266,8 +289,8 @@ class Agent:
         return response
 
     def exit(self):
-        # The native menu calls us on a worker thread. Keep the tray available
-        # until the authenticated service acknowledges the stop request.
+        # Keep the tray until the service acknowledges the stop request or
+        # Windows confirms that it has already stopped.
         if not self._exit_lock.acquire(blocking=False):
             return
         try:
@@ -277,6 +300,9 @@ class Agent:
                 self.client.stop_monitor()
             except (OSError, ValueError) as exc:
                 reason = str(exc).strip()[:300] or "No se pudo contactar con el servicio."
+                # Broker loss disables delivery of stale service tickets. This
+                # local failure still needs to be visible on an active desktop.
+                self._availability(self._current_session() == "active")
                 self.notifier.notify("Elipro UPS", "No se pudo salir de Elipro. " + reason,
                                      severity="warning", sound=True)
                 return

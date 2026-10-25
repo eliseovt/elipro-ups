@@ -138,7 +138,7 @@ Las capturas muestran una configuración de ejemplo; la protección automática 
 ### Historial, Registro y Sistema
 * **Historial con tabla única «Registro»:** Reúne las mediciones en gráfica y una única tabla Registro, conservando sus filtros al navegar. Los eventos recientes permanecen exclusivos en Resumen.
 * **Sistema:** Reúne el funcionamiento del monitor (última lectura, tiempo activo y recursos) y los ajustes de avisos (avisos de escritorio, sonido, tema de las notificaciones, persistencia de avisos críticos e intervalo de repetición) sin opciones contraídas.
-* **Salida desde el panel o la bandeja:** **Salir de Elipro** está disponible en Sistema y al hacer clic derecho en el ícono de Windows. Tras confirmar, solicita detener el monitor y cierra el agente de avisos; si el servidor rechaza el cierre, el ícono permanece y explica el motivo. Cerrar solamente el navegador mantiene la vigilancia.
+* **Salida desde el panel o la bandeja:** **Salir de Elipro** está disponible en Sistema y al hacer clic derecho en el ícono de Windows. Tras confirmar, solicita detener el monitor y cierra el agente de avisos. Si el servicio ya no responde, Windows debe confirmar que está detenido o ausente para cerrar el ícono. Si el servidor rechaza el cierre o su estado no puede confirmarse, el ícono permanece y explica el motivo. Cerrar solamente el navegador mantiene la vigilancia.
 
 ### Webhooks e integraciones externas
 
@@ -270,7 +270,7 @@ El resultado queda en `dist/installer/Elipro-Setup-x64.exe`.
 > Antes de usar USB directo, **cierra el lector original de ForzaTracker** para que un solo programa acceda al UPS. Elipro no sustituye el controlador HID de Windows.
 
 ### Verificación de sockets de red (Anti-colisión)
-Antes de cada lectura, Elipro consulta las tablas UDP IPv4 e IPv6 de Windows (`GetExtendedUdpTable`, clase `UDP_TABLE_OWNER_PID`) para comprobar el puerto local del colector (51222). Solo permite USB si ambas consultas completas confirman su ausencia. Un puerto ocupado o una consulta inconclusa mantienen el bloqueo; `VP_LINK` se usa únicamente para reconocer una respuesta positiva de ForzaTracker. La ausencia no depende de recibir un error ICMP ni se guarda en caché. Consulta [docs/startup-communication.md](docs/startup-communication.md).
+Antes de cada lectura, Elipro consulta las tablas UDP IPv4 e IPv6 de Windows (`GetExtendedUdpTable`, clase `UDP_TABLE_OWNER_PID`) para comprobar el puerto local del colector (51222). Permite USB cuando ambas consultas completas confirman su ausencia, o cuando verifica la excepción acotada de Chrome instalado sin posibles lectores OEM activos. Los propietarios desconocidos y las consultas inconclusas mantienen el bloqueo; `VP_LINK` se usa únicamente para reconocer una respuesta positiva de ForzaTracker. La ausencia no depende de recibir un error ICMP ni se guarda en caché. Consulta [docs/startup-communication.md](docs/startup-communication.md).
 
 ### Comandos de inicio y detención
 

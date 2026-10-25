@@ -61,6 +61,7 @@ class Desktop:
 class StartupProbeIntegrationTests(unittest.TestCase):
     def setUp(self):
         self.clock = Mock(return_value=100)
+        self.enterContext(patch("ups_monitor.native_adapter.browser_only_owners", return_value=False))
         self.table = self.enterContext(patch("ups_monitor.native_adapter.udp_port_occupancy"))
         self.sleep = self.enterContext(patch("ups_monitor.native_adapter.time.sleep"))
         self.socket = self.enterContext(patch("ups_monitor.native_adapter.socket.socket"))

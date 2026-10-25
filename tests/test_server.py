@@ -2,7 +2,9 @@ import io
 import json
 import subprocess
 import tempfile
+import threading
 import unittest
+from contextlib import ExitStack, contextmanager
 from datetime import datetime, timedelta, timezone
 from email.message import Message
 from pathlib import Path
@@ -11,6 +13,7 @@ from unittest.mock import Mock, patch
 
 from ups_monitor.core import Store, iso_utc
 from ups_monitor.adapters import TelemetryError
+from ups_monitor import server as server_module
 from ups_monitor.server import Handler, Monitor, WindowsActionUnconfirmed, main, windows_action
 
 
@@ -425,6 +428,77 @@ class ServerTests(unittest.TestCase):
                 main()
         store.close.assert_not_called()
         ownership.close.assert_not_called()
+
+
+class ServerLifecycleTests(unittest.TestCase):
+    @contextmanager
+    def runtime(self, *, headless=False):
+        monitor, server, store = Mock(), Mock(), Mock()
+        monitor.engine.policy = {"enabled": False}
+        monitor.thread = monitor.supervisor_thread = monitor.processor_thread = None
+        ownership = SimpleNamespace(user_exit_requested=False, close=Mock())
+        store.close.return_value = True
+        with tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parent) as directory, ExitStack() as stack:
+            for name, value in (("make_adapter", Mock()), ("ResilientStore.open", store),
+                                ("Monitor", monitor), ("WindowsNotifier", Mock()),
+                                ("AlertManager", Mock()), ("ThreadingHTTPServer", server)):
+                stack.enter_context(patch("ups_monitor.server." + name, return_value=value))
+            stack.enter_context(patch("ups_monitor.server.request_parent_stop"))
+            stack.enter_context(patch("builtins.print"))
+            args = SimpleNamespace(source="simulation", dry_run=True, diagnose=False,
+                                   headless=headless, data_dir=Path(directory), port=8765,
+                                   forza_url="http://127.0.0.1:15179/Forza", allow_ups_poweroff=False)
+            yield SimpleNamespace(args=args, monitor=monitor, server=server, ownership=ownership,
+                                  log_path=Path(directory) / "monitor.log")
+
+    def test_start_and_server_return_are_persisted_without_private_data(self):
+        for headless, mode in ((False, "session"), (True, "service")):
+            with self.subTest(mode=mode), self.runtime(headless=headless) as runtime:
+                runtime.monitor.csrf_token = "private-csrf-token"
+                server_module._run_owned_monitor(runtime.args, runtime.ownership)
+                log = runtime.log_path.read_text(encoding="utf-8")
+                self.assertIn("Monitor iniciado", log)
+                self.assertIn("version=" + server_module.__version__, log)
+                self.assertIn("runtime_mode=" + mode, log)
+                self.assertIn("source=simulation, port=8765, dry_run=True", log)
+                self.assertIn("reason=server_return, error_type=none", log)
+                self.assertNotIn("private-csrf-token", log)
+                self.assertNotIn(str(runtime.args.data_dir), log)
+
+    def test_user_request_is_logged_once_before_final_shutdown(self):
+        with self.runtime() as runtime:
+            def stop(**_kwargs):
+                runtime.server.mark_exit_requested()
+                runtime.server.mark_exit_requested()
+                runtime.server.request_exit()
+            runtime.server.serve_forever.side_effect = stop
+            server_module._run_owned_monitor(runtime.args, runtime.ownership)
+            log = runtime.log_path.read_text(encoding="utf-8")
+            self.assertEqual(log.count("Salida de Elipro solicitada por el usuario."), 1)
+            self.assertLess(log.index("Monitor iniciado"), log.index("Salida de Elipro"))
+            self.assertLess(log.index("Salida de Elipro"), log.index("Monitor finalizado"))
+            self.assertIn("reason=user_requested, error_type=none", log)
+            self.assertTrue(runtime.ownership.user_exit_requested)
+
+    def test_windows_stop_is_distinguished_from_user_exit(self):
+        with self.runtime(headless=True) as runtime:
+            stopped = threading.Event()
+            stopped.set()
+            server_module._run_owned_monitor(runtime.args, runtime.ownership, stop_event=stopped)
+            log = runtime.log_path.read_text(encoding="utf-8")
+            self.assertIn("reason=windows_stop, error_type=none", log)
+            self.assertNotIn("Salida de Elipro solicitada por el usuario", log)
+
+    def test_server_and_cleanup_failures_persist_type_without_exception_payload(self):
+        for failing_step in ("serve_forever", "stop", "server_close"):
+            with self.subTest(failing_step=failing_step), self.runtime() as runtime:
+                target = runtime.monitor if failing_step == "stop" else runtime.server
+                getattr(target, failing_step).side_effect = RuntimeError("private-exception-payload")
+                with self.assertRaises(RuntimeError):
+                    server_module._run_owned_monitor(runtime.args, runtime.ownership)
+                log = runtime.log_path.read_text(encoding="utf-8")
+                self.assertIn("reason=error, error_type=RuntimeError", log)
+                self.assertNotIn("private-exception-payload", log)
 
 
 if __name__ == "__main__":

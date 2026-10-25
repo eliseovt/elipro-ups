@@ -12,6 +12,7 @@ from logging.handlers import RotatingFileHandler
 import os
 import secrets
 import subprocess
+import sys
 import threading
 import tempfile
 import time
@@ -2027,7 +2028,9 @@ def _run_owned_monitor(args, ownership, *, stop_event=None, ready_callback=None)
         server.monitor = monitor
         server.session_broker = notifier if getattr(args, "headless", False) else None
         def mark_exit_requested():
-            ownership.user_exit_requested = True
+            if ownership.user_exit_requested is not True:
+                ownership.user_exit_requested = True
+                LOGGER.info("Salida de Elipro solicitada por el usuario.")
             monitor.stop_event.set()
         def request_exit():
             mark_exit_requested()
@@ -2056,6 +2059,8 @@ def _run_owned_monitor(args, ownership, *, stop_event=None, ready_callback=None)
             threading.Thread(target=wait_for_service_stop, name="elipro-service-stop", daemon=True).start()
         if ready_callback is not None:
             ready_callback(monitor)
+        LOGGER.info("Monitor iniciado (version=%s, runtime_mode=%s, source=%s, port=%d, dry_run=%s).",
+                    __version__, monitor.runtime_mode, args.source, args.port, args.dry_run)
         print(f"Elipro UPS disponible en http://127.0.0.1:{args.port}", flush=True)
         print("Protección automática: " + ("activada" if monitor.engine.policy["enabled"] else "desactivada"), flush=True)
         server.serve_forever(poll_interval=0.5)
@@ -2070,22 +2075,30 @@ def _run_owned_monitor(args, ownership, *, stop_event=None, ready_callback=None)
             if monitor is not None:
                 monitor.stop()
         finally:
-            if server is not None:
-                server.server_close()
-            if alerts is not None:
-                alerts.stop()
-            reader_stopped = monitor is None or monitor.thread is None or not monitor.thread.is_alive()
-            supervisor = getattr(monitor, "supervisor_thread", None)
-            reader_stopped = reader_stopped and (supervisor is None or not supervisor.is_alive())
-            processor = getattr(monitor, "processor_thread", None)
-            reader_stopped = reader_stopped and (processor is None or not processor.is_alive())
-            if not reader_stopped:
-                safe_to_release = False
-            elif store is not None:
-                safe_to_release = store.close() is not False
-            if log_handler is not None:
-                LOGGER.removeHandler(log_handler)
-                log_handler.close()
+            try:
+                if server is not None:
+                    server.server_close()
+                if alerts is not None:
+                    alerts.stop()
+                reader_stopped = monitor is None or monitor.thread is None or not monitor.thread.is_alive()
+                supervisor = getattr(monitor, "supervisor_thread", None)
+                reader_stopped = reader_stopped and (supervisor is None or not supervisor.is_alive())
+                processor = getattr(monitor, "processor_thread", None)
+                reader_stopped = reader_stopped and (processor is None or not processor.is_alive())
+                if not reader_stopped:
+                    safe_to_release = False
+                elif store is not None:
+                    safe_to_release = store.close() is not False
+            finally:
+                error_type = sys.exc_info()[0]
+                reason = ("user_requested" if ownership.user_exit_requested is True else
+                          "windows_stop" if stop_event is not None and stop_event.is_set() else
+                          "error" if error_type is not None else "server_return")
+                LOGGER.info("Monitor finalizado (reason=%s, error_type=%s).",
+                            reason, error_type.__name__ if error_type is not None else "none")
+                if log_handler is not None:
+                    LOGGER.removeHandler(log_handler)
+                    log_handler.close()
             # If a worker cannot finish, keep ownership until process exit;
             # Windows then releases its handle, including after a crash.
             if safe_to_release:

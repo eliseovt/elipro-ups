@@ -4,7 +4,7 @@ import json
 from email.message import Message
 from pathlib import Path
 from types import SimpleNamespace
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 import unittest
 from unittest.mock import MagicMock, Mock, patch
 
@@ -189,6 +189,26 @@ class AgentTests(unittest.TestCase):
                 notifier.exit_callback()
                 self.assertTrue(agent.stop_event.is_set())
 
+    def test_agent_exit_warning_remains_available_after_service_loss(self):
+        for session, expected_available in (("active", True), ("locked", False), ("unknown", False)):
+            with self.subTest(session=session):
+                client = Mock()
+                client.stop_monitor.side_effect = OSError("No se confirmó el cierre")
+                notifier = WindowsNotifier("http://127.0.0.1:8765")
+                notifier._set_ready(True)
+                agent = Agent(client, notifier, session_state=lambda: session)
+                # A later failed poll invalidates broker delivery after the
+                # one-time service-loss warning has already been reported.
+                notifier.set_session_available(False)
+                agent.exit()
+                self.assertFalse(agent.stop_event.is_set())
+                self.assertIs(notifier.status()["session_available"], expected_available)
+                self.assertEqual(notifier._queue.qsize(), int(expected_available))
+                if expected_available:
+                    warning = notifier._queue.get_nowait()
+                    self.assertIn("No se confirmó el cierre", warning[1])
+                    self.assertEqual(warning[2], "warning")
+
     def test_installed_agent_uses_shared_exit_label_and_confirmation(self):
         notifier = WindowsNotifier("http://127.0.0.1:8765")
         kernel, ownership = Mock(), Mock()
@@ -229,6 +249,73 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(requests[1].headers["X-ups-token"], "a" * 40)
         self.assertEqual(requests[1].headers["Origin"], "http://127.0.0.1:8765")
         self.assertEqual(json.loads(requests[1].data), {})
+
+    def test_client_transport_failure_accepts_only_confirmed_stopped_service(self):
+        for state in ("stopped", "absent", "running", "start_pending", "stop_pending", "unknown", None):
+            for authenticated in (True, False):
+                with self.subTest(state=state, authenticated=authenticated):
+                    client = LocalClient()
+                    if authenticated:
+                        client.token = "a" * 40
+                    error = URLError(ConnectionRefusedError(10061, "Connection refused"))
+                    with patch.object(client, "_request", side_effect=error) as request, \
+                            patch("ups_monitor.windows_service.manage", return_value={"state": state}) as manage:
+                        if state in ("stopped", "absent"):
+                            self.assertEqual(client.stop_monitor(), {"stopped": True})
+                        else:
+                            with self.assertRaises(URLError) as result:
+                                client.stop_monitor()
+                            self.assertIs(result.exception, error)
+                    manage.assert_called_once_with("status")
+                    if authenticated:
+                        request.assert_called_once_with("/api/service/stop", {})
+                    else:
+                        request.assert_called_once_with("/api/status")
+
+    def test_client_transport_failure_keeps_original_error_when_service_state_is_unavailable(self):
+        for status_error in (OSError("SCM unavailable"), RuntimeError("Unknown service"), ValueError("Bad state")):
+            with self.subTest(status_error=status_error):
+                client = LocalClient()
+                client.token = "a" * 40
+                error = TimeoutError("Local request timed out")
+                with patch.object(client, "_request", side_effect=error), \
+                        patch("ups_monitor.windows_service.manage", side_effect=status_error) as manage:
+                    with self.assertRaises(TimeoutError) as result:
+                        client.stop_monitor()
+                self.assertIs(result.exception, error)
+                manage.assert_called_once_with("status")
+
+    def test_client_explicit_stop_refusal_never_falls_back_to_service_state(self):
+        for body in (b'{"error":"La prueba del UPS sigue pendiente"}', b"not json"):
+            with self.subTest(body=body):
+                client = LocalClient()
+                client.token = "a" * 40
+                error = HTTPError(client.url, 400, "Bad Request", {}, io.BytesIO(body))
+                with patch.object(client, "_request", side_effect=error), \
+                        patch("ups_monitor.windows_service.manage", return_value={"state": "stopped"}) as manage:
+                    with self.assertRaises(ValueError):
+                        client.stop_monitor()
+                manage.assert_not_called()
+        client = LocalClient()
+        error = HTTPError(client.url, 503, "Service unavailable", {}, io.BytesIO(b"unavailable"))
+        try:
+            with patch.object(client, "_request", side_effect=error), \
+                    patch("ups_monitor.windows_service.manage", return_value={"state": "stopped"}) as manage:
+                with self.assertRaises(HTTPError) as result:
+                    client.stop_monitor()
+            self.assertIs(result.exception, error)
+            manage.assert_not_called()
+        finally:
+            error.close()
+
+    def test_client_unconfirmed_stop_response_never_falls_back_to_service_state(self):
+        client = LocalClient()
+        client.token = "a" * 40
+        with patch.object(client, "_request", return_value={"stopped": False}), \
+                patch("ups_monitor.windows_service.manage", return_value={"state": "stopped"}) as manage:
+            with self.assertRaisesRegex(ValueError, "no confirmó"):
+                client.stop_monitor()
+        manage.assert_not_called()
 
     def test_client_stop_requires_explicit_boolean_service_confirmation(self):
         client = LocalClient()

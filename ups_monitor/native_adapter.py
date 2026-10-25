@@ -14,6 +14,7 @@ from .battery_estimation import Nt2402ProBatteryEstimator
 from .hid_windows import StatusTransport, enumerate_ups_bounded as enumerate_ups
 from .qs_protocol import parse_qs
 from .windows_udp import UdpPortReason, udp_port_occupancy
+from .windows_process import browser_only_owners
 
 
 class ForzaProbeReason(str, Enum):
@@ -26,6 +27,7 @@ class ForzaProbeReason(str, Enum):
     SOCKET_ERROR = "socket_error"
     ENDPOINT_TABLE_EMPTY = "endpoint_table_empty"
     ENDPOINT_OCCUPIED = "endpoint_occupied"
+    ENDPOINT_BROWSER_ONLY = "endpoint_browser_only"
     ENDPOINT_API_UNAVAILABLE = "endpoint_api_unavailable"
     ENDPOINT_API_ERROR = "endpoint_api_error"
     ENDPOINT_INVALID_TABLE = "endpoint_invalid_table"
@@ -111,7 +113,10 @@ def probe_forza_monitor():
     reply = _probe_forza_reply()
     if reply.state == "active":
         return replace(reply, pids=ownership.pids)
-    # A timeout/closed port/error can never override a bound Windows endpoint.
+    if browser_only_owners(ownership.pids, udp_port_occupancy):
+        return ForzaProbeResult("absent", ForzaProbeReason.ENDPOINT_BROWSER_ONLY,
+                                pids=ownership.pids, reply_reason=reply.reason)
+    # UDP silence alone can never override a bound Windows endpoint.
     return ForzaProbeResult("unknown", ForzaProbeReason.ENDPOINT_OCCUPIED,
                              winerror=reply.winerror, errno=reply.errno,
                              pids=ownership.pids, reply_reason=reply.reason)
