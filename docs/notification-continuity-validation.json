@@ -1,0 +1,406 @@
+[
+  {
+    "theme": "light",
+    "dpi": 120,
+    "scenes": [
+      {
+        "scene": "fresh",
+        "time": 100.0,
+        "rectangle": [
+          1940,
+          864,
+          2540,
+          1360
+        ],
+        "size": [
+          600,
+          496
+        ],
+        "title": "Hibernación programada",
+        "body": "Guarda tu trabajo antes de que termine la cuenta.",
+        "footer": "Entendido no cancela la protección.",
+        "clock": "01:00",
+        "badge": "URGENTE",
+        "label": "Tiempo restante",
+        "cancel_enabled": true,
+        "parent_repositions": 0,
+        "metadata": {
+          "title": "Protección",
+          "message": "Aviso simulado para revisión visual",
+          "priority": 3,
+          "severity": "critical",
+          "sound": false,
+          "confirmed": true,
+          "confirmed_for_ms": 3000,
+          "countdown": {
+            "countdown_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "action": "hibernate",
+            "remaining_seconds": 60,
+            "valid_for_ms": 3000,
+            "cancelable": true
+          }
+        },
+        "last_error": null
+      },
+      {
+        "scene": "pending",
+        "time": 103.2,
+        "rectangle": [
+          1940,
+          864,
+          2540,
+          1360
+        ],
+        "size": [
+          600,
+          496
+        ],
+        "title": "Hibernación programada",
+        "body": "Guarda tu trabajo antes de que termine la cuenta.",
+        "footer": "Entendido no cancela la protección.",
+        "clock": "00:57",
+        "badge": "ACTUALIZANDO",
+        "label": "Tiempo estimado",
+        "cancel_enabled": false,
+        "parent_repositions": 0,
+        "metadata": {
+          "title": "Protección",
+          "message": "Aviso simulado para revisión visual",
+          "priority": 1,
+          "severity": "critical",
+          "sound": false,
+          "confirmed": false,
+          "confirmed_for_ms": 0,
+          "countdown": {
+            "countdown_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "action": "hibernate",
+            "remaining_seconds": 56.8,
+            "valid_for_ms": 0,
+            "cancelable": false,
+            "refresh_pending": true
+          }
+        },
+        "last_error": null
+      },
+      {
+        "scene": "recovered",
+        "time": 104.0,
+        "rectangle": [
+          1940,
+          864,
+          2540,
+          1360
+        ],
+        "size": [
+          600,
+          496
+        ],
+        "title": "Hibernación programada",
+        "body": "Guarda tu trabajo antes de que termine la cuenta.",
+        "footer": "Entendido no cancela la protección.",
+        "clock": "00:56",
+        "badge": "URGENTE",
+        "label": "Tiempo restante",
+        "cancel_enabled": true,
+        "parent_repositions": 0,
+        "metadata": {
+          "title": "Protección",
+          "message": "Aviso simulado para revisión visual",
+          "priority": 3,
+          "severity": "critical",
+          "sound": false,
+          "confirmed": true,
+          "confirmed_for_ms": 3000,
+          "countdown": {
+            "countdown_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "action": "hibernate",
+            "remaining_seconds": 56,
+            "valid_for_ms": 3000,
+            "cancelable": true
+          }
+        },
+        "last_error": null
+      },
+      {
+        "scene": "interrupted",
+        "time": 111.1,
+        "rectangle": [
+          1940,
+          839,
+          2540,
+          1360
+        ],
+        "size": [
+          600,
+          521
+        ],
+        "title": "Actualización interrumpida",
+        "body": "El monitor no ha actualizado la cuenta. Abre Elipro para comprobar el estado.",
+        "footer": "Entendido no cancela la protección.",
+        "clock": "—:—",
+        "badge": "SIN DATOS RECIENTES",
+        "label": "Último estado",
+        "cancel_enabled": false,
+        "parent_repositions": 1,
+        "metadata": {
+          "title": "Protección",
+          "message": "Aviso simulado para revisión visual",
+          "priority": 1,
+          "severity": "critical",
+          "sound": false,
+          "confirmed": false,
+          "confirmed_for_ms": 0,
+          "countdown": {
+            "countdown_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "action": "hibernate",
+            "remaining_seconds": 48.900000000000006,
+            "valid_for_ms": 0,
+            "cancelable": false
+          }
+        },
+        "last_error": null
+      },
+      {
+        "scene": "zero",
+        "time": 160.1,
+        "rectangle": [
+          1940,
+          839,
+          2540,
+          1360
+        ],
+        "size": [
+          600,
+          521
+        ],
+        "title": "Esperando confirmación",
+        "body": "La cuenta llegó a cero. Esperando confirmación del monitor sobre el resultado.",
+        "footer": "Entendido no cancela la protección.",
+        "clock": "00:00",
+        "badge": "CONFIRMANDO",
+        "label": "Cuenta finalizada",
+        "cancel_enabled": false,
+        "parent_repositions": 0,
+        "metadata": {
+          "title": "Protección",
+          "message": "Aviso simulado para revisión visual",
+          "priority": 1,
+          "severity": "critical",
+          "sound": false,
+          "confirmed": false,
+          "confirmed_for_ms": 0,
+          "countdown": {
+            "countdown_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "action": "hibernate",
+            "remaining_seconds": 0,
+            "valid_for_ms": 0,
+            "cancelable": false
+          }
+        },
+        "last_error": null
+      }
+    ]
+  },
+  {
+    "theme": "dark",
+    "dpi": 120,
+    "scenes": [
+      {
+        "scene": "fresh",
+        "time": 100.0,
+        "rectangle": [
+          1940,
+          864,
+          2540,
+          1360
+        ],
+        "size": [
+          600,
+          496
+        ],
+        "title": "Hibernación programada",
+        "body": "Guarda tu trabajo antes de que termine la cuenta.",
+        "footer": "Entendido no cancela la protección.",
+        "clock": "01:00",
+        "badge": "URGENTE",
+        "label": "Tiempo restante",
+        "cancel_enabled": true,
+        "parent_repositions": 0,
+        "metadata": {
+          "title": "Protección",
+          "message": "Aviso simulado para revisión visual",
+          "priority": 3,
+          "severity": "critical",
+          "sound": false,
+          "confirmed": true,
+          "confirmed_for_ms": 3000,
+          "countdown": {
+            "countdown_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "action": "hibernate",
+            "remaining_seconds": 60,
+            "valid_for_ms": 3000,
+            "cancelable": true
+          }
+        },
+        "last_error": null
+      },
+      {
+        "scene": "pending",
+        "time": 103.2,
+        "rectangle": [
+          1940,
+          864,
+          2540,
+          1360
+        ],
+        "size": [
+          600,
+          496
+        ],
+        "title": "Hibernación programada",
+        "body": "Guarda tu trabajo antes de que termine la cuenta.",
+        "footer": "Entendido no cancela la protección.",
+        "clock": "00:57",
+        "badge": "ACTUALIZANDO",
+        "label": "Tiempo estimado",
+        "cancel_enabled": false,
+        "parent_repositions": 0,
+        "metadata": {
+          "title": "Protección",
+          "message": "Aviso simulado para revisión visual",
+          "priority": 1,
+          "severity": "critical",
+          "sound": false,
+          "confirmed": false,
+          "confirmed_for_ms": 0,
+          "countdown": {
+            "countdown_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "action": "hibernate",
+            "remaining_seconds": 56.8,
+            "valid_for_ms": 0,
+            "cancelable": false,
+            "refresh_pending": true
+          }
+        },
+        "last_error": null
+      },
+      {
+        "scene": "recovered",
+        "time": 104.0,
+        "rectangle": [
+          1940,
+          864,
+          2540,
+          1360
+        ],
+        "size": [
+          600,
+          496
+        ],
+        "title": "Hibernación programada",
+        "body": "Guarda tu trabajo antes de que termine la cuenta.",
+        "footer": "Entendido no cancela la protección.",
+        "clock": "00:56",
+        "badge": "URGENTE",
+        "label": "Tiempo restante",
+        "cancel_enabled": true,
+        "parent_repositions": 0,
+        "metadata": {
+          "title": "Protección",
+          "message": "Aviso simulado para revisión visual",
+          "priority": 3,
+          "severity": "critical",
+          "sound": false,
+          "confirmed": true,
+          "confirmed_for_ms": 3000,
+          "countdown": {
+            "countdown_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "action": "hibernate",
+            "remaining_seconds": 56,
+            "valid_for_ms": 3000,
+            "cancelable": true
+          }
+        },
+        "last_error": null
+      },
+      {
+        "scene": "interrupted",
+        "time": 111.1,
+        "rectangle": [
+          1940,
+          839,
+          2540,
+          1360
+        ],
+        "size": [
+          600,
+          521
+        ],
+        "title": "Actualización interrumpida",
+        "body": "El monitor no ha actualizado la cuenta. Abre Elipro para comprobar el estado.",
+        "footer": "Entendido no cancela la protección.",
+        "clock": "—:—",
+        "badge": "SIN DATOS RECIENTES",
+        "label": "Último estado",
+        "cancel_enabled": false,
+        "parent_repositions": 1,
+        "metadata": {
+          "title": "Protección",
+          "message": "Aviso simulado para revisión visual",
+          "priority": 1,
+          "severity": "critical",
+          "sound": false,
+          "confirmed": false,
+          "confirmed_for_ms": 0,
+          "countdown": {
+            "countdown_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "action": "hibernate",
+            "remaining_seconds": 48.900000000000006,
+            "valid_for_ms": 0,
+            "cancelable": false
+          }
+        },
+        "last_error": null
+      },
+      {
+        "scene": "zero",
+        "time": 160.1,
+        "rectangle": [
+          1940,
+          839,
+          2540,
+          1360
+        ],
+        "size": [
+          600,
+          521
+        ],
+        "title": "Esperando confirmación",
+        "body": "La cuenta llegó a cero. Esperando confirmación del monitor sobre el resultado.",
+        "footer": "Entendido no cancela la protección.",
+        "clock": "00:00",
+        "badge": "CONFIRMANDO",
+        "label": "Cuenta finalizada",
+        "cancel_enabled": false,
+        "parent_repositions": 0,
+        "metadata": {
+          "title": "Protección",
+          "message": "Aviso simulado para revisión visual",
+          "priority": 1,
+          "severity": "critical",
+          "sound": false,
+          "confirmed": false,
+          "confirmed_for_ms": 0,
+          "countdown": {
+            "countdown_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "action": "hibernate",
+            "remaining_seconds": 0,
+            "valid_for_ms": 0,
+            "cancelable": false
+          }
+        },
+        "last_error": null
+      }
+    ]
+  }
+]

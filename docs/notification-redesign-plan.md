@@ -75,3 +75,17 @@ La corrección limita los repintados al contador y los píxeles de progreso que 
 - Informe verificable: [notification-countdown-validation.json](notification-countdown-validation.json). Harness y capturas completas locales: `.test-data/notification-smoothness/`. Estos avisos usan datos simulados y no ejecutan el monitor ni acciones sobre el UPS o Windows.
 
 ![Captura animada de la ventana nativa con el contador estable](assets/screenshots/elipro-cuenta-fluida.gif)
+
+## Continuidad del aviso en 0.9.24
+
+El antiguo «Estado sin confirmar» mezclaba datos momentáneamente caducados con el resultado pendiente de una acción. La autorización del aviso dura tres segundos desde la observación, pero la lectura USB tiene una pausa de dos segundos después de consultar el equipo. La publicación del supervisor y el sondeo del agente añaden sus propios desfases. Se reprodujo una lectura nueva en 2,4 s que el motor ya conocía mientras el escritorio conservaba una publicación anterior: a 3,2 s el aviso había caducado y a 3,9 s volvía a confirmado, sin pérdida de comunicación.
+
+La lectura válida y las invalidaciones se publican ahora al procesarlas, antes de persistirlas; el supervisor mantiene su función de vigilancia. En el escritorio, una cuenta previamente confirmada puede conservar su título y la proyección del mismo plazo durante un máximo de cuatro segundos adicionales a su última vigencia. Se rotula **Actualizando / Tiempo estimado** y no renueva confirmación, prioridad, plazo ni permiso de cancelación. Los snapshots caducados no prolongan esa continuidad. Cancelar exige tanto la vigencia de la cuenta como la confirmación vigente; los episodios nuevos, la retirada del aviso y la pérdida de sesión eliminan la continuidad anterior.
+
+Una interrupción que supera ese margen muestra **Actualización interrumpida / Sin datos recientes**. Llegar a cero muestra **Esperando confirmación / Cuenta finalizada**; no afirma que Windows haya terminado su acción. La cadencia USB, el intervalo del agente, la validez de tres segundos y las decisiones de energía permanecen intactos.
+
+- **1059 pruebas Python aprobadas**, incluyendo publicación inmediata, la cadena completa con relojes simulados, snapshots retrasados, caducidad sostenida, episodios nuevos y rechazo de cancelaciones caducadas.
+- **Diez capturas nativas a 120 DPI**, cinco estados por tema: cuenta vigente, actualización breve, recuperación, interrupción sostenida y cero. La cuenta vigente, estimada y recuperada conserva título, cuerpo, pie y rectángulo de **600 × 496**; no hay reposicionamientos ni reinicio del plazo. La cancelación se deshabilita mientras falta confirmación y se recupera con datos recientes.
+- Informe: [notification-continuity-validation.json](notification-continuity-validation.json). Harness y capturas locales: `.test-data/countdown-continuity/`. Son ventanas con datos simulados, sin iniciar el monitor ni ejecutar acciones de energía.
+
+![Cuenta estimada durante una actualización breve](assets/screenshots/elipro-cuenta-actualizando.png)

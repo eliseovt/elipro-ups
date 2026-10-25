@@ -1048,6 +1048,7 @@ class Monitor:
         # can associate its suspension with the actual communication failure.
         # The independent action gate above already blocks operating-system work.
         self.engine.evaluate(None)
+        self._update_alerts()
 
     def _check_health(self):
         if not self.stop_event.is_set() and self._sync_power_state():
@@ -1251,6 +1252,7 @@ class Monitor:
                 # A result superseded while waiting for this lock cannot reset
                 # manual cancellation or finish a protected deadline.
                 self.engine.evaluate(None)
+                self._update_alerts()
                 return
             if not self._fresh_sample(sample):
                 if self.system_power_status()["state"] == "resuming":
@@ -1329,6 +1331,10 @@ class Monitor:
                             self.ups_power_status()["operation"].get("state") in ("submitted", "armed", "uncertain"))
             if not own_shutdown and self._read_generation_current(power_generation):
                 self.engine.evaluate(sample)
+                # Publish the observation immediately, before persistence can
+                # delay it. The supervisor is a watchdog, not the telemetry
+                # clock for the desktop countdown.
+                self._update_alerts()
             if (time.monotonic() - self.last_saved >= 10 or changed) and sample["timestamp"] != self.last_saved_timestamp:
                 try:
                     self.store.add_sample(sample)

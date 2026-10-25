@@ -236,9 +236,10 @@ class PopupPresentationTests(unittest.TestCase):
         invalidations = self.prepare_countdown()
         self.assertTrue(self.view.set_content("Protección", "No se confirma el estado.",
             countdown=self.countdown(remaining_seconds=29, valid_for_ms=0)))
-        self.assertEqual(self.view.texts["title"], "Estado sin confirmar")
+        self.assertEqual(self.view.texts["title"], "Actualización interrumpida")
         self.assertEqual(self.view.texts["countdown"], "—:—")
-        self.assertEqual(self.view.texts["badge"], "SIN CONFIRMAR")
+        self.assertEqual(self.view.texts["badge"], "SIN DATOS RECIENTES")
+        self.assertEqual(self.view.texts["countdown_label"], "Último estado")
         self.assertTrue(any(hwnd == self.backend.popup_hwnd and rectangle is None
                             for hwnd, rectangle, _erase in invalidations))
 
@@ -421,10 +422,79 @@ class PopupPresentationTests(unittest.TestCase):
 
     def test_expired_countdown_shows_uncertainty_instead_of_claiming_completion(self):
         self.view.set_content("Protección", "No se confirma el estado.", countdown=self.countdown(valid_for_ms=0))
-        self.assertEqual(self.view.texts["title"], "Estado sin confirmar")
-        self.assertEqual(self.view.texts["badge"], "SIN CONFIRMAR")
+        self.assertEqual(self.view.texts["title"], "Actualización interrumpida")
+        self.assertEqual(self.view.texts["badge"], "SIN DATOS RECIENTES")
         self.assertEqual(self.view.texts["countdown"], "—:—")
+        self.assertEqual(self.view.texts["countdown_label"], "Último estado")
         self.assertIn("no cancela la protección", self.view.texts["footer"])
+
+    def test_brief_refresh_gap_preserves_countdown_identity_and_layout(self):
+        message = "Guarda tu trabajo antes de que termine la cuenta."
+        footer = "Entendido no cancela la protección."
+        self.view.set_content("Protección", message, countdown=self.countdown(), footer=footer)
+        original_height = self.view.layout(True)
+        original_bounds = dict(self.view.bounds)
+        invalidations = self.capture_invalidations()
+        self.user.SetWindowTextW.reset_mock()
+        self.user.SetWindowPos.reset_mock()
+        self.assertTrue(self.view.set_content("Protección", message,
+            countdown=self.countdown(remaining_seconds=29.5, valid_for_ms=0, refresh_pending=True), footer=footer))
+        self.assertEqual(self.view.texts["title"], "Hibernación programada")
+        self.assertEqual(self.view.texts["badge"], "ACTUALIZANDO")
+        self.assertEqual(self.view.texts["countdown_label"], "Tiempo estimado")
+        self.assertEqual(self.view.texts["countdown"], "00:30")
+        self.assertEqual(self.view.texts["body"], message)
+        self.assertEqual(self.view.texts["footer"], footer)
+        self.assertFalse(self.view.layout_dirty)
+        self.assertEqual(self.view.layout(True), original_height)
+        self.assertEqual(self.view.bounds, original_bounds)
+        self.user.SetWindowPos.assert_not_called()
+        self.assertTrue(invalidations)
+        self.assertFalse(any(hwnd == self.backend.popup_hwnd and rectangle is None
+                             for hwnd, rectangle, _erase in invalidations))
+        self.assertGreater(self.view._progress_pixels(), 0)
+        changed_handles = {call.args[0] for call in self.user.SetWindowTextW.call_args_list}
+        self.assertEqual(changed_handles, {self.view.controls["badge"], self.view.controls["countdown_label"]})
+
+    def test_fresh_confirmation_restores_labels_without_recreating_countdown(self):
+        message = "Guarda tu trabajo antes de que termine la cuenta."
+        footer = "Entendido no cancela la protección."
+        self.view.set_content("Protección", message, countdown=self.countdown(), footer=footer)
+        height = self.view.layout(True)
+        controls = dict(self.view.controls)
+        self.view.set_content("Protección", message,
+            countdown=self.countdown(remaining_seconds=27, valid_for_ms=0, refresh_pending=True), footer=footer)
+        self.user.SetWindowPos.reset_mock()
+        self.view.set_content("Protección", message,
+            countdown=self.countdown(remaining_seconds=26.9, valid_for_ms=3000), footer=footer)
+        self.assertEqual(self.view.texts["badge"], "URGENTE")
+        self.assertEqual(self.view.texts["countdown_label"], "Tiempo restante")
+        self.assertEqual(self.view.texts["countdown"], "00:27")
+        self.assertEqual(self.view.texts["title"], "Hibernación programada")
+        self.assertEqual(self.view.controls, controls)
+        self.assertEqual(self.view._countdown_total, 30)
+        self.assertFalse(self.view.layout_dirty)
+        self.assertEqual(self.view.layout(True), height)
+        self.user.SetWindowPos.assert_not_called()
+
+    def test_zero_is_waiting_for_confirmation_even_if_refresh_pending(self):
+        self.view.set_content("Protección", "La cuenta terminó.",
+            countdown=self.countdown(remaining_seconds=0, valid_for_ms=0, refresh_pending=True))
+        self.assertEqual(self.view.texts["title"], "Esperando confirmación")
+        self.assertEqual(self.view.texts["badge"], "CONFIRMANDO")
+        self.assertEqual(self.view.texts["countdown"], "00:00")
+        self.assertEqual(self.view.texts["countdown_label"], "Cuenta finalizada")
+        self.assertNotIn("completada", self.view.texts["title"])
+        self.assertNotIn("hibernada", self.view.texts["title"])
+
+    def test_shutdown_refresh_gap_keeps_shutdown_heading(self):
+        self.view.set_content("Protección", "Guarda tu trabajo antes de que termine la cuenta.",
+            countdown=self.countdown(action="shutdown", remaining_seconds=125, valid_for_ms=0,
+                                     refresh_pending=True), footer="Entendido no cancela la protección.")
+        self.assertEqual(self.view.texts["title"], "Apagado programado")
+        self.assertEqual(self.view.texts["countdown"], "02:05")
+        self.assertEqual(self.view.texts["countdown_label"], "Tiempo estimado")
+        self.assertEqual(self.view.texts["badge"], "ACTUALIZANDO")
 
     def test_long_message_is_constrained_without_hiding_actions(self):
         message = "El monitor no pudo confirmar la cancelación de la protección. " * 16

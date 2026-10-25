@@ -27,7 +27,7 @@ import webbrowser
 
 from .runtime import resource_root
 from .notification_priority import age_notice_metadata, normalize_notice_metadata
-from .notification_popup import PopupView
+from .notification_popup import PopupView, countdown_presentation
 
 
 WM_CLOSE = 0x0010
@@ -66,6 +66,7 @@ DEFAULT_EXIT_MESSAGE = (
     "Windows seguirá encendido. ¿Quieres salir de Elipro?"
 )
 DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = -4
+COUNTDOWN_REFRESH_GRACE_SECONDS = 4
 
 # Fixed-width Windows scalar types also permit import on Unix for test discovery.
 DWORD = ctypes.c_uint32
@@ -640,18 +641,17 @@ class _Win32Backend:
     def _update_persistent_contents(self, notice, *, reposition=True):
         title, message = notice["title"], notice["message"]
         countdown = notice.get("countdown")
+        footer = "Entendido confirma la lectura de este aviso."
         self.popup_has_countdown = countdown is not None
         if countdown is not None:
             current = (notice.get("confirmed", True) is True and
                        countdown["valid_for_ms"] > 0 and countdown["remaining_seconds"] > 0)
-            if current:
-                title = "Hibernación programada" if countdown["action"] == "hibernate" else "Apagado programado"
-                message = "Guarda tu trabajo. Puedes cancelar la protección antes de que termine la cuenta."
-                if not countdown["cancelable"]:
-                    message = "Guarda tu trabajo antes de que termine la cuenta. El monitor no permite cancelarla."
-            else:
-                title = "Estado sin confirmar"
-                message = "No se confirma que la protección haya terminado. Abre Elipro para comprobar el estado."
+            if not current:
+                countdown = {**countdown, "valid_for_ms": 0}
+            presentation = countdown_presentation(countdown)
+            title, message, footer = presentation["title"], presentation["message"], presentation["footer"]
+            if current and not countdown["cancelable"]:
+                message += " El monitor no permite cancelarla."
             feedback, inflight = self.owner._countdown_feedback(countdown["countdown_id"])
             if feedback:
                 message += " " + feedback
@@ -660,13 +660,8 @@ class _Win32Backend:
                     bool(current and countdown["cancelable"]
                     and callable(self.owner.cancel_countdown_callback) and not inflight
                     and self.owner._session_currently_available()))
-            if not current:
-                countdown = {**countdown, "valid_for_ms": 0}
         self.popup_view.set_content(_utf16_clip(title, 100), _utf16_clip(message, 400),
-            severity=notice.get("severity", "warning"), countdown=countdown,
-            footer=("Entendido reconoce el aviso; la protección continúa." if current
-                    else "Entendido no cancela la protección.") if countdown is not None
-                   else "Entendido confirma la lectura de este aviso.")
+            severity=notice.get("severity", "warning"), countdown=countdown, footer=footer)
         if reposition:
             work = self._popup_workarea()
             self._layout_popup(self.popup_dpi, work)
@@ -990,6 +985,7 @@ class WindowsNotifier:
         self._persistent_messages = {}
         self._persistent_received = {}
         self._persistent_countdowns = {}
+        self._persistent_confirmations = {}
         self._persistent_sound_at = {}
         self._persistent_dismissed = set()
         self._persistent_versions = {}
@@ -1109,6 +1105,7 @@ class WindowsNotifier:
                 self._session_generation += 1
             self._session_available = available
             if not available:
+                self._persistent_confirmations.clear()
                 # The broker owns deferred alerts and will rebuild their text
                 # on resume. Never replay an old local countdown after unlock.
                 for delivery_id in self._pending_deliveries:
@@ -1252,9 +1249,20 @@ class WindowsNotifier:
                     if previous is not None and previous[0] == countdown["countdown_id"]:
                         deadline = min(previous[1], deadline)
                     self._persistent_countdowns[key] = (countdown["countdown_id"], deadline)
+                    confirmation = self._persistent_confirmations.get(key)
+                    if confirmation is not None and confirmation[0] != countdown["countdown_id"]:
+                        self._persistent_confirmations.pop(key, None)
+                    valid_for_ms = countdown["valid_for_ms"]
+                    if "confirmed_for_ms" in value:
+                        valid_for_ms = min(valid_for_ms, value["confirmed_for_ms"])
+                    if (self._session_available and value.get("confirmed", True) is True
+                            and countdown["remaining_seconds"] > 0 and valid_for_ms > 0):
+                        self._persistent_confirmations[key] = (countdown["countdown_id"], now + valid_for_ms / 1000)
                 else:
                     self._persistent_countdowns.pop(key, None)
+                    self._persistent_confirmations.pop(key, None)
             self._persistent_countdowns = {key: value for key, value in self._persistent_countdowns.items() if key in normalized}
+            self._persistent_confirmations = {key: value for key, value in self._persistent_confirmations.items() if key in normalized}
             self._persistent_messages = normalized
             self._persistent_received = {key: now for key in normalized}
             self._persistent_sound_at = {key: value for key, value in self._persistent_sound_at.items() if key in normalized}
@@ -1293,6 +1301,14 @@ class WindowsNotifier:
                     countdown["cancelable"] = False
                     result["confirmed"] = False
                     result["priority"] = min(result.get("priority", 0), 1)
+            confirmation = self._persistent_confirmations.get(key)
+            if (confirmation is not None and confirmation[0] == countdown["countdown_id"]
+                    and (result.get("confirmed", True) is not True or countdown["valid_for_ms"] <= 0)
+                    and countdown["remaining_seconds"] > 0
+                    and now < confirmation[1] + COUNTDOWN_REFRESH_GRACE_SECONDS):
+                # This local-only presentation hint never renews validity,
+                # authorizes cancellation, or extends the episode deadline.
+                countdown["refresh_pending"] = True
         return result
 
     def _persistent_acknowledged(self, key):
@@ -1357,7 +1373,8 @@ class WindowsNotifier:
             return
         notice = self._persistent_message(key)
         countdown = notice.get("countdown") if notice is not None else None
-        if (not countdown or not countdown["cancelable"] or countdown["remaining_seconds"] <= 0
+        if (not countdown or notice.get("confirmed", True) is not True
+                or not countdown["cancelable"] or countdown["remaining_seconds"] <= 0
                 or countdown["valid_for_ms"] <= 0 or not callable(self.cancel_countdown_callback)):
             return
         countdown_id = countdown["countdown_id"]
@@ -1512,6 +1529,7 @@ class WindowsNotifier:
             self._persistent_messages.clear()
             self._persistent_received.clear()
             self._persistent_countdowns.clear()
+            self._persistent_confirmations.clear()
             self._persistent_sound_at.clear()
             self._persistent_dismissed.clear()
             self._persistent_versions.clear()

@@ -1,7 +1,8 @@
 """Branded Win32 popup presentation, with no protection or delivery decisions.
 
 All HWND/GDI work is performed by the owning notification message-loop thread.
-Icons are borrowed from the backend; fonts, brushes and pens belong to this view.
+The DPI-specific logo, fonts, brushes and pens belong to this view; a fallback
+icon can be borrowed from the backend.
 """
 from __future__ import annotations
 
@@ -95,6 +96,29 @@ def format_countdown(seconds):
         hour, minute = divmod(minutes, 60)
         return f"{hour}:{minute:02d}:{second:02d}"
     return f"{minutes:02d}:{second:02d}"
+
+
+def countdown_presentation(countdown):
+    """Describe the clock separately from permission to cancel an episode."""
+    # refresh_pending is a bounded, local-only hint from WindowsNotifier. It
+    # labels a projection of the last known deadline and never authorizes work.
+    remaining = countdown.get("remaining_seconds", 0)
+    title = "Hibernación programada" if countdown.get("action") == "hibernate" else "Apagado programado"
+    footer = "Entendido no cancela la protección."
+    if remaining <= 0:
+        return {"title": "Esperando confirmación", "badge": "CONFIRMANDO", "clock": "00:00",
+                "label": "Cuenta finalizada", "footer": footer,
+                "message": "La cuenta llegó a cero. Esperando confirmación del monitor sobre el resultado."}
+    current = countdown.get("valid_for_ms", 0) > 0
+    updating = countdown.get("refresh_pending") is True
+    if current or updating:
+        return {"title": title, "badge": "URGENTE" if current else "ACTUALIZANDO",
+                "clock": format_countdown(remaining),
+                "label": "Tiempo restante" if current else "Tiempo estimado", "footer": footer,
+                "message": "Guarda tu trabajo antes de que termine la cuenta."}
+    return {"title": "Actualización interrumpida", "badge": "SIN DATOS RECIENTES", "clock": "—:—",
+            "label": "Último estado", "footer": footer,
+            "message": "El monitor no ha actualizado la cuenta. Abre Elipro para comprobar el estado."}
 
 
 def bind_popup_apis(user, gdi):
@@ -321,7 +345,7 @@ class PopupView:
     def _progress_pixels(self):
         if self.countdown is None or not self.bounds.get("progress") or not self._countdown_total:
             return 0
-        if self.countdown.get("valid_for_ms", 0) <= 0:
+        if self.countdown.get("valid_for_ms", 0) <= 0 and self.countdown.get("refresh_pending") is not True:
             return 0
         remaining = max(0, self.countdown.get("remaining_seconds", 0))
         width = self._rect(self.bounds["progress"])
@@ -336,26 +360,28 @@ class PopupView:
         self.countdown = dict(countdown) if isinstance(countdown, dict) else None
         active = self.countdown is not None
         valid = active and self.countdown.get("valid_for_ms", 0) > 0 and self.countdown.get("remaining_seconds", 0) > 0
+        status_changed = False
         if active:
-            title = ("Hibernación programada" if self.countdown.get("action") == "hibernate" else "Apagado programado") if valid else "Estado sin confirmar"
-            badge = "URGENTE" if valid else "SIN CONFIRMAR"
-            clock = format_countdown(self.countdown.get("remaining_seconds")) if valid else "—:—"
-            clock_changed = self._set_text("countdown", clock)
+            presentation = countdown_presentation(self.countdown)
+            title, badge = presentation["title"], presentation["badge"]
+            clock_changed = self._set_text("countdown", presentation["clock"])
+            status_changed = self._set_text("countdown_label", presentation["label"])
             identifier = self.countdown.get("countdown_id")
-            if valid and (getattr(self, "_countdown_id", None) != identifier or self._countdown_total is None):
+            if (valid or self.countdown.get("refresh_pending") is True) and (
+                    getattr(self, "_countdown_id", None) != identifier or self._countdown_total is None):
                 self._countdown_total = max(1, self.countdown.get("remaining_seconds", 1))
                 self._countdown_id = identifier
         else:
             badge = {"critical": "CRÍTICO", "error": "CRÍTICO", "info": "INFORMACIÓN"}.get(self.severity, "AVISO")
             self._countdown_total = None
         self.title, self.message = str(title), str(message)
-        default_footer = ("Entendido reconoce el aviso; la protección continúa." if valid
-                          else "Entendido no cancela la protección.") if active else "Entendido confirma la lectura de este aviso."
+        default_footer = presentation["footer"] if active else "Entendido confirma la lectura de este aviso."
         self.footer = str(footer or default_footer)
+        status_changed = self._set_text("badge", badge) or status_changed
         structural = previous != (self.title, self.message, self.severity, active, self.footer)
         if structural:
             self.layout_dirty = True
-            for key, value in (("title", self.title), ("body", self.message), ("badge", badge), ("footer", self.footer)):
+            for key, value in (("title", self.title), ("body", self.message), ("footer", self.footer)):
                 self._set_text(key, value)
         for key in ("countdown_label", "countdown", "cancel"):
             if self.controls.get(key) and self._visibility.get(key) != active:
@@ -367,7 +393,7 @@ class PopupView:
         elif progress_changed and self.gdi is not None and self.bounds.get("progress"):
             rectangle = self._rect(self.bounds["progress"])
             self.user.InvalidateRect(self.backend.popup_hwnd, ctypes.byref(rectangle), False)
-        return structural or clock_changed or progress_changed
+        return structural or clock_changed or progress_changed or status_changed
 
     def _measure(self, text, width, role, line_height):
         """DrawText uses the same selected font as its STATIC control."""
