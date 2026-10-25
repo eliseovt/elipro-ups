@@ -124,6 +124,7 @@ Las capturas muestran una configuración de ejemplo; la protección automática 
 
 ### Telemetría, avisos y notificaciones
 
+* **Diseño de avisos (0.9.22):** Las ventanas de escritorio incorporan el logo de Elipro, colores coherentes con el panel, títulos y contador diferenciados, y **Cancelar protección** como acción principal durante una cuenta vigente. **Sistema → Avisos → Tema de las notificaciones** permite elegir **Automático**, **Claro** u **Oscuro**; Automático sigue el tema de Windows. La preferencia se guarda y también llega al agente de sesión del servicio. El [plan de implementación y verificación](docs/notification-redesign-plan.md) documenta el alcance y la entrega manual.
 * **Prioridad de avisos (0.9.21):** Una cuenta regresiva real se muestra antes que las alarmas críticas; estas tienen prioridad sobre cortes y revisiones pendientes. Una alerta más urgente sustituye la ventana visible conservando los demás incidentes. Windows muestra el contador y permite **Cancelar protección** únicamente para la cuenta vigente, con confirmación del monitor. Los datos caducados deshabilitan ese botón; las actualizaciones del contador no repiten el sonido.
 * **Telemetría continua:** Lectura de alimentación de red/batería, voltajes de entrada y salida, frecuencia, carga del UPS, voltaje de batería y señales de batería baja o falla.
 * **Ventana modal global:** Los avisos de condiciones activas se cierran automáticamente cuando el monitor confirma su recuperación. Los avisos de recuperación son temporales y los incidentes se conservan en el historial, sin marcarlos como leídos automáticamente. **Entendido** permite reconocer un aviso activo; las cuentas atrás reales o simuladas mantienen **Cancelar protección** y reconocer un aviso no cancela la actuación. Los resultados que requieren revisión siguen visibles hasta confirmarlos.
@@ -133,7 +134,7 @@ Las capturas muestran una configuración de ejemplo; la protección automática 
 
 ### Historial, Registro y Sistema
 * **Historial con tabla única «Registro»:** Reúne las mediciones en gráfica y una única tabla Registro, conservando sus filtros al navegar. Los eventos recientes permanecen exclusivos en Resumen.
-* **Sistema:** Reúne el funcionamiento del monitor (última lectura, tiempo activo y recursos) y los ajustes de avisos (avisos de escritorio, sonido, persistencia de avisos críticos e intervalo de repetición) sin opciones contraídas.
+* **Sistema:** Reúne el funcionamiento del monitor (última lectura, tiempo activo y recursos) y los ajustes de avisos (avisos de escritorio, sonido, tema de las notificaciones, persistencia de avisos críticos e intervalo de repetición) sin opciones contraídas.
 * **Salida desde el panel o la bandeja:** **Salir de Elipro** está disponible en Sistema y al hacer clic derecho en el ícono de Windows. Tras confirmar, solicita detener el monitor y cierra el agente de avisos; si el servidor rechaza el cierre, el ícono permanece y explica el motivo. Cerrar solamente el navegador mantiene la vigilancia.
 
 ### Webhooks e integraciones externas

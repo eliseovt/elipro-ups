@@ -15,7 +15,6 @@ https://learn.microsoft.com/windows/win32/api/shellapi/nf-shellapi-shqueryuserno
 from __future__ import annotations
 
 import ctypes
-import math
 from collections import OrderedDict, deque
 from ctypes import wintypes
 from datetime import datetime, timezone
@@ -28,11 +27,13 @@ import webbrowser
 
 from .runtime import resource_root
 from .notification_priority import age_notice_metadata, normalize_notice_metadata
+from .notification_popup import PopupView
 
 
 WM_CLOSE = 0x0010
 WM_DESTROY = 0x0002
 WM_SETTINGCHANGE = 0x001A
+WM_THEMECHANGED = 0x031A
 WM_DPICHANGED = 0x02E0
 WM_SETFONT = 0x0030
 WM_COMMAND = 0x0111
@@ -114,6 +115,10 @@ class RECT(ctypes.Structure):
     _fields_ = [("left", LONG), ("top", LONG), ("right", LONG), ("bottom", LONG)]
 
 
+class MONITORINFO(ctypes.Structure):
+    _fields_ = [("cbSize", DWORD), ("rcMonitor", RECT), ("rcWork", RECT), ("dwFlags", DWORD)]
+
+
 class MSG(ctypes.Structure):
     _fields_ = [("hwnd", ctypes.c_void_p), ("message", UINT),
                 ("wParam", WPARAM), ("lParam", LPARAM), ("time", DWORD),
@@ -150,6 +155,7 @@ def _load_apis():
     _bind(user, "GetMessageW", [ctypes.POINTER(MSG), ptr, UINT, UINT], ctypes.c_int)
     _bind(user, "TranslateMessage", [ctypes.POINTER(MSG)], wintypes.BOOL)
     _bind(user, "DispatchMessageW", [ctypes.POINTER(MSG)], LRESULT)
+    _bind(user, "IsDialogMessageW", [ptr, ctypes.POINTER(MSG)], wintypes.BOOL)
     _bind(user, "CreatePopupMenu", [], ptr)
     _bind(user, "AppendMenuW", [ptr, UINT, ctypes.c_size_t, text], wintypes.BOOL)
     _bind(user, "GetCursorPos", [ctypes.POINTER(POINT)], wintypes.BOOL)
@@ -167,6 +173,9 @@ def _load_apis():
     _bind(user, "SetTimer", [ptr, ctypes.c_size_t, UINT, ptr], ctypes.c_size_t)
     _bind(user, "KillTimer", [ptr, ctypes.c_size_t], wintypes.BOOL)
     _bind(user, "SendMessageW", [ptr, UINT, WPARAM, LPARAM], LRESULT)
+    _bind(user, "MonitorFromWindow", [ptr, DWORD], ptr)
+    _bind(user, "GetMonitorInfoW", [ptr, ctypes.POINTER(MONITORINFO)], wintypes.BOOL)
+    _bind(user, "RedrawWindow", [ptr, ptr, ptr, UINT], wintypes.BOOL)
     for name, args, result in (
             ("SetProcessDpiAwarenessContext", [ptr], wintypes.BOOL),
             ("SetProcessDPIAware", [], wintypes.BOOL),
@@ -237,6 +246,13 @@ class _Win32Backend:
         self.popup_cancel = None
         self.popup_dpi = 96
         self.popup_font = None
+        self.popup_view = None
+        self.popup_countdown = None
+        self.popup_badge = None
+        self.popup_has_countdown = False
+        self.popup_width = 480
+        self.popup_height = 360
+        self._popup_theme = None
         self.popup_persistent_key = None
         self.last_notice = None
         self._shown_keys = set()
@@ -353,6 +369,8 @@ class _Win32Backend:
                 return
             if result == -1:
                 raise OSError("Falló el bucle de avisos de Windows")
+            if self.popup_hwnd and self.user.IsDialogMessageW(self.popup_hwnd, ctypes.byref(msg)):
+                continue
             self.user.TranslateMessage(ctypes.byref(msg))
             self.user.DispatchMessageW(ctypes.byref(msg))
 
@@ -381,22 +399,27 @@ class _Win32Backend:
         data.szInfo = _utf16_clip(message, 255)
         data.dwInfoFlags = SEVERITIES[severity][0] | NIIF_NOSOUND
         self.last_notice = {"title": title, "message": message, "requested_at": time.monotonic(),
+                            "severity": severity,
                             "clicked": False, "popup_handled": bool(persistent), "shell_shown": False,
                             "persistent_key": key if persistent else None,
                             "validity_callback": validity_callback}
         accepted = False
         if not current():
             return False
-        if persistent and self.user_notification_code == 5:
-            # An explicitly requested persistent warning uses our single native
-            # window. No balloon is added alongside it, and no second sound is
-            # emitted when its current text is refreshed.
+        if self.user_notification_code == 5:
+            # All notices use the branded window on an available desktop.
+            # Windows still owns delivery policy in quiet/fullscreen states.
+            # Never add a balloon or Shell fallback timer beside our own view.
             self.user.KillTimer(self.hwnd, 2)
-            if not self.owner._persistent_acknowledged(key):
+            if not persistent:
+                accepted = self._show_popup(title, message, validity_callback=validity_callback) is True
+            elif not self.owner._persistent_acknowledged(key):
                 current_notice = self.owner._persistent_message(key)
                 if current_notice is not None:
                     accepted = self._show_popup(current_notice["title"], current_notice["message"], persistent=True, key=key,
                                                 validity_callback=validity_callback) is True
+            if accepted:
+                self.last_notice["popup_handled"] = True
         elif not self.shell.Shell_NotifyIconW(NIM_MODIFY, ctypes.byref(data)):
             self.last_notice = None
             raise OSError("Windows no aceptó el aviso de Elipro")
@@ -404,10 +427,6 @@ class _Win32Backend:
             accepted = True
         if not accepted or not current():
             return False
-        if not persistent and self.user_notification_code == 5 and not self.owner._stop.is_set():
-            self.user.KillTimer(self.hwnd, 2)
-            if not self.user.SetTimer(self.hwnd, 2, 1000, None):
-                self.owner._set_error("No se pudo programar la comprobación visual del aviso")
         if persistent and self.user_notification_code == 5:
             notice = self.owner._persistent_message(key) or {}
             notice.setdefault("severity", severity)
@@ -452,58 +471,79 @@ class _Win32Backend:
         return max(1, round(value * self.popup_dpi / 96))
 
     def _set_popup_font(self):
-        if self.gdi is None:
-            return
-        font = self.gdi.CreateFontW(-self._scale(13), 0, 0, 0, 400, 0, 0, 0, 1, 0, 0, 5, 0, "Segoe UI")
-        if not isinstance(font, int) or not font:
-            return
-        previous, self.popup_font = self.popup_font, font
-        for hwnd in (self.popup_title, self.popup_body, *self.popup_buttons):
-            if hwnd:
-                self.user.SendMessageW(hwnd, WM_SETFONT, font, 1)
-        if previous:
-            self.gdi.DeleteObject(previous)
+        if self.popup_view is not None:
+            self.popup_view.set_fonts()
+            self.popup_font = self.popup_view.fonts.get("body")
 
-    def _layout_popup(self, dpi):
+    def _popup_workarea(self):
+        # Follow the popup's monitor after a user/DPI move. Before first show,
+        # MonitorFromWindow chooses the primary monitor for our hidden owner.
+        monitor = self.user.MonitorFromWindow(self.popup_hwnd or self.hwnd, 2)
+        if isinstance(monitor, int) and monitor:
+            info = MONITORINFO()
+            info.cbSize = ctypes.sizeof(info)
+            if self.user.GetMonitorInfoW(monitor, ctypes.byref(info)):
+                if info.rcWork.right > info.rcWork.left and info.rcWork.bottom > info.rcWork.top:
+                    return info.rcWork
+        work = RECT()
+        if (not self.user.SystemParametersInfoW(0x0030, 0, ctypes.byref(work), 0)
+                or work.right <= work.left or work.bottom <= work.top):
+            raise OSError("No se pudo localizar el área de trabajo para el aviso")
+        return work
+
+    def _apply_popup_theme(self, *, force=False):
+        if self.popup_view is not None:
+            preference = getattr(self.owner, "notification_theme", "auto")
+            preference = preference if preference in ("auto", "light", "dark") else "auto"
+            self.popup_view.apply_theme(preference)
+            if force or preference != self._popup_theme:
+                self.user.RedrawWindow(self.popup_hwnd, None, None, 0x0001 | 0x0004 | 0x0080)
+            self._popup_theme = preference
+
+    def _layout_popup(self, dpi, work=None):
         self.popup_dpi = dpi
-        controls = ((self.popup_title, 16, 14, 386, 32), (self.popup_body, 16, 49, 386, 78))
-        if len(self.popup_buttons) >= 2:
-            controls += ((self.popup_buttons[0], 16, 142, 180, 30),
-                         (self.popup_buttons[1], 212, 142, 190, 30))
-        if self.popup_cancel:
-            controls += ((self.popup_cancel, 16, 182, 386, 30),)
-        for hwnd, x, y, width, height in controls:
-            if hwnd and not self.user.SetWindowPos(hwnd, None, self._scale(x), self._scale(y),
-                                                  self._scale(width), self._scale(height), 0x0010 | 0x0004):
-                raise OSError("Windows no pudo ajustar la escala del aviso")
         self._set_popup_font()
+        if self.popup_view is None:
+            return
+        work = work if work is not None else self._popup_workarea()
+        available_width = (work.right - work.left) * 96 // dpi
+        available_height = (work.bottom - work.top) * 96 // dpi
+        self.popup_width = min(480, max(1, available_width - 32))
+        self.popup_height = self.popup_view.layout(self.popup_has_countdown,
+            width=self.popup_width, max_height=max(1, available_height - 32))
+
+    def _position_popup(self, work=None, *, show=False):
+        work = work if work is not None else self._popup_workarea()
+        width = min(self._scale(self.popup_width), work.right - work.left)
+        height = min(self._scale(self.popup_height), work.bottom - work.top)
+        if not self.user.SetWindowPos(self.popup_hwnd, ctypes.c_void_p(-1),
+                max(work.left, work.right - width - self._scale(16)),
+                max(work.top, work.bottom - height - self._scale(16)), width, height,
+                0x0010 | (0x0040 if show else 0)):
+            raise OSError("Windows no pudo mostrar el aviso de Elipro")
 
     def _create_popup(self):
         # A tool window stays out of the taskbar; NOACTIVATE preserves whichever
         # application the user is working in. The DPI-specific font is owned.
         self.popup_dpi = self._window_dpi(self.hwnd)
         self.popup_hwnd = self.user.CreateWindowExW(
-            0x08000000 | 0x00000080 | 0x00000008, self.class_name, "Aviso de Elipro UPS",
-            0x80000000 | 0x00800000, 0, 0, self._scale(420), self._scale(230), None, None, self.instance, None)
+            0x08000000 | 0x00000080 | 0x00000008 | 0x00010000, self.class_name, "Aviso de Elipro UPS",
+            0x80000000 | 0x00800000 | 0x02000000, 0, 0,
+            self._scale(480), self._scale(360), None, None, self.instance, None)
         if not self.popup_hwnd:
             raise OSError("No se pudo crear el aviso de escritorio de Elipro")
-        child_style = 0x40000000 | 0x10000000
-        self.popup_title = self.user.CreateWindowExW(0, "STATIC", "Elipro UPS",
-            child_style | 0x80, self._scale(16), self._scale(14), self._scale(386), self._scale(32), self.popup_hwnd, None, self.instance, None)
-        self.popup_body = self.user.CreateWindowExW(0, "STATIC", "",
-            child_style | 0x80, self._scale(16), self._scale(49), self._scale(386), self._scale(78), self.popup_hwnd, None, self.instance, None)
-        open_button = self.user.CreateWindowExW(0, "BUTTON", "Abrir Elipro",
-            child_style, self._scale(16), self._scale(142), self._scale(180), self._scale(30), self.popup_hwnd, ctypes.c_void_p(101), self.instance, None)
-        close_button = self.user.CreateWindowExW(0, "BUTTON", "Entendido",
-            child_style, self._scale(212), self._scale(142), self._scale(190), self._scale(30), self.popup_hwnd, ctypes.c_void_p(102), self.instance, None)
-        self.popup_cancel = self.user.CreateWindowExW(0, "BUTTON", "Cancelar protección",
-            0x40000000, self._scale(16), self._scale(182), self._scale(386), self._scale(30),
-            self.popup_hwnd, ctypes.c_void_p(103), self.instance, None)
-        self.popup_buttons = (open_button, close_button, self.popup_cancel)
-        if not all((self.popup_title, self.popup_body, *self.popup_buttons)):
+        try:
+            self.popup_view = PopupView(self)
+            controls = self.popup_view.create_controls()
+            self.popup_title, self.popup_body = controls["title"], controls["body"]
+            self.popup_countdown, self.popup_badge = controls["countdown"], controls["badge"]
+            self.popup_cancel = controls["cancel"]
+            self.popup_buttons = (controls["open"], controls["ack"], self.popup_cancel)
+            self._apply_popup_theme()
+            self._set_popup_font()
+        except Exception:
             self._destroy_popup()
-            raise OSError("No se pudieron crear los controles del aviso de Elipro")
-        self._set_popup_font()
+            raise
 
     def _show_popup(self, title, message, persistent=False, key=None, *, validity_callback=None):
         if self.owner._stop.is_set() or self.owner._session_currently_available() is False:
@@ -519,29 +559,25 @@ class _Win32Backend:
         if not self.popup_hwnd:
             self._create_popup()
         dpi = self._window_dpi(self.popup_hwnd)
-        if dpi != self.popup_dpi:
-            self._layout_popup(dpi)
-        work = RECT()
-        if not self.user.SystemParametersInfoW(0x0030, 0, ctypes.byref(work), 0):  # SPI_GETWORKAREA
-            raise OSError("No se pudo localizar el área de trabajo para el aviso")
-        width, height = min(self._scale(420), work.right - work.left), min(self._scale(230), work.bottom - work.top)
-        if width <= 0 or height <= 0:
-            raise OSError("El área de trabajo para avisos no está disponible")
-        self.user.SetWindowTextW(self.popup_title, "Elipro UPS · " + _utf16_clip(title, 80))
-        self.user.SetWindowTextW(self.popup_body, _utf16_clip(message, 400))
+        self._apply_popup_theme()
+        notice = self.owner._persistent_message(key) if persistent else None
+        if notice is not None:
+            self._update_persistent_contents(notice, reposition=False)
+        else:
+            self.popup_has_countdown = False
+            self.popup_view.set_content(_utf16_clip(title, 100), _utf16_clip(message, 400),
+                severity=(self.last_notice or {}).get("severity", "warning"),
+                footer="Los incidentes se conservan en el historial.")
+        work = self._popup_workarea()
+        self._layout_popup(dpi, work)
         if validity_callback is not None and validity_callback() is not True:
             return False
         # HWND_TOPMOST=-1; SHOWWINDOW | NOACTIVATE. A new warning replaces the
         # previous one and refreshes the same timer rather than stacking windows.
-        if not self.user.SetWindowPos(self.popup_hwnd, ctypes.c_void_p(-1),
-                max(work.left, work.right - width - self._scale(16)), max(work.top, work.bottom - height - self._scale(16)),
-                width, height, 0x0010 | 0x0040):
-            raise OSError("Windows no pudo mostrar el aviso de Elipro")
+        self._position_popup(work, show=True)
         self.popup_persistent_key = key if persistent else None
         self.user.KillTimer(self.popup_hwnd, 1)
         self.user.KillTimer(self.popup_hwnd, 3)
-        if self.popup_cancel:
-            self.user.ShowWindow(self.popup_cancel, 0)
         if not persistent:
             if not self.user.SetTimer(self.popup_hwnd, 1, 12000, None):
                 self._hide_popup()
@@ -553,7 +589,6 @@ class _Win32Backend:
                 # Restoring an earlier incident does not produce another sound.
                 self.owner._persistent_sound_at[key] = time.monotonic()
             self._shown_keys.add(key)
-            self._update_persistent_contents(notice)
             if "priority" in notice:
                 if not self.user.SetTimer(self.popup_hwnd, 3, 1000, None):
                     self._hide_popup()
@@ -569,15 +604,18 @@ class _Win32Backend:
             self.owner._record_popup_event("hidden")
         self.popup_persistent_key = None
 
-    def _update_persistent_contents(self, notice):
+    def _update_persistent_contents(self, notice, *, reposition=True):
         title, message = notice["title"], notice["message"]
         countdown = notice.get("countdown")
+        self.popup_has_countdown = countdown is not None
         if countdown is not None:
-            current = countdown["valid_for_ms"] > 0 and countdown["remaining_seconds"] > 0
+            current = (notice.get("confirmed", True) is True and
+                       countdown["valid_for_ms"] > 0 and countdown["remaining_seconds"] > 0)
             if current:
-                action = "Hibernación" if countdown["action"] == "hibernate" else "Apagado"
-                title = f"URGENTE · {action} en {math.ceil(countdown['remaining_seconds'])} segundos"
-                message = "Guarda tu trabajo. Puedes cancelar esta cuenta antes de que termine."
+                title = "Hibernación programada" if countdown["action"] == "hibernate" else "Apagado programado"
+                message = "Guarda tu trabajo. Puedes cancelar la protección antes de que termine la cuenta."
+                if not countdown["cancelable"]:
+                    message = "Guarda tu trabajo antes de que termine la cuenta. El monitor no permite cancelarla."
             else:
                 title = "Estado sin confirmar"
                 message = "No se confirma que la protección haya terminado. Abre Elipro para comprobar el estado."
@@ -585,15 +623,21 @@ class _Win32Backend:
             if feedback:
                 message += " " + feedback
             if self.popup_cancel:
-                self.user.ShowWindow(self.popup_cancel, 5)
                 self.user.SetWindowTextW(self.popup_cancel, "Cancelando…" if inflight else "Cancelar protección")
                 self.user.EnableWindow(self.popup_cancel, bool(current and countdown["cancelable"]
                     and callable(self.owner.cancel_countdown_callback) and not inflight
                     and self.owner._session_currently_available()))
-        elif self.popup_cancel:
-            self.user.ShowWindow(self.popup_cancel, 0)
-        self.user.SetWindowTextW(self.popup_title, "Elipro UPS · " + _utf16_clip(title, 100))
-        self.user.SetWindowTextW(self.popup_body, _utf16_clip(message, 400))
+            if not current:
+                countdown = {**countdown, "valid_for_ms": 0}
+        self.popup_view.set_content(_utf16_clip(title, 100), _utf16_clip(message, 400),
+            severity=notice.get("severity", "warning"), countdown=countdown,
+            footer=("Entendido reconoce el aviso; la protección continúa." if current
+                    else "Entendido no cancela la protección.") if countdown is not None
+                   else "Entendido confirma la lectura de este aviso.")
+        if reposition:
+            work = self._popup_workarea()
+            self._layout_popup(self.popup_dpi, work)
+            self._position_popup(work)
 
     def sync_persistent(self):
         self._shown_keys.intersection_update(self.owner._persistent_keys())
@@ -640,9 +684,13 @@ class _Win32Backend:
             self.popup_title = self.popup_body = None
             self.popup_buttons = ()
             self.popup_cancel = None
-        if self.popup_font and self.gdi is not None:
-            self.gdi.DeleteObject(self.popup_font)
-            self.popup_font = None
+            self.popup_countdown = self.popup_badge = None
+        if self.popup_view is not None:
+            self.popup_view.close()
+            self.popup_view = None
+        self.popup_font = None
+        self._popup_theme = None
+        self.popup_has_countdown = False
         self.popup_persistent_key = None
 
     def suspend_session(self):
@@ -727,6 +775,12 @@ class _Win32Backend:
     def _window_proc(self, hwnd, message, wparam, lparam):
         try:
             if self.popup_hwnd and hwnd == self.popup_hwnd:
+                if self.popup_view is not None:
+                    painted = self.popup_view.handle_message(message, wparam, lparam)
+                    if painted is not None:
+                        return painted
+                if message == 0x0021:  # WM_MOUSEACTIVATE: user interaction may activate it.
+                    return 1  # MA_ACTIVATE; showing it still never steals focus.
                 if message == WM_DPICHANGED:
                     dpi = wparam & 0xFFFF
                     if not 48 <= dpi <= 768 or not lparam:
@@ -735,10 +789,12 @@ class _Win32Backend:
                     width, height = suggested.right - suggested.left, suggested.bottom - suggested.top
                     if width <= 0 or height <= 0:
                         return 0
-                    self._layout_popup(dpi)
                     if not self.user.SetWindowPos(hwnd, ctypes.c_void_p(-1), suggested.left,
                                                   suggested.top, width, height, 0x0010 | 0x0004):
                         raise OSError("Windows no pudo aplicar el cambio de DPI del aviso")
+                    work = self._popup_workarea()
+                    self._layout_popup(dpi, work)
+                    self._position_popup(work)
                     return 0
                 if message == WM_COMMAND:
                     command = wparam & 0xFFFF
@@ -782,10 +838,12 @@ class _Win32Backend:
             if message == WM_TIMER and wparam == 2:
                 self._check_unconfirmed_popup()
                 return 0
-            if message == WM_SETTINGCHANGE:
-                self._query_user_notification_state()
-                if self.user_notification_code != 5 and self.popup_persistent_key is not None:
-                    self._hide_popup()
+            if message in (WM_SETTINGCHANGE, WM_THEMECHANGED):
+                self._apply_popup_theme(force=True)
+                if message == WM_SETTINGCHANGE:
+                    self._query_user_notification_state()
+                    if self.user_notification_code != 5 and self.popup_persistent_key is not None:
+                        self._hide_popup()
                 return 0
             if message == WM_APP_TRAY:
                 event = lparam & 0xFFFF  # NOTIFYICON_VERSION_4
@@ -896,6 +954,7 @@ class WindowsNotifier:
         self._persistent_versions = {}
         self._persistent_serial = 0
         self._dpi_status = None
+        self._notification_theme = "auto"
         self._session_available = True
         self._session_generation = 0
         self._session_probe = None
@@ -930,6 +989,23 @@ class WindowsNotifier:
     def _set_dpi_status(self, value):
         with self._lock:
             self._dpi_status = dict(value)
+
+    @property
+    def notification_theme(self):
+        with self._lock:
+            return self._notification_theme
+
+    def set_theme(self, value):
+        """Wake the UI thread; settings/HTTP threads never touch HWNDs or GDI."""
+        if not isinstance(value, str) or value not in ("auto", "light", "dark"):
+            raise ValueError("El tema de los avisos debe ser auto, light o dark")
+        with self._lock:
+            if value == self._notification_theme:
+                return
+            self._notification_theme = value
+            backend = self._backend
+        if backend is not None:
+            backend.wake()
 
     def set_session_probe(self, probe):
         """Install the agent's fresh WTS/desktop probe, called at delivery time."""
@@ -1288,6 +1364,12 @@ class WindowsNotifier:
         threading.Thread(target=request, name="elipro-tray-exit", daemon=True).start()
 
     def _drain(self, backend):
+        apply_theme = getattr(backend, "_apply_popup_theme", None)
+        if callable(apply_theme):
+            try:
+                apply_theme()
+            except Exception as exc:
+                self._set_error(str(exc))
         # Select from the complete current state before a FIFO ticket can steal
         # the desktop or hide a newer, more urgent condition.
         if getattr(backend, "supports_notification_priority", False) is True and self._session_currently_available():
@@ -1371,6 +1453,7 @@ class WindowsNotifier:
                     "persistent_active": len(self._persistent_messages),
                     "persistent_dismissed": len(self._persistent_dismissed),
                     "dpi_awareness": dict(self._dpi_status) if self._dpi_status else None,
+                    "notification_theme": self._notification_theme,
                     "session_available": self._session_available,
                     "pending_deliveries": len(self._pending_deliveries),
                     "delivery_receipts": len(self._delivery_receipts),

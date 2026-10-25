@@ -61,7 +61,14 @@ class SessionBroker:
         self._serial = 0
         self._heartbeat_serial = 0
         self._started = False
+        self._notification_theme = "auto"
         self.cancel_callback = self.exit_callback = None
+
+    def set_theme(self, value):
+        if not isinstance(value, str) or value not in {"auto", "light", "dark"}:
+            raise ValueError("El tema de avisos debe ser auto, light o dark")
+        with self._lock:
+            self._notification_theme = value
 
     def start(self):
         with self._lock:
@@ -239,7 +246,8 @@ class SessionBroker:
             now = self._clock()
             self._prune(now)
             if not self._started:
-                return {"cursor": self._serial, "messages": [], "persistent": {}, "running": False}
+                return {"cursor": self._serial, "messages": [], "persistent": {}, "running": False,
+                        "notification_theme": self._notification_theme}
             if client_id not in self._clients and len(self._clients) >= 32:
                 raise ValueError("Hay demasiados agentes de sesión.")
             # A fresh/restarted agent never replays the outage log. Active
@@ -282,14 +290,15 @@ class SessionBroker:
                             break
                 return {"protocol": 2, "epoch": self._epoch, "cursor": self._serial,
                         "messages": messages[:32], "persistent": self._persistent_snapshot() if delivery["ready"] else {},
-                        "running": True, "acknowledgement": "windows-api-accepted"}
+                        "running": True, "acknowledgement": "windows-api-accepted",
+                        "notification_theme": self._notification_theme}
             messages = [] if new_client or after is None or after > self._serial else [
                 self._delivery(item)
                 for item in all_items if item["id"] > after and (
                     not item["persistent"] or item["key"] in self._persistent)]
             return {"cursor": self._serial, "messages": messages,
                     "persistent": self._persistent_snapshot(),
-                    "running": True}
+                    "running": True, "notification_theme": self._notification_theme}
 
     def status(self):
         with self._lock:

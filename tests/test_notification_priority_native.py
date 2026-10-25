@@ -44,8 +44,9 @@ class NativePriorityTests(unittest.TestCase):
         self.backend.sync_persistent()
         self.assertEqual(self.backend.popup_persistent_key, "notice:4")
         self.assertEqual(self.backend.popup_hwnd, popup)
-        self.user.SetWindowTextW.assert_any_call(self.backend.popup_title,
-                                                "Elipro UPS · URGENTE · Hibernación en 30 segundos")
+        self.assertEqual(fixtures.latest_control_text(self.user, self.backend.popup_title), "Hibernación programada")
+        self.assertEqual(fixtures.latest_control_text(self.user, self.backend.popup_countdown), "00:30")
+        self.assertEqual(fixtures.latest_control_text(self.user, self.backend.popup_badge), "URGENTE")
         notifier.acknowledge_callback.assert_not_called()
         self.assertEqual(set(notifier._persistent_messages), {"notice:1", "notice:2", "notice:4"})
 
@@ -122,12 +123,14 @@ class NativePriorityTests(unittest.TestCase):
             notice["countdown"]["valid_for_ms"] = 2000
             notifier.sync_persistent({"notice:1": notice})
             self.backend._window_proc(self.backend.popup_hwnd, wn.WM_TIMER, 3, 0)
-            self.user.SetWindowTextW.assert_any_call(self.backend.popup_title,
-                                                    "Elipro UPS · URGENTE · Hibernación en 29 segundos")
+            self.assertEqual(fixtures.latest_control_text(self.user, self.backend.popup_title), "Hibernación programada")
+            self.assertEqual(fixtures.latest_control_text(self.user, self.backend.popup_countdown), "00:29")
             self.user.EnableWindow.assert_called_with(self.backend.popup_cancel, True)
             clock.return_value = 103.01
             self.backend._window_proc(self.backend.popup_hwnd, wn.WM_TIMER, 3, 0)
-            self.user.SetWindowTextW.assert_any_call(self.backend.popup_title, "Elipro UPS · Estado sin confirmar")
+            self.assertEqual(fixtures.latest_control_text(self.user, self.backend.popup_title), "Estado sin confirmar")
+            self.assertEqual(fixtures.latest_control_text(self.user, self.backend.popup_countdown), "—:—")
+            self.assertEqual(fixtures.latest_control_text(self.user, self.backend.popup_badge), "SIN CONFIRMAR")
             self.user.EnableWindow.assert_called_with(self.backend.popup_cancel, False)
             self.backend._window_proc(self.backend.popup_hwnd, wn.WM_COMMAND, 103, 0)
             notifier.cancel_countdown_callback.assert_not_called()
@@ -142,8 +145,9 @@ class NativePriorityTests(unittest.TestCase):
             clock.return_value = 101.1
             self.backend.sync_persistent()
             self.assertIsNotNone(self.backend.popup_persistent_key)
-            self.user.SetWindowTextW.assert_any_call(self.backend.popup_title, "Elipro UPS · Estado sin confirmar")
-            body = self.user.SetWindowTextW.call_args.args[1]
+            self.assertEqual(fixtures.latest_control_text(self.user, self.backend.popup_title), "Estado sin confirmar")
+            self.assertEqual(fixtures.latest_control_text(self.user, self.backend.popup_countdown), "—:—")
+            body = fixtures.latest_control_text(self.user, self.backend.popup_body)
             self.assertIn("No se confirma", body)
             self.assertNotIn("completada", body)
 
@@ -196,7 +200,7 @@ class NativePriorityTests(unittest.TestCase):
         while notifier._countdown_cancel_inflight and time.monotonic() < deadline:
             time.sleep(.005)
         self.backend.sync_persistent()
-        self.assertIn("No se confirmó la cancelación", self.user.SetWindowTextW.call_args.args[1])
+        self.assertIn("No se confirmó la cancelación", fixtures.latest_control_text(self.user, self.backend.popup_body))
         self.assertEqual(self.backend.popup_persistent_key, "notice:1")
         notifier.acknowledge_callback.assert_not_called()
 
@@ -220,27 +224,73 @@ class NativePriorityTests(unittest.TestCase):
         self.backend.sync_persistent()
         self.assertEqual(self.backend.popup_persistent_key, "notice:1")
 
-    def test_button_positions_and_window_size_remain_fixed_across_priorities_at_supported_dpi(self):
+    def test_visible_buttons_fit_without_overlap_across_priorities_at_supported_dpi(self):
         notifier = self.configure_popup()
-        for dpi in (96, 144, 192):
+        for dpi in (96, 120, 144, 192):
             with self.subTest(dpi=dpi):
                 self.user.GetDpiForWindow.return_value = dpi
-                notifier.sync_persistent({"notice:1": self.notice()})
-                self.backend.sync_persistent()
-                self.backend._layout_popup(dpi)
-                controls = {hwnd: call.args[2:6] for call in self.user.SetWindowPos.call_args_list
-                            if (hwnd := call.args[0]) in self.backend.popup_buttons}
-                notifier.sync_persistent({"notice:1": self.notice(), "notice:2": self.notice("Cuenta", 3, countdown="a" * 32)})
-                self.backend.sync_persistent()
-                self.assertEqual(self.user.SetWindowPos.call_args.args[4:6],
-                                 (round(420 * dpi / 96), round(230 * dpi / 96)))
-                self.backend._layout_popup(dpi)
-                for call in self.user.SetWindowPos.call_args_list:
-                    if call.args[0] in controls:
-                        self.assertEqual(call.args[2:6], controls[call.args[0]])
+                for countdown in (False, True):
+                    with self.subTest(countdown=countdown):
+                        notices = {"notice:1": self.notice()}
+                        if countdown:
+                            notices["notice:2"] = self.notice("Cuenta", 3, countdown="a" * 32)
+                        notifier.sync_persistent(notices)
+                        self.backend.sync_persistent()
+                        self.backend._layout_popup(dpi)
+                        _, _, width, height = fixtures.latest_window_position(self.user, self.backend.popup_hwnd)
+                        self.assertEqual(width, round(480 * dpi / 96))
+                        buttons = self.backend.popup_buttons if countdown else self.backend.popup_buttons[:2]
+                        positions = [fixtures.latest_window_position(self.user, hwnd) for hwnd in buttons]
+                        for x, y, button_width, button_height in positions:
+                            self.assertGreaterEqual(x, 0)
+                            self.assertGreaterEqual(y, 0)
+                            self.assertGreater(button_width, 0)
+                            self.assertGreater(button_height, 0)
+                            self.assertLessEqual(x + button_width, width)
+                            self.assertLessEqual(y + button_height, height)
+                        for index, (x, y, button_width, button_height) in enumerate(positions):
+                            for other_x, other_y, other_width, other_height in positions[index + 1:]:
+                                overlap_width = min(x + button_width, other_x + other_width) - max(x, other_x)
+                                overlap_height = min(y + button_height, other_y + other_height) - max(y, other_y)
+                                self.assertFalse(overlap_width > 0 and overlap_height > 0,
+                                                 "Acknowledgment and cancellation targets must not overlap")
                 notifier.sync_persistent({})
                 self.backend.sync_persistent()
                 self.user.SetWindowPos.reset_mock()
+
+    def test_shutdown_countdown_uses_its_own_heading_and_separate_timer(self):
+        notifier = self.configure_popup()
+        notice = self.notice("Protección", 3, countdown="a" * 32)
+        notice["countdown"]["action"] = "shutdown"
+        notice["countdown"]["remaining_seconds"] = 125
+        with patch.object(wn.time, "monotonic", return_value=100):
+            notifier.sync_persistent({"notice:1": notice})
+            self.backend.sync_persistent()
+        self.assertEqual(fixtures.latest_control_text(self.user, self.backend.popup_title), "Apagado programado")
+        self.assertEqual(fixtures.latest_control_text(self.user, self.backend.popup_countdown), "02:05")
+
+    def test_changing_theme_preserves_live_episode_and_does_not_restart_its_timer(self):
+        notifier = self.configure_popup()
+        notifier.acknowledge_callback = Mock()
+        notifier.cancel_countdown_callback = Mock()
+        notice = self.notice("Protección", 3, countdown="a" * 32)
+        with patch.object(wn.time, "monotonic", return_value=100) as clock, \
+                patch.object(self.backend, "_play_sound") as sound:
+            notifier.sync_persistent({"notice:1": notice})
+            self.backend.sync_persistent()
+            popup = self.backend.popup_hwnd
+            notifier._backend = self.backend
+            clock.return_value = 101
+            notifier.set_theme("light")
+            self.backend._window_proc(self.backend.hwnd, wn.WM_APP_NOTIFY, 0, 0)
+            self.assertEqual(self.backend.popup_hwnd, popup)
+            self.assertEqual(self.backend.popup_persistent_key, "notice:1")
+            self.assertEqual(fixtures.latest_control_text(self.user, self.backend.popup_countdown), "00:29")
+            self.assertFalse(notifier._persistent_acknowledged("notice:1"))
+            notifier.acknowledge_callback.assert_not_called()
+            notifier.cancel_countdown_callback.assert_not_called()
+            sound.assert_not_called()
+        notifier._backend = None
 
 
 class CountdownClientTests(unittest.TestCase):

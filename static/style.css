@@ -416,6 +416,8 @@ label.notification-option{cursor:pointer}
 #page-system .notification-option input:checked+.switch:before{background:#fff;transform:translateX(24px)}
 #page-system .notification-option input:disabled+.switch{opacity:.45}
 .notification-repeat-control{display:flex;align-items:center;gap:12px;flex-shrink:0;color:#bad6e5;font-size:14px}
+#page-system #notification-theme{flex-shrink:0;width:155px;max-width:100%;min-height:43px;font-size:14px;background:var(--panel-alt);color:var(--text);border-color:var(--line)}
+@media(max-width:600px){#page-system .notification-theme-option{flex-wrap:wrap}#page-system .notification-theme-option .notification-option-copy{flex-basis:calc(100% - 43px)}#page-system #notification-theme{margin-left:43px;max-width:calc(100% - 43px);min-height:44px}}
 #page-system .notification-repeat-control input{width:79px;min-height:43px;padding:8px 10px;border:1px solid #7497ad;border-radius:6px;color:var(--text);background:var(--panel-alt);font-size:16px;font-weight:500;font-variant-numeric:tabular-nums}
 .notification-delivery{display:flex;flex-direction:column;gap:6px;margin-top:17px;color:var(--muted);font-size:12px;line-height:1.65;overflow-wrap:anywhere}
 .notification-delivery:not(:has(> :not([hidden]))){display:none}
@@ -664,3 +666,4 @@ html[data-theme=light] #page-webhooks .button-secondary:disabled{color:#758995;b
   #page-webhooks .webhook-deliveries-scroll{flex:1;min-height:0;max-height:none}
   #page-webhooks .webhook-deliveries-empty{flex:1;display:grid;place-content:center}
 }
+@media(max-width:600px){#page-system .system-section-header{flex-wrap:wrap}}

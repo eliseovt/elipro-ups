@@ -21,6 +21,7 @@ DEFAULT_NOTIFICATION_SETTINGS = {
     "sound_enabled": True,
     "persistent_critical": False,
     "repeat_seconds": 30,
+    "theme": "auto",
 }
 
 _EVENTS = {
@@ -96,6 +97,8 @@ def validate_notification_settings(value):
             raise ValueError(key + " debe ser booleano")
     if type(result["repeat_seconds"]) is not int or not 10 <= result["repeat_seconds"] <= 300:
         raise ValueError("repeat_seconds debe ser entero entre 10 y 300")
+    if not isinstance(result["theme"], str) or result["theme"] not in {"auto", "light", "dark"}:
+        raise ValueError("theme debe ser auto, light o dark")
     return result
 
 
@@ -164,11 +167,17 @@ class AlertManager:
             if self._started or self._stopped:
                 return
             try:
+                self._apply_theme()
                 self.notifier.start()
                 self._started = True
                 self._sync_persistent()
             except Exception as exc:
                 self._last_error = "No se pudieron iniciar los avisos de Windows: " + str(exc)[:300]
+
+    def _apply_theme(self):
+        setter = getattr(self.notifier, "set_theme", None)
+        if callable(setter):
+            setter(self._settings["theme"])
 
     def stop(self):
         with self._lock:
@@ -610,6 +619,7 @@ class AlertManager:
             self.store.set_setting("notification_settings", settings)
             with self._lock:
                 self._settings = settings
+                self._apply_theme()
                 self._sync_persistent()
                 return self.status()
 

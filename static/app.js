@@ -646,7 +646,9 @@
     $("ups-power-review-ack").disabled = !upsPowerCanReview();
     $("ups-power-review-submit").disabled = !upsPowerCanReview() || !$("ups-power-review-ack").checked;
     const notificationSettingsMissing = !state.status?.notifications?.settings;
-    $("notifications-form").querySelectorAll("input").forEach((field) => { field.disabled = unavailable || busy || notificationSettingsMissing; });
+    $("notifications-form").querySelectorAll("input, select").forEach((field) => { field.disabled = unavailable || busy || notificationSettingsMissing; });
+    $("notification-theme").disabled = unavailable || busy || notificationSettingsMissing
+      || !["auto", "light", "dark"].includes(state.status?.notifications?.settings?.theme);
     $("notifications-persistent").disabled = unavailable || busy || Array.isArray(state.status?.notifications?.pending)
       || typeof state.status?.notifications?.settings?.persistent_critical !== "boolean";
     $("save-notifications").disabled = unavailable || busy || notificationSettingsMissing;
@@ -1307,6 +1309,7 @@
     $("notifications-enabled").checked = settings.enabled === true;
     $("notifications-sound").checked = settings.sound_enabled === true;
     $("notifications-repeat").value = finite(settings.repeat_seconds) ? settings.repeat_seconds : 30;
+    $("notification-theme").value = ["auto", "light", "dark"].includes(settings.theme) ? settings.theme : "auto";
     const supportsPersistent = typeof settings.persistent_critical === "boolean";
     setText("notifications-persistent-note", supportsPersistent ? "Hasta cerrarlos o resolverse la alerta." : "No disponible en esta versión del monitor.");
     $("notifications-persistent").checked = settings.persistent_critical === true;
@@ -2042,6 +2045,7 @@
       sound_enabled: $("notifications-sound").checked,
       repeat_seconds: Number($("notifications-repeat").value),
     };
+    if (["auto", "light", "dark"].includes(state.status.notifications.settings.theme)) settings.theme = $("notification-theme").value;
     if (typeof state.status.notifications.settings.persistent_critical === "boolean") settings.persistent_critical = Array.isArray(state.status.notifications.pending)
       ? state.status.notifications.settings.persistent_critical : $("notifications-persistent").checked;
     state.mutation = "save-notifications";

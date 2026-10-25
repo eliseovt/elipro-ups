@@ -298,6 +298,12 @@ class Agent:
         response = self.client.poll(self.client_id, self.cursor, self.notifier.status(),
                                     acks=sent_acks, epoch=self.epoch, session_state=session)
         transit_age = max(0, self._clock() - poll_started)
+        theme = response.get("notification_theme", "auto")
+        if not isinstance(theme, str) or theme not in {"auto", "light", "dark"}:
+            raise ValueError("El monitor devolvió un tema de avisos no válido")
+        setter = self._notifier_method("set_theme")
+        if setter is not None:
+            setter(theme)
         # Clear ACKs only after a successful round trip. A lost HTTP response
         # causes an idempotent retry, never a second display or false receipt.
         self._acks.difference_update(sent_acks)

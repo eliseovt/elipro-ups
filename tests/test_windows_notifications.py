@@ -1,4 +1,5 @@
 import ctypes
+from itertools import count
 from pathlib import Path
 import sys
 import threading
@@ -8,8 +9,20 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from ups_monitor import windows_notifications as wn
+from ups_monitor import notification_popup as popup_presentation
 from ups_monitor.alerts import AlertManager
 from ups_monitor.core import Store
+
+
+def latest_control_text(user, hwnd):
+    """Read one control's last update without depending on sibling draw order."""
+    return next(call.args[1] for call in reversed(user.SetWindowTextW.call_args_list)
+                if call.args[0] == hwnd)
+
+
+def latest_window_position(user, hwnd):
+    return next(call.args[2:6] for call in reversed(user.SetWindowPos.call_args_list)
+                if call.args[0] == hwnd)
 
 
 class LoopBackend:
@@ -135,6 +148,26 @@ class WindowsNotifierTests(unittest.TestCase):
         for args in (("", "body"), ("title", ""), ("title", "body", "bad")):
             with self.assertRaises(ValueError):
                 notifier.notify(*args)
+
+    def test_theme_is_validated_stored_and_only_wakes_the_native_worker(self):
+        notifier = self.make_notifier()
+        self.assertEqual(notifier.notification_theme, "auto")
+        self.assertEqual(notifier.status()["notification_theme"], "auto")
+        notifier.set_theme("light")
+        self.assertEqual(notifier.notification_theme, "light")
+        self.assertIsNone(notifier._thread)
+        backend = Mock()
+        notifier._backend = backend
+        notifier.set_theme("dark")
+        self.assertEqual(notifier.status()["notification_theme"], "dark")
+        backend.wake.assert_called_once_with()
+        backend.deliver.assert_not_called()
+        backend.initialize.assert_not_called()
+        for value in (None, True, 1, "system", "Light", "", {}, []):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                notifier.set_theme(value)
+        self.assertEqual(notifier.notification_theme, "dark")
+        notifier._backend = None
 
     def test_delivery_receipt_requires_native_true_and_duplicate_does_not_replay(self):
         notifier = self.make_notifier()
@@ -310,7 +343,7 @@ class NativeShellTests(unittest.TestCase):
             return 1
 
         self.shell.Shell_NotifyIconW.side_effect = record
-        self.shell.SHQueryUserNotificationState.side_effect = self.query_accepts_notifications
+        self.shell.SHQueryUserNotificationState.side_effect = NativeShellTests.query_busy_notifications
         with patch.object(wn, "_load_apis", return_value=(self.user, self.shell, self.kernel)):
             self.backend = wn._Win32Backend(self.owner)
         self.backend.initialize()
@@ -319,6 +352,11 @@ class NativeShellTests(unittest.TestCase):
     @staticmethod
     def query_accepts_notifications(pointer):
         ctypes.cast(pointer, ctypes.POINTER(ctypes.c_int)).contents.value = 5
+        return 0
+
+    @staticmethod
+    def query_busy_notifications(pointer):
+        ctypes.cast(pointer, ctypes.POINTER(ctypes.c_int)).contents.value = 2
         return 0
 
     def test_complete_unicode_structure_and_pointer_sized_window(self):
@@ -493,6 +531,7 @@ class NativeShellTests(unittest.TestCase):
     def test_read_only_user_notification_diagnostic_preserves_code_and_timestamp(self):
         notifier = wn.WindowsNotifier("http://127.0.0.1:8765")
         self.backend.owner = notifier
+        self.shell.SHQueryUserNotificationState.side_effect = self.query_accepts_notifications
         self.backend._query_user_notification_state()
         state = notifier.status()["user_notification_state"]
         self.assertEqual(state["state"], "accepts_notifications")
@@ -520,7 +559,8 @@ class NativeShellTests(unittest.TestCase):
         notifier = wn.WindowsNotifier("http://127.0.0.1:8765", cancel_callback=Mock())
         notifier._open_panel = Mock()
         self.backend.owner = notifier
-        self.user.CreateWindowExW.side_effect = [0xE0000000001 + n for n in range(6)]
+        self.shell.SHQueryUserNotificationState.side_effect = self.query_accepts_notifications
+        self.user.CreateWindowExW.side_effect = count(0xE0000000001)
         self.user.SetWindowPos.return_value = 1
         self.user.SetTimer.return_value = 1
 
@@ -532,27 +572,147 @@ class NativeShellTests(unittest.TestCase):
         self.user.SystemParametersInfoW.side_effect = workarea
         return notifier
 
-    def test_popup_scales_geometry_fonts_and_dpi_change_without_leaking_font(self):
+    def test_popup_scales_geometry_and_releases_every_font_after_dpi_changes(self):
         self.configure_popup()
         self.user.GetDpiForWindow.return_value = 192
         self.backend.gdi = Mock()
-        self.backend.gdi.CreateFontW.side_effect = [1001, 1002]
+        self.backend.gdi.CreateSolidBrush.side_effect = count(20000)
+        created_fonts = []
+        handles = count(1001)
+
+        def create_font(*_args):
+            handle = next(handles)
+            created_fonts.append(handle)
+            return handle
+
+        self.backend.gdi.CreateFontW.side_effect = create_font
         self.backend._show_popup("DPI", "Escala 200 %")
         create_popup = self.user.CreateWindowExW.call_args_list[1].args
-        self.assertEqual(create_popup[6:8], (840, 460))
-        self.assertEqual(self.user.SetWindowPos.call_args.args[4:6], (840, 460))
-        self.assertEqual(self.backend.gdi.CreateFontW.call_args.args[0], -26)
-        proposed = wn.RECT(20, 40, 650, 325)
+        self.assertEqual(create_popup[6], 960)
+        self.assertGreater(create_popup[7], 0)
+        self.assertEqual(latest_window_position(self.user, self.backend.popup_hwnd)[2], 960)
+        old_fonts = set(self.backend.popup_view.fonts.values())
+        self.assertGreater(len(old_fonts), 1, "Title, body and countdown need a typographic hierarchy")
+        old_heights = {call.args[0] for call in self.backend.gdi.CreateFontW.call_args_list}
+        self.assertGreater(len(old_heights), 1)
+        proposed = wn.RECT(20, 40, 740, 640)
         self.backend._window_proc(self.backend.popup_hwnd, wn.WM_DPICHANGED,
                                   144 | (144 << 16), ctypes.addressof(proposed))
         self.assertEqual(self.backend.popup_dpi, 144)
-        self.assertEqual(self.user.SetWindowPos.call_args.args[2:6], (20, 40, 630, 285))
-        self.assertEqual(self.backend.gdi.CreateFontW.call_args.args[0], -20)
-        self.backend.gdi.DeleteObject.assert_called_once_with(1001)
-        self.assertEqual(self.user.SendMessageW.call_count, 10)
+        position = latest_window_position(self.user, self.backend.popup_hwnd)
+        self.assertEqual(position[2], 720)
+        self.assertGreaterEqual(position[0], 0)
+        self.assertGreaterEqual(position[1], 0)
+        self.assertLessEqual(position[0] + position[2], 1920)
+        self.assertLessEqual(position[1] + position[3], 1040)
+        self.assertGreater(position[3], 0)
+        new_fonts = set(self.backend.popup_view.fonts.values())
+        self.assertTrue(old_fonts.isdisjoint(new_fonts))
+        deleted = [call.args[0] for call in self.backend.gdi.DeleteObject.call_args_list]
+        for font in old_fonts:
+            self.assertEqual(deleted.count(font), 1)
+        assigned = {call.args[2] for call in self.user.SendMessageW.call_args_list
+                    if call.args[1] == wn.WM_SETFONT}
+        self.assertTrue(new_fonts <= assigned)
         self.backend._destroy_popup()
-        self.backend.gdi.DeleteObject.assert_called_with(1002)
-        self.assertIsNone(self.backend.popup_font)
+        self.backend._destroy_popup()
+        deleted = [call.args[0] for call in self.backend.gdi.DeleteObject.call_args_list]
+        for font in created_fonts:
+            self.assertEqual(deleted.count(font), 1)
+
+    def test_theme_change_repaints_same_popup_without_acknowledgment_or_sound(self):
+        notifier = self.configure_popup()
+        notifier.acknowledge_callback = Mock()
+        self.backend.gdi = Mock()
+        self.backend.gdi.CreateFontW.side_effect = count(10000)
+        self.backend.gdi.CreateSolidBrush.side_effect = count(20000)
+        notifier.set_theme("light")
+        self.backend._show_popup("Prueba", "Diseño de Elipro")
+        popup, view = self.backend.popup_hwnd, self.backend.popup_view
+        created = self.user.CreateWindowExW.call_count
+        notifier._backend = self.backend
+        self.user.InvalidateRect.reset_mock()
+        self.user.RedrawWindow.reset_mock()
+        with patch.object(self.backend, "_play_sound") as sound:
+            notifier.set_theme("dark")
+            self.backend._window_proc(self.backend.hwnd, wn.WM_APP_NOTIFY, 0, 0)
+            self.assertTrue(self.user.InvalidateRect.called or self.user.RedrawWindow.called)
+            self.assertEqual(self.backend.popup_hwnd, popup)
+            self.assertIs(self.backend.popup_view, view)
+            self.assertEqual(self.user.CreateWindowExW.call_count, created)
+            notifier.acknowledge_callback.assert_not_called()
+            notifier.cancel_callback.assert_not_called()
+            notifier._open_panel.assert_not_called()
+            sound.assert_not_called()
+        notifier._backend = None
+
+    def test_windows_appearance_messages_repaint_without_recreating_popup(self):
+        notifier = self.configure_popup()
+        self.backend.gdi = Mock()
+        self.backend.gdi.CreateFontW.side_effect = count(10000)
+        self.backend.gdi.CreateSolidBrush.side_effect = count(20000)
+        with patch.object(popup_presentation, "resolve_theme", return_value="light"):
+            self.backend._show_popup("Prueba", "Sigue el aspecto de Windows")
+        popup = self.backend.popup_hwnd
+        created = self.user.CreateWindowExW.call_count
+        with patch.object(self.backend, "_play_sound") as sound, \
+                patch.object(popup_presentation, "resolve_theme", side_effect=("dark", "light")):
+            for message in (wn.WM_SETTINGCHANGE, wn.WM_THEMECHANGED):
+                with self.subTest(message=message):
+                    self.user.InvalidateRect.reset_mock()
+                    self.user.RedrawWindow.reset_mock()
+                    self.backend._window_proc(self.backend.hwnd, message, 0, 0)
+                    self.assertTrue(self.user.InvalidateRect.called or self.user.RedrawWindow.called)
+                    self.assertEqual(self.backend.popup_hwnd, popup)
+                    self.assertEqual(self.user.CreateWindowExW.call_count, created)
+            sound.assert_not_called()
+        self.assertEqual(notifier.notification_theme, "auto")
+
+    def test_buttons_keep_native_commands_and_keyboard_tab_stops(self):
+        self.configure_popup()
+        self.backend._show_popup("Prueba", "Acciones accesibles")
+        buttons = [call.args for call in self.user.CreateWindowExW.call_args_list
+                   if call.args[1] == "BUTTON"]
+        self.assertEqual({args[9].value for args in buttons}, {101, 102, 103})
+        for args in buttons:
+            self.assertTrue(args[3] & 0x00010000, "Native buttons must remain keyboard-reachable")
+            self.assertEqual(args[3] & 0xF, 0xB, "Branded actions use BS_OWNERDRAW")
+
+    def test_static_text_uses_its_surface_background_in_both_themes(self):
+        self.configure_popup()
+        self.backend.gdi = Mock()
+        self.backend.gdi.CreateFontW.side_effect = count(10000)
+        self.backend.gdi.CreateSolidBrush.side_effect = count(20000)
+        self.backend._show_popup("Prueba", "Sin bloques grises")
+        view = self.backend.popup_view
+        for theme in ("light", "dark"):
+            with self.subTest(theme=theme):
+                view.apply_theme(theme)
+                brush = view.handle_message(popup_presentation.WM_CTLCOLORSTATIC, 99, self.backend.popup_body)
+                self.assertEqual(brush, view.brushes[view.palette["background"]])
+                self.backend.gdi.SetBkColor.assert_called_with(99, view.palette["background"])
+                self.backend.gdi.SetTextColor.assert_called_with(99, view.palette["muted"])
+                brush = view.handle_message(popup_presentation.WM_CTLCOLORSTATIC, 99, self.backend.popup_countdown)
+                self.assertEqual(brush, view.brushes[view.palette["warning_background"]])
+                self.backend.gdi.SetBkColor.assert_called_with(99, view.palette["warning_background"])
+
+    def test_high_contrast_uses_windows_surfaces_and_highlight_colors(self):
+        self.configure_popup()
+        self.backend.gdi = Mock()
+        self.backend.gdi.CreateFontW.side_effect = count(10000)
+        self.backend.gdi.CreateSolidBrush.side_effect = count(20000)
+        self.backend._show_popup("Prueba", "Contraste del sistema")
+        view = self.backend.popup_view
+        self.user.GetSysColor.side_effect = lambda index: 0x100000 + index
+        with patch.object(view, "_high_contrast", return_value=True):
+            view.apply_theme("dark")
+        self.assertEqual(view.palette["background"], 0x100005)
+        self.assertEqual(view.palette["foreground"], 0x100008)
+        self.assertEqual(view.palette["primary"], 0x10000D)
+        self.assertEqual(view.palette["primary_text"], 0x10000E)
+        self.assertEqual(view.palette["disabled_text"], 0x100011)
+        brush = view.handle_message(popup_presentation.WM_CTLCOLORSTATIC, 99, self.backend.popup_body)
+        self.assertEqual(brush, view.brushes[0x100005])
 
     def test_cancelled_ticket_during_popup_creation_is_not_shown_or_acknowledged(self):
         notifier = self.configure_popup()
@@ -560,7 +720,7 @@ class NativeShellTests(unittest.TestCase):
         notifier.sync_persistent({"policy_countdown": {"title": "Cuenta", "message": "Quedan 30 segundos"}})
         notifier.notify("Cuenta", "Quedan 30 segundos", persistent=True,
                         key="policy_countdown", delivery_id="epoch:1")
-        handles = iter(range(500, 505))
+        handles = count(500)
         def create(*_args):
             handle = next(handles)
             if handle == 504:
@@ -568,25 +728,88 @@ class NativeShellTests(unittest.TestCase):
             return handle
         self.user.CreateWindowExW.side_effect = create
         notifier._drain(self.backend)
-        self.user.SetWindowPos.assert_not_called()
+        self.assertFalse(any(call.args[0] == self.backend.popup_hwnd and call.args[-1] & 0x40
+                             for call in self.user.SetWindowPos.call_args_list))
+        self.assertIsNone(notifier.status()["last_popup_shown_at"])
         self.assertEqual([item["outcome"] for item in notifier.drain_receipts()], ["cancelled"])
 
     def test_real_shell_acceptance_produces_receipt_without_claiming_user_saw_it(self):
         notifier = self.configure_popup()
+        self.shell.SHQueryUserNotificationState.side_effect = self.query_busy_notifications
         notifier._ready = True
         notifier.notify("Prueba", "Solicitud nativa", sound=False, delivery_id="epoch:1")
         notifier._drain(self.backend)
         self.assertEqual(notifier.drain_receipts()[0]["outcome"], "accepted")
         self.assertIsNone(notifier.status()["last_shown_at"])
 
+    def test_test_notice_uses_selected_theme_immediately_without_second_visual_or_sound(self):
+        for theme in ("light", "dark"):
+            with self.subTest(theme=theme):
+                notifier = self.configure_popup()
+                notifier._ready = True
+                store = Store(":memory:")
+                self.addCleanup(store.close)
+                alerts = AlertManager(store, notifier)
+                alerts.update_settings({"theme": theme, "sound_enabled": True})
+                shell_before = len(self.native_calls)
+                self.user.SetTimer.reset_mock()
+                sound = Mock(SND_ALIAS=0x10000, SND_ASYNC=1, SND_NODEFAULT=2)
+                with patch.dict(sys.modules, {"winsound": sound}):
+                    alerts.test()
+                    notifier._drain(self.backend)
+                    popup = self.backend.popup_hwnd
+                    self.assertIsNotNone(popup)
+                    self.assertEqual(self.backend.popup_view.theme, theme)
+                    self.assertIn("Prueba", latest_control_text(self.user, self.backend.popup_title))
+                    self.assertIn("No se apagará ni hibernará", latest_control_text(self.user, self.backend.popup_body))
+                    self.assertIsNotNone(notifier.status()["last_popup_shown_at"])
+                    self.assertIsNone(notifier.status()["last_shown_at"])
+                    self.assertTrue(self.backend.last_notice["popup_handled"])
+                    self.user.SetTimer.assert_called_once_with(popup, 1, 12000, None)
+                    self.assertEqual(len(self.native_calls), shell_before, "Own popup must not add a Shell balloon")
+                    created = self.user.CreateWindowExW.call_count
+                    positioned = self.user.SetWindowPos.call_count
+                    self.backend._window_proc(self.backend.hwnd, wn.WM_APP_TRAY, 0, wn.NIN_BALLOONTIMEOUT)
+                    self.backend._window_proc(self.backend.hwnd, wn.WM_TIMER, 2, 0)
+                    self.backend._maybe_fallback_popup()
+                    self.assertEqual(self.user.CreateWindowExW.call_count, created)
+                    self.assertEqual(self.user.SetWindowPos.call_count, positioned)
+                    sound.PlaySound.assert_called_once()
+                self.backend._window_proc(popup, wn.WM_TIMER, 1, 0)
+                self.assertIsNotNone(notifier.status()["last_popup_hidden_at"])
+                notifier.cancel_callback.assert_not_called()
+
+    def test_restricted_desktop_uses_only_shell_visual_and_preserves_explicit_sound(self):
+        notifier = self.configure_popup()
+        for state in (2, 3, 4, 6):
+            with self.subTest(state=state):
+                def query(pointer):
+                    ctypes.cast(pointer, ctypes.POINTER(ctypes.c_int)).contents.value = state
+                    return 0
+
+                self.shell.SHQueryUserNotificationState.side_effect = query
+                before = len(self.native_calls)
+                sound = Mock(SND_ALIAS=0x10000, SND_ASYNC=1, SND_NODEFAULT=2)
+                with patch.dict(sys.modules, {"winsound": sound}):
+                    self.assertTrue(self.backend.deliver("Prueba", "Respeta el estado de Windows", "info", True))
+                    self.backend._maybe_fallback_popup()
+                    self.backend._check_unconfirmed_popup()
+                    sound.PlaySound.assert_called_once()
+                self.assertEqual(len(self.native_calls), before + 1)
+                self.assertEqual(self.native_calls[-1][0], wn.NIM_MODIFY)
+                self.assertIsNone(self.backend.popup_hwnd)
+        self.assertIsNone(notifier.status()["last_popup_shown_at"])
+
     def test_accepted_delivery_keeps_valid_fallback_until_explicitly_cancelled(self):
         notifier = self.configure_popup()
+        self.shell.SHQueryUserNotificationState.side_effect = self.query_busy_notifications
         notifier._ready = True
         with patch.object(wn.time, "monotonic", return_value=100):
             notifier.notify("Corte", "En batería", sound=False, delivery_id="epoch:1")
             notifier._drain(self.backend)
         self.assertEqual(notifier.drain_receipts()[0]["outcome"], "accepted")
         self.assertEqual(notifier.status()["pending_deliveries"], 0)
+        self.shell.SHQueryUserNotificationState.side_effect = self.query_accepts_notifications
         with patch.object(wn.time, "monotonic", return_value=101.01):
             self.backend._check_unconfirmed_popup()
         self.assertIsNotNone(notifier.status()["last_popup_shown_at"],
@@ -598,11 +821,14 @@ class NativeShellTests(unittest.TestCase):
 
     def test_cancelled_accepted_delivery_cannot_reappear_from_timer_or_shell_timeout(self):
         notifier = self.configure_popup()
+        self.shell.SHQueryUserNotificationState.side_effect = self.query_busy_notifications
         notifier._ready = True
         with patch.object(wn.time, "monotonic", return_value=100):
             notifier.notify("Corte", "Texto anterior", sound=False, delivery_id="epoch:1")
             notifier._drain(self.backend)
         notifier.cancel_delivery("epoch:1")
+        self.shell.SHQueryUserNotificationState.side_effect = self.query_accepts_notifications
+        self.backend._query_user_notification_state()
         with patch.object(wn.time, "monotonic", return_value=100.05):
             self.backend._maybe_fallback_popup()
         with patch.object(wn.time, "monotonic", return_value=101.01):
@@ -613,8 +839,11 @@ class NativeShellTests(unittest.TestCase):
 
     def test_fast_shell_timeout_uses_one_nonactivating_popup_and_timer(self):
         notifier = self.configure_popup()
+        self.shell.SHQueryUserNotificationState.side_effect = self.query_busy_notifications
         with patch.object(wn.time, "monotonic", return_value=100):
             self.backend.deliver("Prueba", "Aviso de escritorio", "warning", False)
+        self.shell.SHQueryUserNotificationState.side_effect = self.query_accepts_notifications
+        self.backend._query_user_notification_state()
         with patch.object(wn.time, "monotonic", return_value=100.04):
             self.backend._window_proc(self.backend.hwnd, wn.WM_APP_TRAY, 0, wn.NIN_BALLOONTIMEOUT)
         self.assertIsNotNone(notifier.status()["last_popup_shown_at"])
@@ -623,14 +852,16 @@ class NativeShellTests(unittest.TestCase):
         self.assertTrue(create_args[0] & 0x08000000)  # WS_EX_NOACTIVATE
         self.assertTrue(create_args[0] & 0x00000080)  # WS_EX_TOOLWINDOW
         self.assertTrue(create_args[0] & 0x00000008)  # WS_EX_TOPMOST
-        self.assertEqual(create_args[6:8], (420, 230))
+        self.assertEqual(create_args[6], 480)
+        self.assertGreater(create_args[7], 0)
         self.assertTrue(self.user.SetWindowPos.call_args.args[-1] & 0x10)  # SWP_NOACTIVATE
         with patch.object(wn.time, "monotonic", return_value=100.05):
             self.backend._maybe_fallback_popup()
-        self.assertEqual(self.user.SetTimer.call_count, 2)  # Shell check + popup expiry
+        self.assertEqual(self.user.SetTimer.call_count, 1)  # Popup expiry; no fallback timer beside Shell.
 
     def test_normal_timeout_quiet_mode_click_or_stop_never_shows_fallback(self):
         self.configure_popup()
+        self.shell.SHQueryUserNotificationState.side_effect = self.query_busy_notifications
         with patch.object(wn.time, "monotonic", return_value=100):
             self.backend.deliver("Prueba", "Aviso", "info", False)
         for age, code, clicked, stopped in ((1.5, 5, False, False), (.05, 6, False, False),
@@ -647,8 +878,10 @@ class NativeShellTests(unittest.TestCase):
 
     def test_silent_shell_discard_falls_back_after_one_second(self):
         notifier = self.configure_popup()
+        self.shell.SHQueryUserNotificationState.side_effect = self.query_busy_notifications
         with patch.object(wn.time, "monotonic", return_value=100):
             self.backend.deliver("Prueba", "Shell no emitió callback", "info", False)
+        self.shell.SHQueryUserNotificationState.side_effect = self.query_accepts_notifications
         with patch.object(wn.time, "monotonic", return_value=101.01):
             self.backend._window_proc(self.backend.hwnd, wn.WM_TIMER, 2, 0)
         self.assertIsNotNone(notifier.status()["last_popup_shown_at"])
@@ -656,9 +889,11 @@ class NativeShellTests(unittest.TestCase):
 
     def test_confirmed_shell_display_has_no_second_popup(self):
         notifier = self.configure_popup()
+        self.shell.SHQueryUserNotificationState.side_effect = self.query_busy_notifications
         with patch.object(wn.time, "monotonic", return_value=100):
             self.backend.deliver("Prueba", "Shell mostró este aviso", "info", False)
             self.backend._window_proc(self.backend.hwnd, wn.WM_APP_TRAY, 0, wn.NIN_BALLOONSHOW)
+        self.shell.SHQueryUserNotificationState.side_effect = self.query_accepts_notifications
         with patch.object(wn.time, "monotonic", return_value=101.01):
             self.backend._window_proc(self.backend.hwnd, wn.WM_TIMER, 2, 0)
         self.assertIsNone(notifier.status()["last_popup_shown_at"])
@@ -774,10 +1009,8 @@ class NativeShellTests(unittest.TestCase):
             self.assertTrue(all(item["acknowledged_at"] is None for item in pending))
             self.assertTrue(all(not item["requires_attention"] for item in pending))
 
-            # A Windows-suppressed balloon falls back to a temporary popup.
-            requested = self.backend.last_notice["requested_at"]
-            with patch.object(wn.time, "monotonic", return_value=requested + 1.01):
-                self.backend._check_unconfirmed_popup()
+            # Recovery uses the same branded surface immediately, with a bounded lifetime.
+            self.assertEqual(latest_control_text(self.user, self.backend.popup_title), "Suministro eléctrico recuperado")
             self.user.SetTimer.assert_any_call(popup, 1, 12000, None)
             self.assertIsNone(self.backend.popup_persistent_key)
             self.backend._window_proc(popup, wn.WM_TIMER, 1, 0)
@@ -795,7 +1028,8 @@ class NativeShellTests(unittest.TestCase):
         alerts.on_event("power_lost", "El UPS usa batería")
         alerts.on_event("power_restored", "Volvió la red")
         notifier._drain(self.backend)
-        self.assertIsNone(self.backend.popup_hwnd)
+        self.assertIsNotNone(self.backend.popup_hwnd)
+        self.assertEqual(latest_control_text(self.user, self.backend.popup_title), "Suministro eléctrico recuperado")
         self.assertEqual(self.backend.last_notice["title"], "Suministro eléctrico recuperado")
         self.assertEqual(notifier._persistent_messages, {})
         self.assertEqual(len(store.pending_notifications()), 2)

@@ -431,7 +431,8 @@ class AlertTests(unittest.TestCase):
         self.store.set_setting("policy", policy)
         self.manager.update_settings({"sound_enabled": False, "repeat_seconds": 90})
         self.manager.update_settings({"enabled": False})
-        expected = {"enabled": False, "sound_enabled": False, "persistent_critical": False, "repeat_seconds": 90}
+        expected = {"enabled": False, "sound_enabled": False, "persistent_critical": False, "repeat_seconds": 90,
+                    "theme": "auto"}
         self.assertEqual(self.new_manager().status()["settings"], expected)
         self.assertEqual(self.store.get_setting("policy"), policy)
 

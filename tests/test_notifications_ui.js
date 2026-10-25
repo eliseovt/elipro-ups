@@ -139,7 +139,7 @@ function harness(historyOptions = {}) {
   };
   const policyFields = ["policy-low-battery", "policy-runtime", "policy-countdown", "policy-action", "policy-ups-poweroff", "policy-ups-delay"];
   get("policy-form").fields = policyFields.map(get);
-  get("notifications-form").fields = ["notifications-enabled", "notifications-sound", "notifications-repeat", "notifications-persistent"].map(get);
+  get("notifications-form").fields = ["notifications-enabled", "notifications-sound", "notifications-repeat", "notifications-persistent", "notification-theme"].map(get);
   get("webhooks-form").fields = ["webhook-enabled", "webhook-url", ...["power_lost", "power_restored", "battery_low", "overload", "ups_fault"].map((event) => "webhook-event-" + event)].map(get);
   const selectors = new Map();
   const intervals = [];
@@ -312,6 +312,46 @@ test("late status GET cannot overwrite a confirmed notification save", async () 
   await flush();
   assert.equal(ui.get("notifications-sound").checked, false);
   assert.equal(ui.get("test-notifications-label").textContent, "Probar aviso");
+});
+
+test("notification theme drafts survive polling and save independently of the panel theme", async () => {
+  const ui = await connected({ theme: "auto" });
+  assert.equal(ui.get("notification-theme").value, "auto");
+  assert.equal(ui.get("notification-theme").disabled, false);
+  ui.get("notification-theme").value = "light";
+  ui.get("notifications-form").emit("input");
+  ui.poll();
+  ui.calls.at(-1).respond(snapshot({ theme: "dark" }));
+  await flush();
+  assert.equal(ui.get("notification-theme").value, "light");
+  const pending = ui.get("notifications-form").emit("submit");
+  assert.equal(ui.get("notification-theme").disabled, true);
+  const save = ui.calls.at(-1);
+  assert.equal(save.url, "/api/notifications");
+  assert.equal(JSON.parse(save.options.body).theme, "light");
+  save.respond(snapshot({ theme: "light" }));
+  await pending;
+  assert.equal(ui.get("notification-theme").value, "light");
+  assert.equal(ui.get("notification-theme").disabled, false);
+  assert.equal(ui.get("notifications-feedback").textContent, "Avisos guardados");
+  assert.equal(ui.storageWrites.length, 0, "the saved notification preference must not change the panel theme");
+});
+
+test("notification theme stays disabled on older monitors and keeps a draft after reconnect", async () => {
+  const legacy = await connected();
+  assert.equal(legacy.get("notification-theme").disabled, true);
+  const ui = await connected({ theme: "dark" });
+  ui.get("notification-theme").value = "light";
+  ui.get("notifications-form").emit("input");
+  ui.poll();
+  ui.calls.at(-1).reject(new TypeError("offline"));
+  await flush();
+  assert.equal(ui.get("notification-theme").disabled, true);
+  ui.poll();
+  ui.calls.at(-1).respond(snapshot({ theme: "dark" }));
+  await flush();
+  assert.equal(ui.get("notification-theme").disabled, false);
+  assert.equal(ui.get("notification-theme").value, "light");
 });
 
 test("saving notices preserves unsaved protection and saving protection preserves unsaved notices", async () => {
