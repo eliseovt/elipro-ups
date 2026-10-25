@@ -1010,7 +1010,7 @@ test("persistent critical notices stay visible and are configurable when support
   assert.equal(ui.get("policy-enabled").checked, false);
 });
 
-test("durable notices require Entendido and hide the obsolete persistence switch while preserving its stored setting", async () => {
+test("durable notices explain recovery closure and hide the obsolete persistence switch while preserving its stored setting", async () => {
   const ui = harness();
   const data = snapshot({ persistent_critical: true });
   data.notifications.pending = [];
@@ -1018,7 +1018,7 @@ test("durable notices require Entendido and hide the obsolete persistence switch
   assert.equal(ui.get("notifications-persistent-option").hidden, true);
   assert.equal(ui.get("notifications-persistent").disabled, true);
   assert.equal(ui.get("notifications-inbox-note").hidden, false);
-  assert.match(ui.get("notifications-inbox-note").textContent || html, /Los avisos de energía permanecen hasta pulsar Entendido/);
+  assert.match(ui.get("notifications-inbox-note").textContent || html, /Los avisos se cierran al confirmarse la recuperación.*incidentes se conservan en el historial/);
   ui.get("notifications-persistent").checked = false;
   ui.get("notifications-sound").checked = false;
   ui.get("notifications-form").emit("input");
@@ -1955,20 +1955,19 @@ test("a pending overload becomes unconfirmed rather than resolved when its load 
   assert.equal(row.dataset.state, "active");
 });
 
-test("recovery before acknowledgment stays visible as resolved until the user acknowledges it", async () => {
+test("confirmed telemetry recovery closes the fallback dialog without acknowledgment and a recurrence reopens it", async () => {
   const { ui, data } = await currentUi({ low_battery: true });
-  const row = ui.get("critical-list").children[0];
   data.sample.low_battery = false;
   await pushStatus(ui, data);
-  assert.equal(ui.get("critical-dialog").open, true);
-  assert.equal(ui.get("critical-title").textContent, "Alerta resuelta");
-  assert.equal(ui.get("critical-list").children[0], row);
-  assert.equal(row.dataset.state, "resolved");
-  assert.match(textOf(row), /Resuelta/i);
-  ui.get("critical-ack").emit("click");
   assert.equal(ui.get("critical-dialog").open, false);
+  assert.equal(ui.get("critical-dialog").modalCloses, 1);
   await pushStatus(ui, data);
   assert.equal(ui.get("critical-dialog").open, false);
+  data.sample.low_battery = true;
+  await pushStatus(ui, data);
+  assert.equal(ui.get("critical-dialog").open, true);
+  assert.equal(ui.get("critical-dialog").modalShows, 2);
+  assert.equal(ui.calls.some((call) => call.options.method === "POST"), false);
 });
 
 function pendingNotice(ui, changes = {}) {
@@ -1976,14 +1975,13 @@ function pendingNotice(ui, changes = {}) {
     timestamp: new Date(ui.now()).toISOString(), resolved_at: null, ...changes };
 }
 
-test("a five-second outage and its recovery remain visible until durable Entendido is confirmed", async () => {
+test("a five-second outage closes on recovery while unread incidents and event history remain intact", async () => {
   const { ui, data } = await currentUi({}, { navigation: true });
   const outage = pendingNotice(ui);
   data.sample = liveSample({ on_battery: true }, ui.now());
   data.notifications.pending = [outage];
   await pushStatus(ui, data);
   const dialog = ui.get("critical-dialog");
-  const outageRow = ui.get("critical-list").children[0];
   assert.equal(dialog.open, true);
   assert.equal(ui.get("critical-title").textContent, "Corte de energía");
   ui.advance(5000);
@@ -1997,55 +1995,131 @@ test("a five-second outage and its recovery remain visible until durable Entendi
     id: 102, kind: "power_restored", title: "Suministro eléctrico recuperado", message: "Volvió el suministro eléctrico.",
   })];
   await pushStatus(ui, data);
-  assert.equal(dialog.open, true);
+  assert.equal(dialog.open, false);
   assert.equal(dialog.modalShows, 1);
-  assert.equal(ui.get("critical-title").textContent, "Avisos pendientes de Entendido");
-  assert.equal(ui.get("critical-list").children[0], outageRow);
-  assert.equal(outageRow.dataset.state, "resolved");
-  assert.match(textOf(outageRow), /Registrado:.*Recuperado:.*Pendiente de Entendido/);
-  assert.match(textOf(ui.get("critical-list").children[1]), /Suministro eléctrico recuperado.*Volvió el suministro/);
-  assert.equal(ui.get("toast").hidden, true, "the recovery must use the persistent inbox instead of a transient toast");
+  assert.equal(dialog.modalCloses, 1);
+  assert.equal(data.notifications.pending.length, 2, "automatic closure cannot mark durable notices as read");
+  assert.ok(data.notifications.pending.every((notice) => !notice.acknowledged_at));
   ui.advance(10000); ui.runTimeouts();
   for (const view of ["system", "history", "overview"]) ui.open(view);
-  ui.get("critical-dialog").emit("cancel");
-  assert.equal(dialog.open, true);
-  assert.equal(ui.calls.some((call) => call.options.method === "POST"), false);
-  const acknowledgment = ui.get("critical-ack").emit("click");
-  const request = ui.calls.at(-1);
-  assert.equal(request.url, "/api/notifications/ack");
-  assert.deepEqual(JSON.parse(request.options.body), { ids: [101, 102] });
-  assert.equal(request.options.headers["X-UPS-Token"], "test-token");
-  assert.equal(dialog.open, true, "the notices must stay visible until the monitor confirms the disk write");
-  assert.equal(ui.get("critical-ack").disabled, true);
-  await ui.get("critical-ack").emit("click");
-  assert.equal(ui.calls.at(-1), request);
-  data.notifications.pending = [];
-  request.respond(data);
-  await acknowledgment;
   assert.equal(dialog.open, false);
+  assert.equal(ui.calls.some((call) => call.options.method === "POST"), false);
   await pushStatus(ui, data);
   assert.equal(dialog.open, false);
-  assert.equal(data.events.length, 2, "Entendido must preserve event history");
+  assert.equal(data.events.length, 2, "automatic closure must preserve event history");
+  data.notifications.pending.push(pendingNotice(ui, { id: 103 }));
+  data.sample = liveSample({ on_battery: true }, ui.now());
+  await pushStatus(ui, data);
+  assert.equal(dialog.open, true, "a new outage needs attention independently of the recovered unread incident");
+  assert.equal(dialog.modalShows, 2);
+  assert.deepEqual(ui.get("critical-list").children.map((row) => row.dataset.notificationId), ["103"]);
 });
 
-test("an outage completed between panel polls opens from the durable inbox and survives reloading the panel", async () => {
+test("an outage completed between panel polls remains in the inbox without opening a modal or reopening on reload", async () => {
   const { ui, data } = await currentUi();
   data.notifications.pending = [pendingNotice(ui, { timestamp: new Date(ui.now() - 5000).toISOString(), resolved_at: new Date(ui.now()).toISOString() }),
     pendingNotice(ui, { id: 102, kind: "power_restored", title: "Suministro eléctrico recuperado", message: "Volvió la electricidad." })];
   await pushStatus(ui, data);
-  assert.equal(ui.get("critical-dialog").open, true);
-  assert.equal(ui.get("critical-list").children.length, 2);
+  assert.equal(ui.get("critical-dialog").open, false);
+  assert.equal(ui.get("critical-dialog").modalShows, 0);
   const reloaded = harness();
   reloaded.calls[0].respond(data); await flush();
-  assert.equal(reloaded.get("critical-dialog").open, true, "initial event history must not suppress unread persisted notices");
-  assert.equal(reloaded.get("critical-list").children.length, 2);
-  const acknowledgment = reloaded.get("critical-ack").emit("click");
-  data.notifications.pending = [];
-  reloaded.calls.at(-1).respond(data); await acknowledgment;
-  const understood = harness();
-  understood.calls[0].respond(data); await flush();
-  assert.equal(understood.get("critical-dialog").open, false);
+  assert.equal(reloaded.get("critical-dialog").open, false);
+  assert.equal(data.notifications.pending.length, 2);
+  assert.equal(reloaded.calls.some((call) => call.options.method === "POST"), false);
 });
+
+test("the modal follows requires_attention and retains other active incidents when an outage recovers", async () => {
+  const { ui, data } = await currentUi();
+  const outage = pendingNotice(ui, { requires_attention: true });
+  const fault = pendingNotice(ui, { id: 102, kind: "ups_fault", title: "Falla del UPS", requires_attention: true });
+  data.notifications.pending = [outage, fault];
+  await pushStatus(ui, data);
+  data.notifications.pending = [{ ...outage, requires_attention: false }, fault];
+  await pushStatus(ui, data);
+  assert.equal(ui.get("critical-dialog").open, true);
+  assert.deepEqual(ui.get("critical-list").children.map((row) => row.dataset.notificationId), ["102"]);
+  assert.equal(ui.get("critical-title").textContent, "Falla del UPS");
+  assert.equal(ui.get("critical-dialog").modalShows, 1);
+  data.notifications.pending[1] = { ...fault, requires_attention: false };
+  await pushStatus(ui, data);
+  assert.equal(ui.get("critical-dialog").open, false);
+  assert.equal(data.notifications.pending.length, 2);
+  assert.equal(ui.calls.some((call) => call.options.method === "POST"), false);
+});
+
+test("informational recovery notices use the compatibility fallback without opening a modal", async () => {
+  const { ui, data } = await currentUi();
+  data.notifications.pending = ["power_restored", "connection_restored", "monitor_restarted", "policy_cancelled", "ups_poweroff_reviewed"]
+    .map((kind, index) => pendingNotice(ui, { id: index + 1, kind }));
+  await pushStatus(ui, data);
+  assert.equal(ui.get("critical-dialog").open, false);
+  assert.equal(data.notifications.pending.length, 5);
+  assert.equal(ui.calls.some((call) => call.options.method === "POST"), false);
+});
+
+test("fresh normal telemetry cannot dismiss unresolved reviews or unconfirmed Windows and UPS actions", async () => {
+  const { ui, data } = await currentUi();
+  const kinds = ["ups_poweroff_unconfirmed", "ups_cancel_test_unconfirmed", "ups_battery_test_unconfirmed",
+    "ups_battery_test_windows_unconfirmed", "windows_action_unconfirmed", "ups_poweroff_blocked"];
+  data.notifications.pending = kinds.map((kind, index) => pendingNotice(ui, { id: index + 1, kind }));
+  await pushStatus(ui, data);
+  assert.equal(ui.get("critical-dialog").open, true);
+  assert.deepEqual(ui.get("critical-list").children.map((row) => row.dataset.kind), kinds);
+  data.sample = liveSample({}, ui.now());
+  await pushStatus(ui, data);
+  assert.equal(ui.get("critical-dialog").open, true);
+  assert.equal(ui.get("critical-list").children.length, kinds.length);
+  assert.equal(ui.calls.some((call) => call.options.method === "POST"), false);
+});
+
+test("stale telemetry and API loss do not imply recovery of an unresolved inbox incident", async () => {
+  const { ui, data } = await currentUi();
+  data.notifications.pending = [pendingNotice(ui, { requires_attention: true })];
+  await pushStatus(ui, data);
+  data.connection = { state: "stale" };
+  data.sample = liveSample({}, ui.now() - 20000);
+  await pushStatus(ui, data);
+  assert.equal(ui.get("critical-dialog").open, true);
+  ui.poll(); ui.calls.at(-1).reject(new TypeError("offline")); await flush();
+  assert.equal(ui.get("critical-dialog").open, true);
+  assert.equal(ui.get("critical-list").children[0].dataset.state, "unconfirmed");
+  assert.equal(ui.calls.some((call) => call.options.method === "POST"), false);
+});
+
+test("a recovered countdown notice cannot acknowledge or cancel a protection countdown that remains active", async () => {
+  const { ui, data } = await currentUi();
+  const countdown = pendingNotice(ui, { kind: "policy_countdown", requires_attention: true });
+  data.notifications.pending = [countdown];
+  data.protection = { state: "countdown", simulation: false, deadline: new Date(ui.now() + 60000).toISOString() };
+  await pushStatus(ui, data);
+  data.notifications.pending = [{ ...countdown, requires_attention: false, resolved_at: new Date(ui.now()).toISOString() }];
+  await pushStatus(ui, data);
+  assert.equal(ui.get("critical-dialog").open, true);
+  assert.equal(ui.get("critical-countdown").hidden, false);
+  assert.equal(ui.get("critical-countdown-time").textContent, "01:00");
+  assert.equal(ui.get("critical-cancel").disabled, false);
+  assert.equal(ui.calls.some((call) => call.options.method === "POST"), false);
+  data.protection = { state: "idle" };
+  await pushStatus(ui, data);
+  assert.equal(ui.get("critical-dialog").open, false);
+});
+
+for (const result of ["blocked", "executed"]) {
+  test(`recovering an incident keeps a ${result} protection result available for review`, async () => {
+    const { ui, data } = await currentUi();
+    const outage = pendingNotice(ui);
+    data.notifications.pending = [outage];
+    await pushStatus(ui, data);
+    data.notifications.pending = [{ ...outage, requires_attention: false, resolved_at: new Date(ui.now()).toISOString() }];
+    data.protection = { state: result, reason: "Revisa el resultado de la protección.", simulation: false };
+    await pushStatus(ui, data);
+    assert.equal(ui.get("critical-dialog").open, true);
+    assert.equal(ui.get("critical-list").children.length, 0);
+    assert.match(ui.get("critical-description").textContent, /Revisa el resultado/);
+    assert.equal(ui.calls.some((call) => call.options.method === "POST"), false);
+  });
+}
 
 test("Entendido failures and unconfirmed responses leave every selected notice pending for a safe retry", async () => {
   const { ui, data } = await currentUi();
@@ -2082,7 +2156,7 @@ test("a notice arriving during Entendido remains unread and needs its own acknow
   await pushStatus(ui, data);
   const acknowledgment = ui.get("critical-ack").emit("click");
   const request = ui.calls.at(-1);
-  data.notifications.pending = [pendingNotice(ui, { id: 102, kind: "power_restored", title: "Suministro eléctrico recuperado" })];
+  data.notifications.pending = [pendingNotice(ui, { id: 102, kind: "ups_fault", title: "Falla del UPS" })];
   request.respond(data); await acknowledgment;
   assert.deepEqual(JSON.parse(request.options.body), { ids: [101] });
   assert.equal(ui.get("critical-dialog").open, true);
@@ -2102,12 +2176,12 @@ test("Entendido commits more than 200 pending notices in bounded batches without
   const acknowledgment = ui.get("critical-ack").emit("click");
   const first = ui.calls.at(-1);
   assert.equal(JSON.parse(first.options.body).ids.length, 200);
-  data.notifications.pending = [pendingNotice(ui, { id: 201 }), pendingNotice(ui, { id: 202, kind: "power_restored" })];
+  data.notifications.pending = [pendingNotice(ui, { id: 201 }), pendingNotice(ui, { id: 202, kind: "ups_fault" })];
   first.respond(data); await flush();
   const second = ui.calls.at(-1);
   assert.notEqual(first, second);
   assert.deepEqual(JSON.parse(second.options.body), { ids: [201] });
-  data.notifications.pending = [pendingNotice(ui, { id: 202, kind: "power_restored" })];
+  data.notifications.pending = [pendingNotice(ui, { id: 202, kind: "ups_fault" })];
   second.respond(data); await acknowledgment;
   assert.equal(ui.get("critical-dialog").open, true);
   assert.equal(ui.get("critical-list").children.length, 1);
@@ -3228,7 +3302,7 @@ test("the preview precedes settings and keeps separate steps for the warning, Wi
   assert.doesNotMatch(page, /id="ups-power-sequence"/);
   assert.doesNotMatch(page, /Espera antes del aviso|policy-on-battery|policy-wait-note/);
   assert.match(page, /Tiempo antes de hibernar/);
-  assert.match(page, /Si vuelve la luz durante la cuenta atrás, se cancela la acción\. El aviso permanece hasta pulsar Entendido\./);
+  assert.match(page, /Si vuelve la luz durante la cuenta atrás, se cancela la acción y el aviso se cierra al confirmarse la recuperación\. El incidente se conserva en el historial\./);
   assert.match(page, /Apagar el UPS después de/);
   data.policy = { ...data.policy, countdown_seconds: 15, action: "hibernate", ups_poweroff: true, ups_poweroff_delay_seconds: 180 };
   await pushStatus(ui, data);
@@ -3517,7 +3591,7 @@ test("zero disables percentage priority visibly while the UPS critical alarm sti
   assert.match(textOf(ui.get("critical-list")), /El UPS ha enviado la señal de batería baja/);
 });
 
-test("a UPS block remains in the durable global notice after mains recovery and reload until Entendido", async () => {
+test("a resolved UPS block closes after recovery and reload while its durable incident and block history remain", async () => {
   const { ui, data } = await currentUi();
   const reason = "Se perdió la comunicación USB antes de enviar la orden de apagado.";
   const blockedAt = new Date(ui.now()).toISOString();
@@ -3536,21 +3610,16 @@ test("a UPS block remains in the durable global notice after mains recovery and 
   data.notifications.pending[0].resolved_at = new Date(ui.now()).toISOString();
   await pushStatus(ui, data);
   assert.equal(ui.get("ups-power-availability").textContent, "Disponible ahora");
-  assert.equal(ui.get("critical-dialog").open, true);
-  assert.match(textOf(ui.get("critical-list")), /Corte del UPS bloqueado.*comunicación USB.*Pendiente de Entendido/);
+  assert.equal(ui.get("critical-dialog").open, false);
   assert.equal(ui.get("ups-power-block-history").hidden, false);
   assert.equal(ui.get("ups-power-block-history").open, false, "history is collapsed while the current UPS is ready");
   assert.equal(ui.get("ups-power-last-block").hidden, false);
   assert.ok(ui.get("ups-power-last-block").textContent.includes(reason));
   const reloaded = harness();
   reloaded.calls[0].respond(data); await flush();
-  assert.equal(reloaded.get("critical-dialog").open, true);
-  assert.ok(textOf(reloaded.get("critical-list")).includes(reason));
-  const acknowledged = reloaded.get("critical-ack").emit("click");
-  assert.equal(reloaded.calls.at(-1).url, "/api/notifications/ack");
-  data.notifications.pending = [];
-  reloaded.calls.at(-1).respond(data); await acknowledged;
   assert.equal(reloaded.get("critical-dialog").open, false);
+  assert.equal(data.notifications.pending.length, 1);
+  assert.equal(reloaded.calls.some((call) => call.options.method === "POST"), false);
   assert.ok(reloaded.get("ups-power-last-block").textContent.includes(reason));
   await pushStatus(reloaded, data);
   assert.equal(reloaded.get("critical-dialog").open, false);

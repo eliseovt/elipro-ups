@@ -39,12 +39,16 @@ class NotificationInboxTests(unittest.TestCase):
         pending = first.status()["pending"]
         self.assertEqual([item["kind"] for item in pending], ["power_lost", "power_restored"])
         self.assertIsNotNone(pending[0]["resolved_at"])
+        self.assertTrue(all(item["requires_attention"] is False for item in pending))
+        self.assertTrue(all(item["acknowledged_at"] is None for item in pending))
         first.stop()
         store.close()
         reopened = Store(self.path)
         self.addCleanup(reopened.close)
         second = self.manager(reopened)
         self.assertEqual([item["id"] for item in second.status()["pending"]], [item["id"] for item in pending])
+        self.assertTrue(all(item["requires_attention"] is False for item in second.status()["pending"]))
+        self.assertTrue(all(item["acknowledged_at"] is None for item in second.status()["pending"]))
         second.acknowledge([pending[0]["id"]])
         self.assertEqual([item["id"] for item in second.status()["pending"]], [pending[1]["id"]])
         second.acknowledge([pending[0]["id"]])  # Lost HTTP replies are idempotent.
@@ -85,6 +89,58 @@ class NotificationInboxTests(unittest.TestCase):
         for ids in ([], [True], [0], [2**53], ["1"], None):
             with self.subTest(ids=ids), self.assertRaises(ValueError):
                 manager.acknowledge(ids)
+
+    def test_acknowledged_percentage_sources_survive_restart_and_missing_reading_without_rearming(self):
+        store = Store(self.path)
+        first = self.manager(store)
+        first.update({}, "connected", self.sample(battery_percent=10))
+        notice_id = first.status()["pending"][0]["id"]
+        first.acknowledge([notice_id])
+        first.stop()
+        store.close()
+        reopened = Store(self.path)
+        self.addCleanup(reopened.close)
+        second = self.manager(reopened)
+        second.update({}, "connected", self.sample(battery_percent=None))
+        incident = reopened.notification_incidents()[0]
+        self.assertEqual(incident["id"], notice_id)
+        self.assertIsNone(incident["resolved_at"])
+        self.assertIsNotNone(incident["acknowledged_at"])
+        self.assertEqual(second.status()["pending"], [])
+        self.clock.advance(31)
+        second.update({}, "connected", self.sample(battery_percent=10))
+        self.assertEqual(second.status()["pending"], [])
+        second.update({}, "connected", self.sample(battery_percent=80))
+        self.assertEqual(reopened.notification_incidents(), [])
+        second.update({}, "connected", self.sample(battery_percent=10))
+        self.assertEqual(len(second.status()["pending"]), 1)
+        self.assertNotEqual(second.status()["pending"][0]["id"], notice_id)
+
+    def test_source_learned_after_restart_survives_acknowledgement_and_another_restart(self):
+        store = Store(self.path)
+        first = self.manager(store)
+        first.update({}, "connected", self.sample(battery_percent=10))
+        notice_id = first.status()["pending"][0]["id"]
+        first.stop()
+        store.close()
+        reopened = Store(self.path)
+        second = self.manager(reopened)
+        second.update({}, "connected", self.sample(low_battery=True, battery_percent=10))
+        second.acknowledge([notice_id])
+        second.stop()
+        reopened.close()
+        reopened_again = Store(self.path)
+        self.addCleanup(reopened_again.close)
+        third = self.manager(reopened_again)
+        third.update({}, "connected", self.sample(low_battery=None, battery_percent=80))
+        incident = reopened_again.notification_incidents()[0]
+        self.assertEqual(incident["id"], notice_id)
+        self.assertEqual(incident["condition_sources"], ["reported_percentage", "signal"])
+        self.assertIsNone(incident["resolved_at"])
+        self.assertIsNotNone(incident["acknowledged_at"])
+        self.assertEqual(third.status()["pending"], [])
+        third.update({}, "connected", self.sample(low_battery=False, battery_percent=80))
+        self.assertEqual(reopened_again.notification_incidents(), [])
 
     def test_unread_notice_outlives_history_retention_and_desktop_disable(self):
         store = Store(self.path, retention_days=1)

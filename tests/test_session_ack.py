@@ -282,7 +282,10 @@ class SemanticAlertTests(unittest.TestCase):
             self.assertEqual(len(broker._persistent), 2)
             alerts.on_event("policy_action_started", "Ejecutando apagado")
             self.assertNotIn("policy_countdown", broker._conditions)
-            self.assertTrue(any("anterior" in item["message"] for item in broker._persistent.values()))
+            self.assertEqual(len(broker._persistent), 1)
+            countdown = next(item for item in alerts.status()["pending"] if item["kind"] == "policy_countdown")
+            self.assertFalse(countdown["requires_attention"])
+            self.assertIsNone(countdown["acknowledged_at"])
             alerts.update({}, "stale", sample)
             self.assertEqual(broker._conditions, {})
             self.assertGreater(broker.status()["pending_retained"], 0)
@@ -291,6 +294,47 @@ class SemanticAlertTests(unittest.TestCase):
         finally:
             alerts.stop()
             store.close()
+
+    def test_recovery_retires_active_delivery_without_losing_temporary_notice_or_saved_incident(self):
+        store = Store(":memory:")
+        self.addCleanup(store.close)
+        broker = SessionBroker()
+        alerts = AlertManager(store, broker)
+        alerts.start()
+        self.addCleanup(alerts.stop)
+        notifier = ReceiptNotifier()
+        agent = Agent(BrokerClient(broker), notifier, session_state=lambda: "active")
+        alerts.on_event("power_lost", "El UPS usa batería")
+        sample = {"timestamp": datetime.now(timezone.utc).isoformat(), "on_battery": True, "low_battery": False}
+        alerts.update({}, "connected", sample)
+        agent.step()
+        self.assertTrue(notifier.messages[-1][2]["persistent"])
+        self.assertEqual(len(notifier.persistent), 1)
+
+        alerts.on_event("power_restored", "Volvió el suministro")
+        alerts.update({}, "connected", {**sample, "on_battery": False})
+        self.assertEqual(broker._persistent, {})
+        self.assertEqual([item["kind"] for item in broker._retained], ["power_restored"])
+        agent.step()
+        self.assertEqual(notifier.persistent, {})
+        recovery = notifier.messages[-1][2]
+        self.assertFalse(recovery["persistent"])
+        self.assertIsNone(recovery["key"])
+        notifier.receipts = [{"delivery_id": recovery["delivery_id"], "outcome": "accepted"}]
+        agent.step()
+        self.assertEqual(broker.status()["pending_retained"], 0)
+        pending = alerts.status()["pending"]
+        self.assertEqual({item["kind"] for item in pending}, {"power_lost", "power_restored"})
+        self.assertTrue(all(item["requires_attention"] is False for item in pending))
+        self.assertTrue(all(item["acknowledged_at"] is None for item in store.pending_notifications()))
+
+        alerts.stop()
+        restarted_broker = SessionBroker()
+        restarted = AlertManager(store, restarted_broker)
+        restarted.start()
+        self.addCleanup(restarted.stop)
+        self.assertEqual(restarted_broker._persistent, {})
+        self.assertEqual({item["id"] for item in restarted.status()["pending"]}, {item["id"] for item in pending})
 
 
 class NativeQueueIntegrationTests(unittest.TestCase):

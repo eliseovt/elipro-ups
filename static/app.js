@@ -195,6 +195,11 @@
     const currentResult = protectionResultKey(protection);
     if (state.pendingNotifications.size || state.criticalItems.size || currentCountdown && !sameCountdown
         || currentResult !== null && state.criticalResultAcknowledged !== currentResult) { refreshTelemetry(); return; }
+    closeCriticalDialog();
+  }
+
+  function closeCriticalDialog() {
+    if (!state.criticalOpen) return;
     state.criticalOpen = false;
     const dialog = $("critical-dialog");
     if (dialog.open) dialog.close();
@@ -246,9 +251,15 @@
       const next = new Map();
       for (const notice of pending) {
         if (!Number.isSafeInteger(notice?.id) || notice.id <= 0) continue;
+        // Recovered incidents stay unread in the monitor's durable inbox, but
+        // they no longer require an interrupting dialog. Older monitors do not
+        // publish requires_attention, so retain the same recovery rules here.
+        const requiresAttention = typeof notice.requires_attention === "boolean" ? notice.requires_attention
+          : !notice.resolved_at && !["power_restored", "connection_restored", "monitor_restarted", "policy_cancelled", "ups_poweroff_reviewed"].includes(notice.kind);
+        if (!requiresAttention) continue;
         const item = state.pendingNotifications.get(notice.id) || { notificationId: notice.id };
         item.definition = { kind: String(notice.kind || "notification"), title: String(notice.title || eventLabel(notice.kind)) };
-        item.status = notice.resolved_at || /^(power|connection)_restored$/.test(notice.kind) ? "resolved" : "active";
+        item.status = "active";
         const timestamp = parseDate(notice.timestamp);
         const resolved = parseDate(notice.resolved_at);
         item.message = `${String(notice.message || eventLabel(notice.kind))}${timestamp ? ` Registrado: ${recordDateFormat.format(timestamp)}.` : ""}${resolved ? ` Recuperado: ${recordDateFormat.format(resolved)}.` : ""}`;
@@ -296,8 +307,10 @@
     const previousPendingNotifications = [...state.pendingNotifications.values()];
     const hadPendingNotifications = previousPendingNotifications.length > 0;
     syncPendingNotifications();
-    const acknowledgedCountdownElsewhere = previousPendingNotifications.some((item) => item.definition.kind === "policy_countdown"
-      && item.status !== "resolved" && !state.pendingNotifications.has(item.notificationId));
+    const rawPending = state.status?.notifications?.pending;
+    const acknowledgedCountdownElsewhere = state.serviceAvailable && Array.isArray(rawPending)
+      && previousPendingNotifications.some((item) => item.definition.kind === "policy_countdown"
+        && !rawPending.some((notice) => notice.id === item.notificationId));
     // The monitor owns incident episodes and durable acknowledgments. Older
     // versions without an inbox retain the existing telemetry-only fallback.
     const hasInbox = Array.isArray(state.status?.notifications?.pending);
@@ -318,9 +331,8 @@
           item.status = "active";
           item.message = definition.message(sample);
           state.criticalItems.set(definition.kind, item);
-        } else if (state.criticalItems.has(definition.kind)) {
-          const item = state.criticalItems.get(definition.kind);
-          item.status = active ? "active" : "resolved";
+        } else if (!active) {
+          state.criticalItems.delete(definition.kind);
         }
       }
     } else {
@@ -331,6 +343,7 @@
     const resultKey = !state.stopAcknowledged ? protectionResultKey(protection) : null;
     if (!resultKey) state.criticalResultAcknowledged = null;
     const resultAttention = resultKey !== null && state.criticalResultAcknowledged !== resultKey;
+    const simulationResultVisible = state.criticalOpen && protection.simulation === true && simulationPhase() === "complete";
     if (!countdown) state.criticalCountdownAcknowledged = null;
     const acknowledged = state.criticalCountdownAcknowledged;
     const deadline = parseDate(protection.deadline)?.getTime() ?? null;
@@ -344,11 +357,14 @@
     const increasedRemaining = deadline === null && finite(protection.countdown_remaining) && finite(acknowledged?.remaining) && protection.countdown_remaining > acknowledged.remaining + 2;
     if (countdown && state.serviceAvailable && acknowledged && (newDeadline || increasedRemaining || acknowledged.simulation !== !!protection.simulation || acknowledged.action !== state.status?.policy?.action)) state.criticalCountdownAcknowledged = null;
     if (hadPendingNotifications && !state.pendingNotifications.size && state.mutation !== "ack-notifications"
-        && !state.criticalItems.size && (!countdown || acknowledgedCountdownElsewhere) && !resultAttention) {
+        && !state.criticalItems.size && countdown && acknowledgedCountdownElsewhere && !resultAttention) {
       // Entendido in the native window is the same explicit action as in this panel.
       finishCriticalAcknowledgment(captureCriticalAcknowledgment());
     }
-    if (!state.criticalItems.size && !state.pendingNotifications.size && (!countdown || state.criticalCountdownAcknowledged) && !resultAttention && !state.criticalOpen) {
+    if (!state.criticalItems.size && !state.pendingNotifications.size && (!countdown || state.criticalCountdownAcknowledged) && !resultAttention && !simulationResultVisible) {
+      // Automatic recovery only closes the view. It never acknowledges notices,
+      // suppresses a new incident, or changes an active protection action.
+      closeCriticalDialog();
       renderCriticalCountdown();
       return;
     }
@@ -361,7 +377,7 @@
     let description = active.length ? "El UPS requiere tu atención. Revisa las condiciones detectadas." : unconfirmed ? "No hay información suficiente para confirmar las condiciones detectadas. Revisa el estado y la conexión con el monitor." : "El UPS ya no reporta estas condiciones. El incidente permanece en el registro.";
     if (pending.length) {
       title = active.length ? active[0].definition.title : unconfirmed ? "Estado sin confirmar" : "Avisos pendientes de Entendido";
-      description = "Los avisos permanecen aquí hasta que marques Entendido, aunque vuelva la electricidad. Confirmar su lectura no cancela la protección ni borra el historial.";
+      description = "El aviso se cierra automáticamente cuando se confirma la recuperación. El incidente se conserva en el historial. Entendido confirma su lectura sin cancelar la protección.";
     }
     if (!items.length) {
       const simulation = protection.simulation === true;
