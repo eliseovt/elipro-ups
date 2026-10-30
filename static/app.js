@@ -1103,10 +1103,10 @@
     status.textContent = !confirmed ? "Sin confirmar" : available ? "Disponible ahora" : "Bloqueado ahora";
     setText("ups-power-conditions-note", "Solo estas cuatro condiciones pueden bloquear la orden. El voltaje y la carga no bloquean el apagado; el porcentaje bajo de batería adelanta la protección.");
     const categories = [
-      { key: "connection", label: "UPS conectado y compatible", checks: ["native_source", "source", "identity", "usb_identity", "profile", "connection", "communication", "monitor_running", "operational_profile", "sample_fresh", "qs_status", "power_state"], action: "Comprueba la conexión USB y el estado del monitor." },
-      { key: "windows", label: protectionDraft().action === "shutdown" ? "Windows preparado para apagar" : "Windows preparado para hibernar", checks: ["real_actions", "windows", "windows_action", "windows_ready"], action: "Revisa la acción de Windows y los permisos del servicio." },
-      { key: "operation", label: "Sin otra operación de energía pendiente", checks: ["manual_tests", "operation", "previous_operation", "battery_test", "shutdown_pending"], action: "Espera a que termine la operación o revisa su estado antes de iniciar otra." },
-      { key: "controlled_shutdown", label: "Apagado controlado disponible", checks: ["low_battery", "fault"], action: "Revisa la alarma indicada por el UPS. Se mantiene la protección de Windows." },
+      { key: "connection", label: "UPS conectado y compatible", description: "Comprueba que Elipro pueda comunicarse con el UPS por USB y apagarlo.", checks: ["native_source", "source", "identity", "usb_identity", "profile", "connection", "communication", "monitor_running", "operational_profile", "sample_fresh", "qs_status", "power_state"], action: "Comprueba la conexión USB y el estado del monitor." },
+      { key: "windows", label: protectionDraft().action === "shutdown" ? "Windows preparado para apagar" : "Windows preparado para hibernar", description: protectionDraft().action === "shutdown" ? "Comprueba que Elipro pueda apagar este equipo automáticamente." : "Comprueba que Elipro pueda hibernar este equipo automáticamente.", checks: ["real_actions", "windows", "windows_action", "windows_ready"], action: "Revisa la acción de Windows y los permisos del servicio." },
+      { key: "operation", label: "Sin pruebas ni apagados pendientes", description: "Si hay una prueba o un apagado pendiente, primero debe terminar o revisarse.", checks: ["manual_tests", "operation", "previous_operation", "battery_test", "shutdown_pending"], action: "Espera a que termine la operación o revisa su estado antes de iniciar otra." },
+      { key: "controlled_shutdown", label: "Estado de la batería y del UPS", description: "Si el UPS avisa de batería crítica o una falla, podría apagarse antes del tiempo elegido.", checks: ["low_battery", "fault"], action: "Revisa la alarma indicada por el UPS. Se mantiene la protección de Windows." },
     ];
     const checks = Array.isArray(capability?.checks) ? capability.checks : Array.isArray(admission?.checks) ? admission.checks : [];
     const blockers = Array.isArray(capability?.blockers) ? capability.blockers : [];
@@ -1125,6 +1125,10 @@
       const result = document.createElement("strong");
       result.textContent = !confirmedCheck ? "Sin confirmar" : blocked ? "Bloqueado" : "Listo";
       row.append(label, result);
+      const description = document.createElement("small");
+      description.className = "ups-power-check-description";
+      description.textContent = category.description;
+      row.append(description);
       const reasons = blocker ? (Array.isArray(blocker.reasons) ? blocker.reasons : []) : legacyFailures.map((check) => check.reason);
       const details = [...new Set(reasons.map(upsReason).filter(Boolean))];
       const summary = upsReason(blocker?.reason);
@@ -1143,12 +1147,6 @@
     });
     list.replaceChildren(...rows);
     list.hidden = false;
-    const block = capability?.last_block;
-    const blockReason = upsReason(block?.reason || block?.message);
-    const stamp = parseDate(block?.timestamp);
-    $("ups-power-block-history").hidden = false;
-    $("ups-power-last-block").hidden = !blockReason;
-    setText("ups-power-last-block", blockReason ? `Último bloqueo registrado${stamp ? ` (${recordDateFormat.format(stamp)})` : ""}: ${blockReason}` : "");
   }
 
   function upsCancelTestActive() {

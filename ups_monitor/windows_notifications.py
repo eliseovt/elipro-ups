@@ -775,8 +775,6 @@ class _Win32Backend:
             raise OSError("No se pudo abrir el menú de Elipro")
         try:
             self.user.AppendMenuW(menu, 0, 1, "Abrir Elipro")
-            if self.owner.cancel_callback is not None:
-                self.user.AppendMenuW(menu, 0, 2, "Cancelar acción pendiente")
             if self.owner.exit_callback is not None:
                 self.user.AppendMenuW(menu, 0x0800, 0, None)
                 self.user.AppendMenuW(menu, 0, 3, self._owner_text("exit_label", DEFAULT_EXIT_LABEL))
@@ -789,9 +787,6 @@ class _Win32Backend:
             self.user.PostMessageW(self.hwnd, 0, 0, 0)
             if command == 1:
                 self.owner._open_panel()
-            elif (command == 2 and self.owner.cancel_callback is not None
-                  and not self.owner._stop.is_set()):
-                self.owner.cancel_callback()
             elif (command == 3 and self.owner.exit_callback is not None
                   and not self.owner._stop.is_set()):
                 exit_label = self._owner_text("exit_label", DEFAULT_EXIT_LABEL)

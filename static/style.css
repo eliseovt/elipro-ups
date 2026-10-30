@@ -350,10 +350,8 @@ body[data-view=protection] .page-heading{margin-bottom:14px;min-height:58px}
 .ups-power-checks small{grid-column:1/-1;color:var(--muted);font-size:11px;overflow-wrap:anywhere}
 .ups-power-checks [data-state=blocked]{border-color:var(--amber)}
 .ups-power-checks .ups-power-resolution{color:var(--text)}
-.ups-power-block-history{margin-top:10px;font-size:12px;line-height:1.5;color:var(--muted)}
-.ups-power-block-history summary{cursor:pointer}
-.ups-power-block-history summary:focus-visible{outline:2px solid var(--teal);outline-offset:4px}
-.ups-power-last-block{margin-top:10px;font-size:12px;line-height:1.6;color:var(--muted);overflow-wrap:anywhere}
+.ups-power-details{margin-top:14px;padding-top:12px;border-top:1px solid var(--line)}
+.ups-power-details h5{margin:0;font-size:13px;line-height:1.5;font-weight:600}
 .protection-notes{margin:10px 0 0;padding-left:20px;color:var(--muted);font-size:12px;line-height:1.6}
 .protection-notes li+li{margin-top:4px}
 .ups-power-review{margin-top:14px;padding-top:10px;border-top:1px solid var(--line)}

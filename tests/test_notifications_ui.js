@@ -3358,9 +3358,10 @@ test("Protection is always expanded and its preview uses one Windows countdown a
   ui.open("protection");
   const page = html.match(/<section id="page-protection"[\s\S]*?(?=<section id="page-system")/)[0];
   assert.doesNotMatch(page, /id="settings-toggle"|aria-expanded|disclosure-arrow/);
-  assert.equal([...page.matchAll(/<details\b/g)].length, 1, "only operating details and the previous block history are collapsible");
-  assert.equal(ui.get("ups-power-block-history").hidden, false, "operating details remain accessible without a previous block");
-  assert.equal(ui.get("ups-power-last-block").hidden, true);
+  assert.doesNotMatch(page, /<details\b|<summary\b|Último bloqueo/, "operating details are always visible without block history");
+  assert.match(page, /<h5 id="ups-power-details-heading">Detalles de funcionamiento<\/h5>/);
+  assert.equal(ui.get("ups-power-details").hidden, false);
+  assert.equal(ui.document.getElementById("ups-power-last-block"), null);
   assert.equal(ui.document.getElementById("settings-toggle"), null);
   assert.equal(ui.get("settings-panel").hidden, false);
   assert.equal(ui.get("policy-countdown").value, 15);
@@ -3573,7 +3574,7 @@ test("UPS protection shows exactly four current blockers and ignores removed vol
   assert.equal(ui.get("ups-power-availability").textContent, "Disponible ahora");
   assert.equal(ui.get("ups-power-checks").children.length, 4);
   assert.deepEqual(ui.get("ups-power-checks").children.map((row) => row.dataset.check), ["connection", "windows", "operation", "controlled_shutdown"]);
-  assert.match(textOf(ui.get("ups-power-checks")), /UPS conectado y compatible.*Windows preparado para hibernar.*Sin otra operación de energía pendiente.*Apagado controlado disponible/);
+  assert.match(textOf(ui.get("ups-power-checks")), /UPS conectado y compatible.*Windows preparado para hibernar.*Sin pruebas ni apagados pendientes.*Estado de la batería y del UPS/);
   assert.ok(ui.get("ups-power-checks").children.every((row) => row.dataset.state === "passed"));
   assert.match(ui.get("ups-power-conditions-note").textContent, /voltaje y la carga no bloquean/);
   assert.doesNotMatch(textOf(ui.get("ups-power-checks")), /25[.,]18|100 %|Red eléctrica previa/);
@@ -3758,7 +3759,7 @@ test("zero disables percentage priority visibly while the UPS critical alarm sti
   assert.match(textOf(ui.get("critical-list")), /El UPS ha enviado la señal de batería baja/);
 });
 
-test("a resolved UPS block closes after recovery and reload while its durable incident and block history remain", async () => {
+test("a resolved UPS block closes after recovery and reload while its durable incident remains outside Protection", async () => {
   const { ui, data } = await currentUi();
   const reason = "Se perdió la comunicación USB antes de enviar la orden de apagado.";
   const blockedAt = new Date(ui.now()).toISOString();
@@ -3778,16 +3779,15 @@ test("a resolved UPS block closes after recovery and reload while its durable in
   await pushStatus(ui, data);
   assert.equal(ui.get("ups-power-availability").textContent, "Disponible ahora");
   assert.equal(ui.get("critical-dialog").open, false);
-  assert.equal(ui.get("ups-power-block-history").hidden, false);
-  assert.equal(ui.get("ups-power-block-history").open, false, "history is collapsed while the current UPS is ready");
-  assert.equal(ui.get("ups-power-last-block").hidden, false);
-  assert.ok(ui.get("ups-power-last-block").textContent.includes(reason));
+  assert.equal(ui.get("ups-power-details").hidden, false);
+  assert.equal(ui.document.getElementById("ups-power-block-history"), null);
+  assert.equal(ui.document.getElementById("ups-power-last-block"), null);
   const reloaded = harness();
   reloaded.calls[0].respond(data); await flush();
   assert.equal(reloaded.get("critical-dialog").open, false);
   assert.equal(data.notifications.pending.length, 1);
   assert.equal(reloaded.calls.some((call) => call.options.method === "POST"), false);
-  assert.ok(reloaded.get("ups-power-last-block").textContent.includes(reason));
+  assert.equal(reloaded.document.getElementById("ups-power-last-block"), null);
   await pushStatus(reloaded, data);
   assert.equal(reloaded.get("critical-dialog").open, false);
 });

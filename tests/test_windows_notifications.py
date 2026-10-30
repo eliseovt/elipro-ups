@@ -493,16 +493,22 @@ class NativeShellTests(unittest.TestCase):
         self.assertEqual([item[0] for item in self.native_calls[before:]], [wn.NIM_ADD, wn.NIM_SETVERSION])
         self.owner._set_ready.assert_called_with(True)
 
-    def test_click_opens_panel_but_only_explicit_menu_command_cancels(self):
+    def test_tray_opens_panel_and_menu_only_offers_open_and_exit(self):
         self.backend._window_proc(self.backend.hwnd, wn.WM_APP_TRAY, 0, wn.NIN_BALLOONUSERCLICK)
         self.owner._open_panel.assert_called_once_with()
         self.owner.cancel_callback.assert_not_called()
         self.user.TrackPopupMenu.return_value = 0
         self.backend._window_proc(self.backend.hwnd, wn.WM_APP_TRAY, 0, wn.WM_CONTEXTMENU)
         self.owner.cancel_callback.assert_not_called()
+        actions = [(call.args[2], call.args[3])
+                   for call in self.user.AppendMenuW.call_args_list if call.args[1] == 0]
+        self.assertEqual(actions, [(1, "Abrir Elipro"), (3, wn.DEFAULT_EXIT_LABEL)])
+        self.user.TrackPopupMenu.return_value = 1
+        self.backend._window_proc(self.backend.hwnd, wn.WM_APP_TRAY, 0, wn.WM_CONTEXTMENU)
+        self.assertEqual(self.owner._open_panel.call_count, 2)
         self.user.TrackPopupMenu.return_value = 2
         self.backend._window_proc(self.backend.hwnd, wn.WM_APP_TRAY, 0, wn.WM_CONTEXTMENU)
-        self.owner.cancel_callback.assert_called_once_with()
+        self.owner.cancel_callback.assert_not_called()
 
     def test_shutdown_does_not_start_cancel_callback_from_open_menu(self):
         self.owner._stop.set()
