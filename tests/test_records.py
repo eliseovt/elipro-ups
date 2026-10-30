@@ -6,7 +6,7 @@ import unittest
 from datetime import timedelta
 from unittest.mock import patch
 
-from ups_monitor.core import RecordCursorExpired, Store, iso_utc, utc_now
+from ups_monitor.core import MISSING_TELEMETRY_REASON, RecordCursorExpired, Store, iso_utc, utc_now
 from ups_monitor.persistence import HistoryUnavailable, ResilientStore
 
 
@@ -230,6 +230,135 @@ class RecordTests(unittest.TestCase):
             self.assertEqual(grouping.call_count, 2)
             self.assertEqual(recovered["status"], "recovered")
             self.assertEqual(recovered["duration_seconds"], 20)
+
+    def test_recent_summary_pairs_historical_missing_telemetry_notices_across_raw_window(self):
+        self.base = utc_now() - timedelta(days=2)
+        first = self.event("policy_unknown", 0, MISSING_TELEMETRY_REASON, {"state": "unknown"})
+        for second in range(1, 131):
+            self.event("custom", second)
+        self.event("policy_unknown", 180, MISSING_TELEMETRY_REASON, {"state": "unknown"})
+        first_recovery = self.event("connection_restored", 32683)
+        second = self.event("policy_unknown", 40000, MISSING_TELEMETRY_REASON, {"state": "unknown"})
+        second_recovery = self.event("connection_restored", 81923)
+        self.assertNotIn(first["id"], [event["id"] for event in self.store.events(100)])
+        raw_before = self.store.events(1000)
+        archive_before = self.store.records(limit=200)["records"]
+
+        records = self.store.recent_records()
+        groups = [record for record in records if record["record_type"] == "incident"]
+        self.assertEqual([record["type"] for record in groups], ["connection", "connection"])
+        self.assertEqual([record["opening_event_id"] for record in groups], [second["id"], first["id"]])
+        self.assertEqual([record["recovery_event_id"] for record in groups],
+                         [second_recovery["id"], first_recovery["id"]])
+        self.assertEqual([record["duration_seconds"] for record in groups], [41923, 32683])
+        self.assertTrue(all(record["status"] == "recovered" and record["start_known"] for record in groups))
+        self.assertTrue(all(record["categories"] == ["connection", "protection"] for record in groups))
+        self.assertFalse(any(record.get("kind") in {"policy_unknown", "connection_restored"} for record in records))
+        self.assertEqual(self.store.events(1000), raw_before)
+        self.assertEqual(self.store.records(limit=200)["records"], archive_before)
+
+    def test_recent_summary_does_not_infer_missing_telemetry_from_other_unknown_reasons(self):
+        cases = [
+            ("Esperando una lectura válida del UPS después de actualizar la protección.", {"state": "unknown"}),
+            (MISSING_TELEMETRY_REASON + "; causa distinta", {"state": "unknown"}),
+            (MISSING_TELEMETRY_REASON, {"state": "countdown"}),
+            (MISSING_TELEMETRY_REASON, {}),
+        ]
+        for index, (message, data) in enumerate(cases):
+            self.event("policy_unknown", index * 2, message, data)
+            self.event("connection_restored", index * 2 + 1)
+        rows = self.store.recent_records()
+        self.assertEqual(len(rows), len(cases) * 2)
+        self.assertTrue(all(record["record_type"] == "event" for record in rows))
+        self.assertTrue(all(record["duration_seconds"] is None for record in rows))
+
+    def test_recent_telemetry_notice_preserves_shared_power_action_and_explicit_opening(self):
+        self.event("power_lost", 0)
+        opening = self.event("connection_lost", 1)
+        notice = self.event("policy_unknown", 2, MISSING_TELEMETRY_REASON, {"state": "unknown"})
+        self.event("connection_restored", 20)
+        groups = self.store._group_records(list(self.store.iter_events()), utc_now(),
+                                          telemetry_notice_ids={notice["id"]})
+        groups = {record["type"]: record for record in groups if record["record_type"] == "incident"}
+        self.assertEqual(groups["connection"]["opening_event_id"], opening["id"])
+        self.assertEqual(groups["connection"]["duration_seconds"], 19)
+        for group in groups.values():
+            self.assertEqual(group["actions"], [notice])
+            self.assertEqual(sum(event["id"] == notice["id"] for event in group["events"]), 1)
+        summary = self.store.recent_records()
+        self.assertEqual(summary[0]["type"], "connection")
+        self.assertEqual(summary[1]["type"], "power")
+        self.assertEqual(summary[1]["status"], "open")
+        self.assertIsNone(summary[1]["duration_seconds"])
+
+    def test_recent_telemetry_notice_stays_unconfirmed_until_recovery_and_respects_retention(self):
+        old = iso_utc(utc_now() - timedelta(days=31))
+        self.store.add_event("policy_unknown", MISSING_TELEMETRY_REASON,
+                             {"state": "unknown"}, timestamp=old)
+        pending = self.store.recent_records()[0]
+        self.assertEqual(pending["status"], "open")
+        self.assertIsNone(pending["duration_seconds"])
+        self.event("connection_restored", 0)
+        self.assertEqual(self.store.recent_records()[0]["record_type"], "incident")
+        self.store._last_prune = 0
+        self.store._prune()
+        orphan = self.store.recent_records()[0]
+        self.assertEqual(orphan["kind"], "connection_restored")
+        self.assertEqual(orphan["record_type"], "event")
+        self.assertIsNone(orphan["duration_seconds"])
+
+    def test_legacy_notice_with_intermediate_readings_is_not_a_continuous_gap(self):
+        self.event("power_lost", 0)
+        notice = self.event("policy_unknown", 10, MISSING_TELEMETRY_REASON, {"state": "unknown"})
+        for second in range(20, 100, 10):
+            self.store.add_sample({"timestamp": self.stamp(second), "input_voltage": 220})
+        recovery = self.event("connection_restored", 120)
+        rows = self.store.recent_records()
+        self.assertFalse(any(record["type"] == "connection" for record in rows))
+        standalone = {record["id"] for record in rows if record["record_type"] == "event"}
+        self.assertEqual(standalone, {"event:" + str(notice["id"]), "event:" + str(recovery["id"])})
+        self.assertEqual(self.store.records()["records"][-1]["actions"], [notice])
+
+    def test_legacy_gap_allows_the_fresh_sample_that_triggers_recovery(self):
+        self.event("policy_unknown", 0, MISSING_TELEMETRY_REASON, {"state": "unknown"})
+        self.store.add_sample({"timestamp": self.stamp(119.5), "input_voltage": 220})
+        self.event("connection_restored", 120)
+        rows = self.store.recent_records()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["type"], "connection")
+        self.assertEqual(rows[0]["duration_seconds"], 120)
+
+    def test_unclosed_legacy_notice_with_later_measurements_remains_an_event(self):
+        self.event("policy_unknown", 0, MISSING_TELEMETRY_REASON, {"state": "unknown"})
+        self.store.add_sample({"timestamp": self.stamp(60), "input_voltage": 220})
+        rows = self.store.recent_records()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["record_type"], "event")
+        self.assertIsNone(rows[0]["duration_seconds"])
+
+    def test_recent_cache_rechecks_only_readings_that_can_contradict_a_legacy_gap(self):
+        self.event("policy_unknown", 0, MISSING_TELEMETRY_REASON, {"state": "unknown"})
+        self.event("connection_restored", 120)
+        with patch.object(self.store, "_group_records", wraps=self.store._group_records) as grouping:
+            self.assertEqual(self.store.recent_records()[0]["type"], "connection")
+            self.store.add_sample({"timestamp": self.stamp(119.5), "input_voltage": 220})
+            self.store.add_sample({"timestamp": self.stamp(130), "input_voltage": 220})
+            self.assertEqual(self.store.recent_records()[0]["type"], "connection")
+            self.assertEqual(grouping.call_count, 1)
+            self.store.add_sample({"timestamp": self.stamp(60), "input_voltage": 220})
+            self.assertTrue(all(record["record_type"] == "event" for record in self.store.recent_records()))
+            self.assertEqual(grouping.call_count, 2)
+            self.store.add_sample({"timestamp": self.stamp(70), "input_voltage": 220})
+            self.store.recent_records()
+            self.assertEqual(grouping.call_count, 2, "An already rejected gap needs no sample-driven rebuild")
+
+    def test_recent_cache_rechecks_an_unclosed_legacy_gap_when_readings_resume(self):
+        self.event("policy_unknown", 0, MISSING_TELEMETRY_REASON, {"state": "unknown"})
+        with patch.object(self.store, "_group_records", wraps=self.store._group_records) as grouping:
+            self.assertEqual(self.store.recent_records()[0]["record_type"], "incident")
+            self.store.add_sample({"timestamp": self.stamp(10), "input_voltage": 220})
+            self.assertEqual(self.store.recent_records()[0]["record_type"], "event")
+            self.assertEqual(grouping.call_count, 2)
 
     def test_recent_summary_is_invalidated_when_retention_removes_an_opening(self):
         old = iso_utc(utc_now() - timedelta(days=31))

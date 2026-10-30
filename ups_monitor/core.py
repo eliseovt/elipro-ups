@@ -34,6 +34,7 @@ DEFAULT_POLICY = {
     "ups_poweroff_delay_seconds": 180,
 }
 BATTERY_ESTIMATE_FIELDS = ("battery_percent_estimate", "battery_estimate_method")
+MISSING_TELEMETRY_REASON = "Sin datos recientes y confirmados del UPS"
 SAMPLE_FIELDS = (
     "input_voltage", "output_voltage", "frequency_hz", "load_percent",
     "battery_percent", "battery_voltage", "runtime_seconds", "temperature_c",
@@ -183,6 +184,7 @@ class Store:
         self._lock = threading.RLock()
         self._batch_depth = 0
         self._recent_records_cache = None
+        self._recent_records_sample_windows = ()
         self._db = sqlite3.connect(str(path), check_same_thread=False, timeout=busy_timeout_ms / 1000)
         try:
             with self._db:
@@ -246,6 +248,9 @@ class Store:
         with self._transaction():
             self._db.execute("INSERT INTO samples(ts,timestamp,payload) VALUES(?,?,?)",
                              (ts, normalized["timestamp"], json.dumps(normalized, allow_nan=False)))
+            if self._recent_records_cache is not None and any(
+                    start < ts < end for start, end in self._recent_records_sample_windows):
+                self._recent_records_cache = None
         return normalized
 
     def add_event(self, kind, message, data=None, *, timestamp=None):
@@ -781,13 +786,42 @@ class Store:
                  "filter": cls._cursor_fingerprint(filters, "records")}
         return base64.urlsafe_b64encode(json.dumps(value, separators=(",", ":")).encode()).decode().rstrip("=")
 
+    @staticmethod
+    def _is_missing_telemetry_notice(event):
+        return (event["kind"] == "policy_unknown" and event["message"] == MISSING_TELEMETRY_REASON
+                and isinstance(event["data"], dict) and event["data"].get("state") == "unknown")
+
+    def _overview_telemetry_notices(self, events):
+        """Reject legacy gap inference when retained readings contradict it.
+
+        A continuity reset can emit the same policy notice while the USB reader
+        remains connected. Only the overview interprets a notice as a gap. The
+        final fresh sample may precede its connection-restored event by up to
+        the policy's 15-second freshness window.
+        """
+        accepted, windows, recovery = set(), [], None
+        for event in reversed(events):
+            if event["kind"] == "connection_restored":
+                recovery = _timestamp(event["timestamp"]).timestamp()
+            elif self._is_missing_telemetry_notice(event):
+                start = _timestamp(event["timestamp"]).timestamp()
+                end = recovery - 15 if recovery is not None else math.inf
+                contradictory = self._db.execute(
+                    "SELECT 1 FROM samples WHERE ts>? AND ts<? LIMIT 1", (start, end)).fetchone()
+                if contradictory is None:
+                    accepted.add(event["id"])
+                    windows.append((start, end))
+        return accepted, windows
+
     @classmethod
-    def _group_records(cls, events, as_of):
+    def _group_records(cls, events, as_of, *, telemetry_notice_ids=None):
         """Associate only outage evidence and protection actions with incidents.
 
         Alerts and configuration are independent conditions, even during an
         outage. A shared protection action can appear in two incident details
         while its event ID is suppressed only once in the standalone feed.
+        The overview can also recognize the exact historical policy notice
+        emitted for missing telemetry, without reclassifying configuration waits.
         """
         active, incidents, members = {}, [], set()
         opening = {"power_lost": "power", "connection_lost": "connection", "monitor_error": "connection"}
@@ -797,7 +831,9 @@ class Store:
             if (kind in {"connection_lost", "monitor_error"} and isinstance(event["data"], dict)
                     and event["data"].get("error_kind") == "stopped"):
                 continue
-            event_type = opening.get(kind)
+            legacy_notice = telemetry_notice_ids is not None and cls._is_missing_telemetry_notice(event)
+            telemetry_notice = legacy_notice and event["id"] in telemetry_notice_ids
+            event_type = "connection" if telemetry_notice else opening.get(kind)
             if event_type is not None:
                 if event_type not in active:
                     incident = {"id": event_type + ":" + str(event["id"]), "record_type": "incident",
@@ -812,6 +848,13 @@ class Store:
                     incidents.append(incident)
                 active[event_type]["events"].append(event)
                 members.add(event["id"])
+                if telemetry_notice:
+                    # It remains protection evidence for any concurrent power
+                    # incident while also opening the missing-readings interval.
+                    for incident in active.values():
+                        incident["actions"].append(event)
+                        if incident is not active[event_type]:
+                            incident["events"].append(event)
             elif kind in recovery:
                 incident = active.pop(recovery[kind], None)
                 if incident is not None:
@@ -823,7 +866,10 @@ class Store:
                 for incident in active.values():
                     incident["actions"].append(event)
                     incident["events"].append(event)
-                    members.add(event["id"])
+                    # A notice contradicted by recorded readings must remain
+                    # visible as an individual event, even beside an old outage.
+                    if not legacy_notice:
+                        members.add(event["id"])
         for incident in incidents:
             end = _timestamp(incident["ended_at"]) if incident["ended_at"] else as_of
             incident["duration_seconds"] = max(0, round((end - _timestamp(incident["started_at"])).total_seconds(), 3))
@@ -902,7 +948,10 @@ class Store:
             raise ValueError("limit debe ser entero entre 1 y 100")
         with self._lock:
             if self._recent_records_cache is None:
-                records = self._group_records(list(self.iter_events()), utc_now())
+                events, now = list(self.iter_events()), utc_now()
+                notices, sample_windows = self._overview_telemetry_notices(events)
+                records = self._group_records(events, now,
+                                              telemetry_notice_ids=notices)
                 records.sort(key=lambda record: (
                     _timestamp(record.get("ended_at") or record["timestamp"]),
                     record.get("recovery_event_id") or record.get("opening_event_id") or record["events"][0]["id"]),
@@ -920,6 +969,7 @@ class Store:
                         value["duration_seconds"] = None
                     compact.append(value)
                 self._recent_records_cache = compact
+                self._recent_records_sample_windows = sample_windows
             return copy.deepcopy(self._recent_records_cache[:limit])
 
     def iter_records(self, *, start=None, end=None, kind=None, query=None):
@@ -1136,7 +1186,7 @@ class PolicyEngine:
             self._deadline = self._battery_since = self._last_fresh_at = None
             self._effective_countdown_seconds = None
             self._emergency_source = self._emergency_percent = None
-            self._transition("unknown", "Sin datos recientes y confirmados del UPS")
+            self._transition("unknown", MISSING_TELEMETRY_REASON)
             return self.status()
         # Calling evaluate infrequently must not count unobserved time as safe.
         if self._last_fresh_at is not None and now - self._last_fresh_at > self.stale_after:
