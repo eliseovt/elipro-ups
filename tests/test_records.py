@@ -192,6 +192,120 @@ class RecordTests(unittest.TestCase):
         self.assertEqual(len(records), 601)
         self.assertNotIn("New after export began", [record["description"] for record in records])
 
+    def test_recent_summary_groups_beyond_raw_window_and_orders_by_recovery(self):
+        opening = self.event("connection_lost", 0)
+        for second in range(1, 131):
+            self.event("policy_countdown", second)
+        self.event("battery_low", 150)
+        recovery = self.event("connection_restored", 180)
+        self.event("overload", 170)
+        self.assertNotIn(opening["id"], [event["id"] for event in self.store.events(100)])
+
+        records = self.store.recent_records()
+        incident = records[0]
+        self.assertEqual(incident["record_type"], "incident")
+        self.assertEqual(incident["opening_event_id"], opening["id"])
+        self.assertEqual(incident["recovery_event_id"], recovery["id"])
+        self.assertEqual(incident["duration_seconds"], 180)
+        self.assertEqual(incident["categories"], ["connection", "protection"])
+        self.assertEqual([record.get("kind") for record in records[1:]], ["overload", "battery_low"])
+        self.assertTrue(all("events" not in record and "actions" not in record for record in records))
+        self.assertEqual(self.store.recent_records(limit=1), [incident])
+
+    def test_recent_summary_reuses_cache_until_events_change_and_returns_isolated_values(self):
+        self.event("connection_lost", 0)
+        self.event("custom", 1, data={"result": "original"})
+        with patch.object(self.store, "_group_records", wraps=self.store._group_records) as grouping:
+            first = self.store.recent_records()
+            first[0]["data"]["result"] = "changed by caller"
+            self.store.add_sample({"timestamp": self.stamp(2), "input_voltage": 220})
+            self.store.set_setting("test", True)
+            second = self.store.recent_records()
+            self.assertEqual(grouping.call_count, 1)
+            self.assertEqual(second[0]["data"]["result"], "original")
+            self.assertEqual(second[1]["status"], "open")
+            self.assertIsNone(second[1]["duration_seconds"], "An unclosed old record has no confirmed duration")
+            self.event("connection_restored", 20)
+            recovered = self.store.recent_records()[0]
+            self.assertEqual(grouping.call_count, 2)
+            self.assertEqual(recovered["status"], "recovered")
+            self.assertEqual(recovered["duration_seconds"], 20)
+
+    def test_recent_summary_is_invalidated_when_retention_removes_an_opening(self):
+        old = iso_utc(utc_now() - timedelta(days=31))
+        self.store.add_event("power_lost", "Old opening", timestamp=old)
+        self.event("power_restored", 0)
+        self.assertEqual(self.store.recent_records()[0]["record_type"], "incident")
+        self.store._last_prune = 0
+        self.store._prune()
+        record = self.store.recent_records()[0]
+        self.assertEqual(record["record_type"], "event")
+        self.assertEqual(record["kind"], "power_restored")
+        self.assertIsNone(record["duration_seconds"])
+
+    def test_recent_summary_is_bounded_and_resilient_reads_validate_without_disk_errors(self):
+        for second in range(105):
+            self.event("custom", second)
+        resilient = ResilientStore.open(":memory:", store_factory=lambda path: self.store)
+        try:
+            self.assertEqual(len(resilient.recent_records()), 100)
+            for limit in (0, True, 101, "2"):
+                with self.subTest(limit=limit), self.assertRaises(ValueError):
+                    resilient.recent_records(limit)
+            self.assertTrue(resilient.status()["available"])
+            with patch.object(self.store, "recent_records", side_effect=sqlite3.DatabaseError("disk I/O error")):
+                with self.assertRaises(HistoryUnavailable):
+                    resilient.recent_records()
+            self.assertFalse(resilient.status()["available"])
+            self.assertEqual(len(resilient.recent_records(limit=2)), 2)
+            self.assertTrue(resilient.status()["available"])
+        finally:
+            resilient.close(timeout=1)
+
+    def test_pending_events_remain_visible_without_inventing_pairs_and_disappear_after_commit(self):
+        resilient = ResilientStore.open(":memory:", store_factory=lambda path: self.store)
+        try:
+            opening = resilient.add_event("connection_lost", "Sin datos", timestamp=self.stamp(0))
+            resilient.add_event("connection_restored", "Recuperada", timestamp=self.stamp(30))
+            resilient.add_event("policy_changed", "Configuración guardada", timestamp=self.stamp(31))
+            pending = resilient.recent_records()
+            self.assertEqual(len(pending), 3)
+            self.assertTrue(all(record["record_type"] == "event" and record["pending"] for record in pending))
+            self.assertTrue(all(record["duration_seconds"] is None for record in pending))
+            self.assertTrue(any(record["id"] == "pending:" + str(-opening["id"]) for record in pending))
+            self.assertEqual(len(resilient.events()), 3)
+            with resilient._io_lock:
+                resilient._persist_batch(tuple(resilient._queue))
+            committed = resilient.recent_records()
+            self.assertEqual(len(committed), 2)
+            self.assertTrue(all("pending" not in record for record in committed))
+            self.assertEqual(committed[1]["record_type"], "incident")
+            self.assertEqual(committed[1]["duration_seconds"], 30)
+            self.assertEqual(resilient.pending_records(), [])
+            self.assertEqual(len(resilient.events()), 3)
+        finally:
+            resilient.close(timeout=1)
+
+    def test_pending_snapshot_is_merged_while_the_commit_lock_is_held(self):
+        resilient = ResilientStore.open(":memory:", store_factory=lambda path: self.store)
+        try:
+            resilient.add_event("simulation", "Aviso de prueba", timestamp=self.stamp(0))
+            original = resilient.pending_records
+
+            def locked_pending():
+                acquired = resilient._io_lock.acquire(blocking=False)
+                if acquired:
+                    resilient._io_lock.release()
+                self.assertFalse(acquired, "The worker must not commit between archive and pending snapshots")
+                return original()
+
+            with patch.object(resilient, "pending_records", side_effect=locked_pending):
+                records = resilient.recent_records()
+            self.assertEqual(len(records), 1)
+            self.assertEqual(records[0]["kind"], "simulation")
+        finally:
+            resilient.close(timeout=1)
+
 
 if __name__ == "__main__":
     unittest.main()

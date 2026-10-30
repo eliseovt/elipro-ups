@@ -1,3 +1,3 @@
 """Local UPS monitoring components."""
 
-__version__ = "0.9.26"
+__version__ = "0.9.27"

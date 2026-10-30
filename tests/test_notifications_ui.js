@@ -1464,7 +1464,7 @@ test("Resumen and Historial share the chart while recent events remain exclusive
   assert.equal(ui.get("page-history").hidden, true);
   ui.get("events-filter").value = "power";
   ui.get("events-filter").emit("change");
-  assert.equal(ui.get("event-count").textContent, "1 / 2");
+  assert.equal(ui.get("events-list").children.length, 1);
   assert.equal(ui.get("events-list").children[0].children[1].children[0].textContent, "Falla del UPS");
   const chart = ui.get("history-chart");
   assert.equal(ui.get("recent-events-card").hidden, false);
@@ -1477,7 +1477,7 @@ test("Resumen and Historial share the chart while recent events remain exclusive
   assert.equal(ui.get("recent-events-card").hidden, false);
   assert.equal(ui.get("history-chart"), chart);
   assert.equal(ui.get("events-filter").value, "power");
-  assert.equal(ui.get("event-count").textContent, "1 / 2");
+  assert.equal(ui.get("events-list").children.length, 1);
   assert.equal(ui.get("history-period").value, "168");
   assert.equal(ui.metrics[2].getAttribute("aria-pressed"), "true");
   for (const view of ["protection", "system"]) {
@@ -1492,6 +1492,145 @@ test("Resumen and Historial share the chart while recent events remain exclusive
   const ids = [...html.matchAll(/\bid="([^"]+)"/g)].map((match) => match[1]);
   assert.equal(new Set(ids).size, ids.length, "the shared surface must not duplicate any IDs");
   assert.doesNotMatch(html, /summary-history-spark|summary-health|summary-last-incident|details-row/);
+});
+
+const recentTree = (element) => [element, ...(element.children || []).flatMap(recentTree)];
+const connectionIncident = (changes = {}) => incidentRecord({
+  id: "connection:3", type: "connection", category: "connection", categories: ["connection"],
+  timestamp: "2026-10-30T02:04:00Z", started_at: "2026-10-30T02:04:00Z",
+  ended_at: "2026-10-30T11:09:00Z", duration_seconds: 32700,
+  description: "Sin datos recientes y confirmados del UPS", ...changes,
+});
+
+test("Resumen replaces four raw messages with two complete incidents and only a shared history link", async () => {
+  const ui = harness({ navigation: true });
+  const newer = connectionIncident();
+  const older = connectionIncident({ id: "connection:1", timestamp: "2026-10-29T12:32:00Z",
+    started_at: "2026-10-29T12:32:00Z", ended_at: "2026-10-30T00:11:00Z", duration_seconds: 41940 });
+  const data = snapshot();
+  data.recent_records = [older, newer];
+  data.events = [older, newer].flatMap((record, index) => [
+    { id: index * 2 + 1, kind: "connection_lost", timestamp: record.started_at, message: "Mensaje de pérdida" },
+    { id: index * 2 + 2, kind: "connection_restored", timestamp: record.ended_at, message: "Mensaje de recuperación" },
+  ]);
+  ui.calls[0].respond(data);
+  await flush();
+  const rows = ui.get("events-list").children;
+  assert.equal(rows.length, 2);
+  assert.match(textOf(rows[0]), /Interrupción de comunicación/);
+  assert.match(textOf(rows[0]), /Restablecida/);
+  assert.match(textOf(rows[0]), /9 h 05 min\s+sin lecturas/);
+  assert.match(textOf(rows[1]), /11 h 39 min\s+sin lecturas/);
+  assert.deepEqual(recentTree(rows[0]).filter((node) => node.dateTime).map((node) => node.dateTime),
+    [newer.started_at, newer.ended_at].map((value) => new Date(value).toISOString()));
+  assert.doesNotMatch(textOf(ui.get("events-list")), /Mensaje de pérdida|Mensaje de recuperación|Ver en mediciones|Mostrar intervalo/);
+  assert.equal(recentTree(ui.get("events-list")).some((node) => node.href || node.type === "button" || node.listeners?.click), false);
+  assert.equal(ui.get("recent-events-caption").textContent, "Últimos incidentes");
+  assert.equal(ui.get("overview-history-link").getAttribute("data-go-view"), "history");
+  assert.doesNotMatch(html, /id="event-count"/);
+  assert.equal(recordCalls(ui).length, 0, "the summary comes with status, independently of the full history query");
+  assert.equal(ui.get("toast").hidden, true, "historical incidents are not new notifications");
+});
+
+test("recent incidents never turn missing boundaries or an open archive record into a confirmed outage duration", async () => {
+  const ui = harness();
+  const data = snapshot();
+  data.recent_records = [
+    connectionIncident({ id: "connection:open", status: "open", ended_at: null, duration_seconds: 99999 }),
+    connectionIncident({ id: "connection:unknown", start_known: false, started_at: null, duration_seconds: 32700 }),
+    connectionIncident({ id: "connection:invalid", ended_at: "not-a-date", duration_seconds: 32700 }),
+  ];
+  ui.calls[0].respond(data);
+  await flush();
+  const rows = ui.get("events-list").children;
+  assert.equal(rows.length, 3);
+  assert.match(textOf(ui.get("events-list")), /Sin cierre registrado/);
+  assert.match(textOf(ui.get("events-list")), /Inicio no registrado/);
+  for (const row of rows) {
+    assert.match(textOf(row), /Duración sin confirmar/);
+    assert.doesNotMatch(textOf(row), /\d+ h \d+ min\s+sin lecturas|En curso|Ahora|NaN|Invalid Date/);
+  }
+  assert.equal(ui.get("protection-alert").hidden, true);
+  assert.equal(ui.get("critical-dialog").open, false);
+});
+
+test("recent incident filters include related protection without changing measurements or rebuilding unchanged rows", async () => {
+  const ui = harness({ navigation: true });
+  const data = snapshot();
+  data.recent_records = [connectionIncident(),
+    incidentRecord({ categories: ["power", "protection"] }),
+    eventRecord({ kind: "ups_fault", type: "ups_fault", message: "Falla registrada", description: "Falla registrada" }),
+    eventRecord({ id: "event:5", kind: "policy_unknown", type: "policy_unknown", category: "protection",
+      description: "unknown", message: "unknown", events: [] }),
+  ];
+  ui.calls[0].respond(data);
+  await flush();
+  const graph = ui.get("history-chart"), requests = [...ui.historyCalls];
+  const filter = (value) => { ui.get("events-filter").value = value; ui.get("events-filter").emit("change"); };
+  filter("connection");
+  assert.equal(ui.get("events-list").children.length, 1);
+  assert.match(textOf(ui.get("events-list")), /Interrupción de comunicación/);
+  filter("power");
+  assert.equal(ui.get("events-list").children.length, 2, "Energía includes electrical incidents and UPS alerts");
+  assert.match(textOf(ui.get("events-list")), /Falla registrada/);
+  assert.doesNotMatch(textOf(ui.get("events-list")), /Interrupción de comunicación/);
+  filter("protection");
+  assert.equal(ui.get("events-list").children.length, 2);
+  assert.match(textOf(ui.get("events-list")), /Protección suspendida por falta de lecturas válidas/);
+  filter("all");
+  assert.equal(ui.get("events-list").children.length, 4);
+  const stableRows = [...ui.get("events-list").children];
+  await pushStatus(ui, JSON.parse(JSON.stringify(data)));
+  stableRows.forEach((row, index) => assert.equal(ui.get("events-list").children[index], row));
+  assert.equal(ui.get("history-chart"), graph);
+  assert.deepEqual(ui.historyCalls, requests);
+  assert.equal(ui.get("recent-events-caption").textContent, "Actividad reciente");
+});
+
+test("grouped recent records do not replace raw-event notification identity or replay alerts while filtering", async () => {
+  const ui = harness();
+  const data = snapshot();
+  data.recent_records = [connectionIncident()];
+  data.events = [{ id: 1, kind: "connection_lost", timestamp: "2026-10-30T02:04:00Z", message: "Datos interrumpidos" }];
+  ui.calls[0].respond(data);
+  await flush();
+  assert.equal(ui.get("toast").hidden, true);
+  data.events.unshift({ id: 2, kind: "connection_restored", timestamp: "2026-10-30T11:09:00Z", message: "Lectura nueva confirmada" });
+  await pushStatus(ui, data);
+  assert.equal(ui.get("toast").textContent, "Lectura nueva confirmada");
+  assert.equal(ui.get("events-list").children.length, 1);
+  ui.advance(10000);
+  ui.runTimeouts();
+  assert.equal(ui.get("toast").hidden, true);
+  ui.get("events-filter").value = "connection";
+  ui.get("events-filter").emit("change");
+  await pushStatus(ui, data);
+  assert.equal(ui.get("toast").hidden, true);
+  delete data.recent_records;
+  await pushStatus(ui, data);
+  assert.equal(ui.get("events-list").children.length, 2, "legacy raw events remain separate instead of guessing pairs");
+  assert.match(textOf(ui.get("events-list")), /Lectura nueva confirmada/);
+  assert.doesNotMatch(textOf(ui.get("events-list")), /9 h 05 min/);
+});
+
+test("recent activity failures are local, do not restore a raw list as grouped incidents and recover on the next status", async () => {
+  const ui = harness();
+  const data = snapshot();
+  data.recent_records = null;
+  data.recent_records_error = "No se pudo consultar el registro reciente.";
+  data.events = [{ id: 1, kind: "connection_lost", timestamp: "2026-10-30T02:04:00Z", message: "Pérdida histórica" }];
+  ui.calls[0].respond(data);
+  await flush();
+  assert.equal(ui.get("service-notice").hidden, true);
+  assert.equal(ui.get("recent-events-error").hidden, false);
+  assert.match(ui.get("recent-events-error").textContent, /No se pudo consultar/);
+  assert.match(textOf(ui.get("events-list")), /No se pudo cargar la actividad/);
+  assert.doesNotMatch(textOf(ui.get("events-list")), /Pérdida histórica|Sin eventos registrados/);
+  data.recent_records = [connectionIncident()];
+  delete data.recent_records_error;
+  await pushStatus(ui, data);
+  assert.equal(ui.get("recent-events-error").hidden, true);
+  assert.match(textOf(ui.get("events-list")), /9 h 05 min/);
 });
 
 for (const outcome of ["failure", "success"]) {

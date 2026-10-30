@@ -344,7 +344,7 @@ class ResilientStore:
         finally:
             self._io_lock.release()
 
-    def _read(self, method, *args, **kwargs):
+    def _read(self, method, *args, _after_read=None, **kwargs):
         if not self._io_lock.acquire(timeout=0.1):
             raise HistoryUnavailable("El historial está ocupado; vuelve a intentarlo.")
         try:
@@ -354,6 +354,8 @@ class ResilientStore:
                 backend = self._backend
             try:
                 result = getattr(backend, method)(*args, **kwargs)
+                if _after_read is not None:
+                    result = _after_read(result)
             except (IncidentCursorExpired, RecordCursorExpired):
                 raise
             except Exception as exc:
@@ -398,6 +400,33 @@ class ResilientStore:
         Store._page_limit(limit)
         Store._decode_record_cursor(cursor, filters)
         return self._read("records", start=start, end=end, kind=kind, query=query, limit=limit, cursor=cursor)
+
+    def recent_records(self, limit=100):
+        Store._page_limit(limit)
+        if limit > 100:
+            raise ValueError("limit debe ser entero entre 1 y 100")
+        # Capture the pending queue before releasing _io_lock. The worker must
+        # not commit between the archive read and this merge, which would make
+        # a provisional event briefly disappear or appear twice.
+        return self._read("recent_records", limit=limit,
+                          _after_read=lambda records: sorted(records + self.pending_records(),
+                              key=lambda item: _timestamp(item.get("ended_at") or item["timestamp"]),
+                              reverse=True)[:limit])
+
+    def pending_records(self):
+        """Expose queued evidence as individual events, never inferred incidents."""
+        with self._condition:
+            events = copy.deepcopy([entry.value for entry in self._queue if entry.kind == "event"])
+        records = []
+        for event in reversed(events):
+            category = Store._record_category(event["kind"])
+            records.append({"id": "pending:" + str(-event["id"]), "record_type": "event",
+                            "type": event["kind"], "kind": event["kind"], "category": category,
+                            "categories": [category], "timestamp": event["timestamp"],
+                            "description": event["message"], "message": event["message"],
+                            "data": event["data"], "status": None, "duration_seconds": None,
+                            "action_result": None, "pending": True})
+        return records
 
     def iter_records(self, *, start=None, end=None, kind=None, query=None):
         Store._record_filters(start, end, kind, query)

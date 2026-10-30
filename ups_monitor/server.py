@@ -143,6 +143,7 @@ class Monitor:
                  ups_cancel_test=None, ups_cancel_test_journal=None, ups_battery_test=None, ups_battery_test_journal=None,
                  webhooks=None, windows_readiness_probe=None):
         self.store, self.adapter = store, adapter
+        self._recent_records_snapshot_cache = None
         self.simulation_source = getattr(adapter, "simulation", False) is True
         self.dry_run = bool(dry_run) or self.simulation_source
         if type(allow_ups_poweroff) is not bool:
@@ -326,13 +327,13 @@ class Monitor:
         if self.alerts is None or self.stop_event.is_set():
             raise ValueError("Los avisos locales no están disponibles.")
         self.alerts.update_settings(settings)
-        return self.snapshot()
+        return self.snapshot(refresh_recent_records=False)
 
     def test_notifications(self):
         if self.alerts is None or self.stop_event.is_set():
             raise ValueError("Los avisos locales no están disponibles.")
         self.alerts.test()
-        return self.snapshot()
+        return self.snapshot(refresh_recent_records=False)
 
     def acknowledge_notifications(self, data):
         if not isinstance(data, dict) or set(data) != {"ids"}:
@@ -342,7 +343,7 @@ class Monitor:
         # The acknowledgement commits before returning the updated dashboard.
         # It neither cancels protection nor changes any power setting.
         self.alerts.acknowledge(data["ids"])
-        return self.snapshot()
+        return self.snapshot(refresh_recent_records=False)
 
     def webhook_status(self):
         return self.webhooks.status()
@@ -353,7 +354,7 @@ class Monitor:
             if self.stop_event.is_set():
                 raise ValueError("Los webhooks no están disponibles: el monitor está detenido.")
             self.webhooks.update_settings(settings)
-        return self.snapshot()
+        return self.snapshot(refresh_recent_records=False)
 
     def test_webhooks(self):
         if self.stop_event.is_set():
@@ -361,7 +362,7 @@ class Monitor:
         with self.lock:
             sample = dict(self.sample) if self.sample is not None else None
         self.webhooks.test(sample)
-        return self.snapshot()
+        return self.snapshot(refresh_recent_records=False)
 
     def _policy_event(self, kind, message, data):
         if kind == "policy_unknown" and self.system_power_status()["state"] != "running":
@@ -446,7 +447,7 @@ class Monitor:
             self._record_event("ups_battery_test_reviewed", result["message"],
                                {"operation_id": result["operation_id"], "result": result.get("result"),
                                 "source": "user_physical_observation", "production_validated": False})
-            return self.snapshot()
+            return self.snapshot(refresh_recent_records=False)
 
     def run_ups_battery_test(self, *, acknowledge_risk=False):
         # Only an explicit authenticated POST enters this path. Loss of mains,
@@ -546,7 +547,7 @@ class Monitor:
             finally:
                 self._cancel_test_io.clear()
                 self._poll_wake.set()
-            return self.snapshot()
+            return self.snapshot(refresh_recent_records=False)
 
     def _observe_cancel_test(self, sample):
         before = self.ups_cancel_test_status()
@@ -567,7 +568,7 @@ class Monitor:
             self._record_event("ups_cancel_test_reviewed", result["message"],
                                {"operation_id": result["operation_id"], "result": result["result"],
                                 "source": "user_physical_observation", "production_validated": False})
-            return self.snapshot()
+            return self.snapshot(refresh_recent_records=False)
 
     def confirm_ups_cancel_observation(self, data):
         with self.settings_lock, self.lock:
@@ -576,7 +577,7 @@ class Monitor:
             self._record_event("ups_cancel_test_reviewed", result["message"],
                                {"operation_id": result["operation_id"], "result": result["result"],
                                 "source": "user_independent_load", "production_validated": False})
-            return self.snapshot()
+            return self.snapshot(refresh_recent_records=False)
 
     def run_ups_cancel_test(self, *, cancel=False, acknowledge_risk=False):
         with self.settings_lock:
@@ -628,7 +629,7 @@ class Monitor:
         finally:
             self._cancel_test_io.clear()
             self._poll_wake.set()
-        return self.snapshot()
+        return self.snapshot(refresh_recent_records=False)
 
     def _read_generation_current(self, generation):
         with self._power_lock:
@@ -879,7 +880,7 @@ class Monitor:
                                                      sample=self.sample, **data)
             self._record_event("ups_poweroff_reviewed", "Revisión cerrada por el usuario; el corte anterior no se confirma automáticamente.",
                                {"operation_id": result.get("operation_id"), "physical_confirmation": False})
-            return self.snapshot()
+            return self.snapshot(refresh_recent_records=False)
 
     def _cancel_own_ups_after_windows_failure(self):
         # A cancel can also turn an output back on. Never issue it based only on
@@ -1499,6 +1500,11 @@ class Monitor:
             LOGGER.error("El supervisor no terminó; no se cerrará SQLite mientras siga activo.")
             raise RuntimeError("No se pudo detener el supervisor a tiempo.")
 
+    @staticmethod
+    def _event_severity(kind):
+        return "critical" if kind in ("overload", "ups_fault", "policy_action_failed", "monitor_error", "ups_poweroff_unconfirmed", "ups_cancel_test_unconfirmed", "ups_battery_test_unconfirmed") else (
+            "warning" if kind in ("power_lost", "battery_low", "battery_low_percentage", "connection_lost", "policy_countdown", "policy_unknown", "ups_poweroff_blocked") else "info")
+
     def events(self):
         try:
             events = self.store.events(100)
@@ -1507,12 +1513,36 @@ class Monitor:
             self._history_failed("events_read", exc)
             events = []
         for event in events:
-            kind = event["kind"]
-            event["severity"] = "critical" if kind in ("overload", "ups_fault", "policy_action_failed", "monitor_error", "ups_poweroff_unconfirmed", "ups_cancel_test_unconfirmed", "ups_battery_test_unconfirmed") else (
-                "warning" if kind in ("power_lost", "battery_low", "battery_low_percentage", "connection_lost", "policy_countdown", "policy_unknown", "ups_poweroff_blocked") else "info")
+            event["severity"] = self._event_severity(event["kind"])
         return events
 
-    def snapshot(self):
+    def _recent_records_snapshot(self, *, refresh=True):
+        if not refresh:
+            # Mutation responses can be built under the protection lock. They
+            # reuse memory only; the next regular status poll refreshes history.
+            # Omission before the first poll lets older/raw event rendering work.
+            return copy.deepcopy(self._recent_records_snapshot_cache or {})
+        try:
+            records = self.store.recent_records()
+            self._history_failures.pop("recent_records_read", None)
+            error = None
+        except Exception as exc:
+            self._history_failed("recent_records_read", exc)
+            pending = getattr(self.store, "pending_records", None)
+            records = pending()[:100] if callable(pending) else None
+            error = ("No se pudo consultar el historial. Se muestran los eventos pendientes de guardar."
+                     if records else "No se pudieron cargar los eventos recientes.")
+        for record in records or ():
+            if record["record_type"] == "event":
+                record["severity"] = self._event_severity(record["kind"])
+        result = {"recent_records": records, "recent_records_error": error}
+        self._recent_records_snapshot_cache = copy.deepcopy(result)
+        return result
+
+    def snapshot(self, *, refresh_recent_records=True):
+        # A cache rebuild scans retained events; ordinary status polling must
+        # not hold the telemetry/protection lock while reading that archive.
+        recent_records = self._recent_records_snapshot(refresh=refresh_recent_records)
         with self.lock:
             self._check_health()
             raw = self.engine.status()
@@ -1558,6 +1588,7 @@ class Monitor:
                 "sample": ({**self.sample, **battery_estimate_fields(self.sample)}
                            if self.sample is not None else None),
                 "events": self.events(),
+                **recent_records,
                 "history": self.history_status(),
                 "health": self.health_status(),
                 "system_power": self.system_power_status(),
@@ -1628,7 +1659,7 @@ class Monitor:
                 if value["enabled"]:
                     self.engine.update_policy(value)
                 self._event("policy_changed", "Protección automática " + ("activada." if value["enabled"] else "desactivada."))
-                return self.snapshot()
+                return self.snapshot(refresh_recent_records=False)
 
     def cancel(self):
         with self.lock:
@@ -1641,7 +1672,7 @@ class Monitor:
                     self.test_ups_simulation.update(phase="cancelled", remaining=0, ups_cut_simulated=False)
                 self.test_ups_delay = None
             self.engine.cancel()
-            return self.snapshot()
+            return self.snapshot(refresh_recent_records=False)
 
     def _countdown_actionable(self, raw):
         """Inspect current state under the decision lock, without new USB I/O."""
@@ -1680,7 +1711,7 @@ class Monitor:
                 raise CountdownConflictError("La cuenta cambió, terminó o ya no admite cancelación. Revisa el estado actual.")
             self.engine.cancel()
             self._update_alerts()
-            result = self.snapshot()
+            result = self.snapshot(refresh_recent_records=False)
             result["cancelled_countdown_id"] = countdown_id
             return result
         finally:
@@ -1700,7 +1731,7 @@ class Monitor:
             self.test_ups_simulation = None
             self.test_deadline, self.test_finished = time.monotonic() + seconds, False
             self._record_event("simulation", f"Prueba de aviso iniciada ({seconds} segundos, sin apagado).")
-            return self.snapshot()
+            return self.snapshot(refresh_recent_records=False)
 
 
 class Handler(BaseHTTPRequestHandler):

@@ -12,6 +12,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from ups_monitor.core import Store, iso_utc
+from ups_monitor.persistence import ResilientStore
 from ups_monitor.adapters import TelemetryError
 from ups_monitor import server as server_module
 from ups_monitor.server import Handler, Monitor, WindowsActionUnconfirmed, main, windows_action
@@ -85,6 +86,72 @@ class ServerTests(unittest.TestCase):
         handler.do_GET()
         self.assertEqual(handler._json.call_args.args[1], 400)
         self.action.assert_not_called()
+
+    def test_status_contains_grouped_summaries_and_preserves_raw_notification_events(self):
+        start = datetime.now(timezone.utc) - timedelta(minutes=10)
+        self.store.add_event("connection_lost", "Sin datos", timestamp=iso_utc(start))
+        self.store.add_event("connection_restored", "Recuperada", timestamp=iso_utc(start + timedelta(minutes=5)))
+        self.store.add_event("ups_fault", "Falla del UPS")
+        handler = self.handler(path="/api/status")
+        handler.do_GET()
+        data = handler._json.call_args.args[0]
+        self.assertEqual(len(data["events"]), 3)
+        self.assertEqual(len(data["recent_records"]), 2)
+        self.assertIsNone(data["recent_records_error"])
+        self.assertEqual(data["recent_records"][0]["severity"], "critical")
+        incident = data["recent_records"][1]
+        self.assertEqual(incident["status"], "recovered")
+        self.assertEqual(incident["duration_seconds"], 300)
+        self.assertNotIn("events", incident)
+        self.assertNotIn("actions", incident)
+
+    def test_recent_summary_failure_does_not_remove_telemetry_or_raw_events(self):
+        self.store.add_event("battery_low", "Batería baja")
+        with patch.object(self.store, "recent_records", side_effect=RuntimeError("read unavailable")):
+            failed = self.monitor.snapshot()
+        self.assertIsNone(failed["recent_records"])
+        self.assertIn("No se pudieron cargar", failed["recent_records_error"])
+        self.assertEqual(len(failed["events"]), 1)
+        self.assertIn("connection", failed)
+        self.assertIn("protection", failed)
+        recovered = self.monitor.snapshot()
+        self.assertEqual(len(recovered["recent_records"]), 1)
+        self.assertIsNone(recovered["recent_records_error"])
+
+    def test_recent_summary_keeps_pending_evidence_when_archive_reads_fail(self):
+        resilient = ResilientStore.open(":memory:", store_factory=lambda path: self.store)
+        monitor = Monitor(resilient, self.adapter, action_callback=self.action)
+        try:
+            resilient.add_event("connection_lost", "Sin lecturas")
+            with patch.object(self.store, "recent_records", side_effect=RuntimeError("read unavailable")):
+                snapshot = monitor.snapshot()
+            self.assertEqual(len(snapshot["recent_records"]), 1)
+            record = snapshot["recent_records"][0]
+            self.assertEqual(record["record_type"], "event")
+            self.assertEqual(record["kind"], "connection_lost")
+            self.assertTrue(record["pending"])
+            self.assertEqual(record["severity"], "warning")
+            self.assertIsNone(record["duration_seconds"])
+            self.assertIn("pendientes de guardar", snapshot["recent_records_error"])
+            self.assertEqual(len(snapshot["events"]), 1)
+        finally:
+            resilient.close(timeout=1)
+
+    def test_mutation_responses_do_not_query_archive_under_the_protection_lock(self):
+        with patch.object(self.store, "recent_records") as archive:
+            initial = self.monitor.test()
+            self.assertNotIn("recent_records", initial)
+            self.monitor.cancel()
+            self.monitor.set_policy({"enabled": False})
+            archive.assert_not_called()
+        cached = self.monitor.snapshot()["recent_records"]
+        self.assertTrue(cached)
+        with patch.object(self.store, "recent_records") as archive:
+            response = self.monitor.test()
+            self.assertEqual(response["recent_records"], cached)
+            response["recent_records"].clear()
+            self.assertEqual(self.monitor.cancel()["recent_records"], cached)
+            archive.assert_not_called()
 
     def test_simulation_is_rejected_while_real_policy_is_enabled(self):
         self.monitor.set_policy({"enabled": True, "countdown_seconds": 10})

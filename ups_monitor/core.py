@@ -182,6 +182,7 @@ class Store:
         self.path = str(path)
         self._lock = threading.RLock()
         self._batch_depth = 0
+        self._recent_records_cache = None
         self._db = sqlite3.connect(str(path), check_same_thread=False, timeout=busy_timeout_ms / 1000)
         try:
             with self._db:
@@ -223,7 +224,9 @@ class Store:
         cutoff = now - self.retention_days * 86400
         with self._transaction():
             self._db.execute("DELETE FROM samples WHERE ts < ?", (cutoff,))
-            self._db.execute("DELETE FROM events WHERE ts < ?", (cutoff,))
+            removed_events = self._db.execute("DELETE FROM events WHERE ts < ?", (cutoff,))
+            if removed_events.rowcount:
+                self._recent_records_cache = None
             # Unread notices never expire with telemetry retention.
             self._db.execute("DELETE FROM notifications WHERE acknowledged_at IS NOT NULL AND acknowledged_at < ? "
                              "AND (json_extract(payload,'$.resolved_at') IS NOT NULL OR json_extract(payload,'$.kind') "
@@ -254,6 +257,7 @@ class Store:
                 "INSERT INTO events(ts,timestamp,kind,message,data) VALUES(?,?,?,?,?)",
                 (_timestamp(stamp).timestamp(), stamp, kind, message, json.dumps(data, allow_nan=False)))
             event_id = cursor.lastrowid
+            self._recent_records_cache = None
         return {"id": event_id, "timestamp": stamp, "kind": kind, "message": message, "data": data}
 
     @contextmanager
@@ -885,6 +889,38 @@ class Store:
         return {"records": rows, "total": len(records), "limit": limit, **filters,
                 "next_cursor": self._encode_record_cursor(high, rows[-1]["id"], as_of, filters) if more else None,
                 "as_of": as_of, "retention_days": self.retention_days}
+
+    def recent_records(self, limit=100):
+        """Return compact grouped summaries, rebuilding only when events change.
+
+        Group the retained archive before limiting it: a long incident may
+        begin well before the 100 raw events exposed for notifications. Samples
+        do not invalidate this cache, and no member/action arrays reach status.
+        """
+        self._page_limit(limit)
+        if limit > 100:
+            raise ValueError("limit debe ser entero entre 1 y 100")
+        with self._lock:
+            if self._recent_records_cache is None:
+                records = self._group_records(list(self.iter_events()), utc_now())
+                records.sort(key=lambda record: (
+                    _timestamp(record.get("ended_at") or record["timestamp"]),
+                    record.get("recovery_event_id") or record.get("opening_event_id") or record["events"][0]["id"]),
+                    reverse=True)
+                compact = []
+                for record in records[:100]:
+                    value = {key: item for key, item in record.items() if key not in {"events", "actions"}}
+                    value["categories"] = sorted({record["category"]} | {
+                        self._record_category(event["kind"]) for event in record["events"]})
+                    # No recovery means there is no confirmed incident duration.
+                    # The elapsed time since an old opening is not proof that
+                    # the interruption is still happening now.
+                    if record["record_type"] == "incident" and (
+                            not record.get("ended_at") or record.get("start_known") is False):
+                        value["duration_seconds"] = None
+                    compact.append(value)
+                self._recent_records_cache = compact
+            return copy.deepcopy(self._recent_records_cache[:limit])
 
     def iter_records(self, *, start=None, end=None, kind=None, query=None):
         """Export all matching grouped rows from one fixed event/time snapshot."""

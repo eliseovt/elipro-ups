@@ -510,7 +510,7 @@ html[data-theme=light] .history-section-heading svg,html[data-theme=light] #page
 body[data-view=overview] .workspace{padding-top:24px;padding-bottom:24px}
 body[data-view=overview] .page-heading{margin-bottom:16px}
 body[data-view=overview] #shared-history{margin-top:16px}
-body[data-view=overview] #shared-history .history-events{grid-template-columns:minmax(0,1.65fr) minmax(320px,1fr);gap:16px;height:clamp(310px,38vh,390px);margin-top:0;align-items:stretch}
+body[data-view=overview] #shared-history .history-events{grid-template-columns:minmax(0,1.85fr) minmax(320px,1fr);gap:16px;height:clamp(410px,40vh,460px);margin-top:0;align-items:stretch}
 body[data-view=overview] #shared-history .history-card,body[data-view=overview] #shared-history .events-card{display:flex;flex-direction:column;min-height:0;height:100%;padding:18px 20px}
 body[data-view=overview] #shared-history .section-header{flex-shrink:0;align-items:center;gap:12px;flex-wrap:nowrap}
 body[data-view=overview] #shared-history .section-header h2{font-size:17px;font-weight:550;max-width:none}
@@ -523,21 +523,40 @@ body[data-view=overview] #shared-history .period-select select{padding:7px 9px;f
 body[data-view=overview] #shared-history .chart-legend{flex-shrink:0;gap:16px;margin-top:12px;font-size:10px}
 body[data-view=overview] #shared-history .chart-container{flex:1;min-height:145px;height:auto;margin-top:7px}
 body[data-view=overview] #shared-history .chart-note{flex-shrink:0;margin-top:6px;font-size:10px;line-height:1.5}
-body[data-view=overview] #recent-events-card .count-badge{font-size:11px}
-body[data-view=overview] #recent-events-card .events-filter{flex-shrink:0;gap:12px;margin-top:12px;font-size:11px}
-body[data-view=overview] #recent-events-card .events-filter select{min-height:33px;min-width:112px;padding:6px 9px;font-size:11px}
-body[data-view=overview] #recent-events-card .events-list{display:block;flex:1;min-height:0;max-height:none;margin-top:8px;overflow-y:auto}
+body[data-view=overview] #recent-events-card .section-header{gap:8px}
+body[data-view=overview] #recent-events-card .events-filter{flex-shrink:0;gap:0;margin:0;font-size:11px}
+body[data-view=overview] #recent-events-card .events-filter select{min-height:34px;width:96px;min-width:0;padding:6px 8px;font-size:11px;background:var(--panel)}
+body[data-view=overview] #recent-events-card .recent-events-caption{flex-shrink:0;margin-top:13px;color:var(--muted);font-size:10px;line-height:1.4;font-weight:500;letter-spacing:1px;text-transform:uppercase}
+body[data-view=overview] #recent-events-card .section-error{flex-shrink:0;margin:8px 0 0;font-size:11px;line-height:1.5;overflow-wrap:anywhere}
+body[data-view=overview] #recent-events-card .events-list{display:block;flex:1;min-height:0;max-height:none;margin-top:6px;overflow-y:auto;overscroll-behavior:contain;scrollbar-gutter:stable}
 body[data-view=overview] #recent-events-card .event{padding:10px 0;gap:11px}
 body[data-view=overview] #recent-events-card .event:first-child{padding-top:6px}
 body[data-view=overview] #recent-events-card .event-symbol{width:29px;height:29px;font-size:13px}
 body[data-view=overview] #recent-events-card .event h3{font-size:11px;line-height:1.5}
 body[data-view=overview] #recent-events-card .event time{font-size:10px;margin-top:4px}
+body[data-view=overview] #recent-events-card .recent-incident{gap:11px;padding:12px 0}
+body[data-view=overview] #recent-events-card .recent-incident:first-child{padding-top:4px}
+body[data-view=overview] #recent-events-card .recent-incident .event-symbol{width:24px;height:24px;margin-top:1px;border:0;border-radius:0;background:transparent;color:var(--muted);fill:none;stroke:currentColor;stroke-width:1.6;stroke-linecap:round;stroke-linejoin:round}
+body[data-view=overview] #recent-events-card .recent-incident h3{font-size:13px;line-height:1.45;font-weight:600;overflow-wrap:break-word}
+body[data-view=overview] #recent-events-card .incident-status{display:flex;align-items:center;gap:5px;margin-top:3px;color:var(--muted);font-size:12px;line-height:1.4}
+body[data-view=overview] #recent-events-card .incident-status.recovered{color:var(--teal)}
+body[data-view=overview] #recent-events-card .incident-status.open{color:var(--amber)}
+body[data-view=overview] #recent-events-card .incident-status svg{flex-shrink:0;width:15px;height:15px;fill:none;stroke:currentColor;stroke-width:1.6;stroke-linecap:round;stroke-linejoin:round}
+body[data-view=overview] #recent-events-card .incident-duration{display:flex;align-items:baseline;flex-wrap:wrap;column-gap:6px;row-gap:0;margin-top:5px;line-height:1.25;font-variant-numeric:tabular-nums}
+body[data-view=overview] #recent-events-card .incident-duration strong{font-size:22px;font-weight:650;letter-spacing:-.45px;color:var(--text)}
+body[data-view=overview] #recent-events-card .incident-duration span{font-size:12px;color:var(--muted)}
+body[data-view=overview] #recent-events-card .incident-times{display:grid;gap:3px;margin:7px 0 0;font-size:11px;line-height:1.4;color:var(--muted)}
+body[data-view=overview] #recent-events-card .incident-times>div{display:grid;grid-template-columns:auto minmax(0,1fr);gap:8px;align-items:baseline}
+body[data-view=overview] #recent-events-card .incident-times dt{font-weight:400}
+body[data-view=overview] #recent-events-card .incident-times dd{margin:0;text-align:right;overflow-wrap:anywhere;font-variant-numeric:tabular-nums}
+body[data-view=overview] #recent-events-card .incident-times time{margin:0;color:inherit;font-size:inherit}
 body[data-view=overview] #recent-events-card .events-empty{min-height:140px;height:100%;padding:15px}
 .recent-events-link{flex-shrink:0;align-self:flex-start;margin-top:10px;padding-top:10px;font-size:11px;color:var(--teal)}
 .recent-events-link svg{width:15px;height:15px}
-@media(max-width:1140px){body[data-view=overview] #shared-history .history-events{grid-template-columns:1fr;height:auto;gap:16px}body[data-view=overview] #shared-history .history-card{height:auto;min-height:340px}body[data-view=overview] #shared-history .history-card .chart-container{flex:none;height:220px;min-height:0}body[data-view=overview] #shared-history .events-card{height:auto;min-height:280px}body[data-view=overview] #recent-events-card .events-list{flex:none;max-height:290px}body[data-view=overview] #shared-history .section-header{flex-wrap:wrap}}
+@media(max-width:1140px){body[data-view=overview] #shared-history .history-events{grid-template-columns:1fr;height:auto;gap:16px}body[data-view=overview] #shared-history .history-card{height:auto;min-height:340px}body[data-view=overview] #shared-history .history-card .chart-container{flex:none;height:220px;min-height:0}body[data-view=overview] #shared-history .events-card{height:auto;min-height:280px}body[data-view=overview] #recent-events-card .events-list{flex:none;max-height:320px}body[data-view=overview] #shared-history .section-header{flex-wrap:wrap}}
 @media(max-width:600px){body[data-view=overview] .workspace{padding-top:20px;padding-bottom:20px}body[data-view=overview] #shared-history .history-card,body[data-view=overview] #shared-history .events-card{padding:18px 16px}body[data-view=overview] #shared-history .section-header h2{font-size:16px}body[data-view=overview] #shared-history .export-link{font-size:10px}body[data-view=overview] #shared-history .chart-toolbar{gap:8px;flex-wrap:wrap}body[data-view=overview] #shared-history .period-select{margin-left:auto}body[data-view=overview] #shared-history .segmented button{padding:6px 10px;font-size:10px}body[data-view=overview] #shared-history .chart-legend{margin-top:11px}body[data-view=overview] #shared-history .history-card .chart-container{height:200px}body[data-view=overview] #shared-history .chart-note{font-size:9px}}
-@media(max-height:767px) and (min-width:1141px){.energy-diagram{height:360px}body[data-view=overview] #shared-history .history-events{height:340px}}
+@media(max-width:400px){body[data-view=overview] #recent-events-card .section-header{align-items:flex-start}body[data-view=overview] #recent-events-card .events-filter{margin-left:auto}body[data-view=overview] #recent-events-card .incident-times{font-size:11px}body[data-view=overview] #recent-events-card .incident-times>div{grid-template-columns:1fr;gap:1px}body[data-view=overview] #recent-events-card .incident-times dd{text-align:left}}
+@media(max-height:767px) and (min-width:1141px){.energy-diagram{height:360px}body[data-view=overview] #shared-history .history-events{height:410px}}
 
 /* Webhooks retain the destination and event choices when delivery is paused. */
 #page-webhooks .webhooks-card{padding:30px 32px}

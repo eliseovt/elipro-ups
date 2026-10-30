@@ -954,10 +954,31 @@
         toast(`${prefix}${eventMessage(newest)}`, /error|critical|danger/.test(severity), /warning/.test(severity));
       }
     }
-    const filtered = state.eventFilter === "all" ? sorted : sorted.filter((event) => eventCategory(event) === state.eventFilter);
-    setText("event-count", state.eventFilter === "all" ? String(sorted.length) : `${filtered.length} / ${sorted.length}`);
-    $("event-count").title = `${filtered.length} visibles de ${sorted.length} registros recientes recibidos.`;
-    const signature = `${state.eventFilter}|${sorted.map((event) => `${event.id}:${event.timestamp}:${event.kind}:${event.severity}:${event.message}`).join("|")}`;
+    // Notifications still use the raw event stream. Only this summary uses the
+    // complete, server-grouped records so a truncated event window cannot invent
+    // a start, recovery or duration for an incident.
+    const error = typeof state.status?.recent_records_error === "string" ? state.status.recent_records_error : "";
+    const grouped = Array.isArray(state.status?.recent_records);
+    const records = (grouped ? state.status.recent_records : error ? [] : sorted)
+      .filter(record => record && typeof record === "object")
+      .slice().sort((a, b) => (parseDate(b.ended_at || b.timestamp || b.started_at)?.getTime() || 0)
+        - (parseDate(a.ended_at || a.timestamp || a.started_at)?.getTime() || 0));
+    const filtered = state.eventFilter === "all" ? records : records.filter(record => {
+      if (Array.isArray(record.categories) && record.categories.includes(state.eventFilter)) return true;
+      const category = ["power", "connection", "protection"].includes(record.category)
+        ? record.category : eventCategory({ kind: record.kind || record.type });
+      return category === state.eventFilter;
+    });
+    sectionError("recent-events-error", error);
+    setText("recent-events-caption", filtered.length && filtered.every(record => record.record_type === "incident")
+      ? "Últimos incidentes" : "Actividad reciente");
+    const signature = JSON.stringify([state.eventFilter, error, filtered.map(record => ({
+      id: record.id, record_type: record.record_type, type: record.type, kind: record.kind,
+      category: record.category, timestamp: record.timestamp, severity: record.severity,
+      message: eventMessage({ ...record, kind: record.kind || record.type, message: record.description || record.message }),
+      status: record.status, start_known: record.start_known, started_at: record.started_at, ended_at: record.ended_at,
+      duration: record.status === "recovered" ? recentDuration(record) : null,
+    }))]);
     if (list.dataset.signature === signature) return;
     list.dataset.signature = signature;
     if (!filtered.length) {
@@ -966,17 +987,24 @@
       empty.className = "events-empty";
       const icon = document.createElement("span");
       icon.setAttribute("aria-hidden", "true");
-      icon.textContent = "✓";
+      icon.textContent = error ? "!" : "✓";
       const title = document.createElement("strong");
-      title.textContent = sorted.length ? "Sin eventos de este tipo" : "Sin eventos registrados";
+      title.textContent = error ? "No se pudo cargar la actividad" : records.length ? "Sin eventos de este tipo" : "Sin eventos registrados";
       const description = document.createElement("p");
-      description.textContent = sorted.length ? "Selecciona Todos para consultar el resto de los registros recientes." : "Los cortes, retornos de energía y cambios de conexión aparecerán aquí.";
+      description.textContent = error ? "El resumen se volverá a consultar automáticamente."
+        : records.length ? "Selecciona Todos para consultar el resto de los registros recientes."
+        : "Los cortes, retornos de energía y cambios de conexión aparecerán aquí.";
       empty.append(icon, title, description);
       list.append(empty);
       return;
     }
     list.replaceChildren();
-    for (const event of filtered) {
+    for (const record of filtered) {
+      if (record.record_type === "incident") {
+        list.append(renderRecentIncident(record));
+        continue;
+      }
+      const event = { ...record, kind: record.kind || record.type, message: record.description || record.message };
       const severity = String(event.severity || "").toLowerCase();
       const kind = String(event.kind || "").toLowerCase();
       const good = /restor|online|connect|return/.test(kind) && !/disconnect|lost|fail/.test(kind);
@@ -1003,6 +1031,71 @@
       item.append(symbol, body);
       list.append(item);
     }
+  }
+
+  function recentDuration(record) {
+    const start = parseDate(record.started_at), end = parseDate(record.ended_at);
+    if (record.status !== "recovered" || record.start_known === false || !start || !end || end < start
+        || !finite(record.duration_seconds) || record.duration_seconds < 0) return null;
+    const seconds = Math.floor(record.duration_seconds);
+    return seconds < 3600 ? runtimeLabel(seconds)
+      : `${Math.floor(seconds / 3600)} h ${String(Math.floor(seconds % 3600 / 60)).padStart(2, "0")} min`;
+  }
+
+  function renderRecentIncident(record) {
+    const power = record.type === "power";
+    const recovered = record.status === "recovered" && !!parseDate(record.ended_at);
+    const item = document.createElement("article");
+    item.className = "event recent-incident";
+    const symbol = svgElement("svg", { viewBox: "0 0 24 24", class: "event-symbol", "aria-hidden": "true" });
+    symbol.append(svgElement("path", { d: power ? "m13 2-9 12h7l-1 8 10-13h-7l1-7Z"
+      : "M10 13a5 5 0 0 0 7 .1l3-3a5 5 0 0 0-7-7l-2 2M14 11a5 5 0 0 0-7-.1l-3 3a5 5 0 0 0 7 7l2-2" }));
+    const body = document.createElement("div");
+    body.className = "event-body";
+    const title = document.createElement("h3");
+    title.textContent = power ? "Corte eléctrico" : "Interrupción de comunicación";
+    const status = document.createElement("p");
+    status.className = `incident-status ${recovered ? "recovered" : "open"}`;
+    const statusIcon = svgElement("svg", { viewBox: "0 0 24 24", "aria-hidden": "true" });
+    statusIcon.append(svgElement("circle", { cx: 12, cy: 12, r: 9 }));
+    statusIcon.append(svgElement("path", { d: recovered ? "m8 12 3 3 5-6" : "M12 7v6m0 4h.01" }));
+    status.append(statusIcon, document.createTextNode(recovered ? "Restablecida" : "Sin cierre registrado"));
+    if (!recovered) status.title = "El registro no confirma cuándo terminó. Consulta el estado actual del UPS.";
+    const duration = document.createElement("p");
+    duration.className = "incident-duration";
+    const durationText = recentDuration(record);
+    if (durationText !== null) {
+      const value = document.createElement("strong"), description = document.createElement("span");
+      value.textContent = durationText;
+      description.textContent = power ? "sin red eléctrica" : "sin lecturas";
+      duration.append(value, document.createTextNode(" "), description);
+    } else {
+      const unknown = document.createElement("span");
+      unknown.textContent = "Duración sin confirmar";
+      duration.append(unknown);
+    }
+    const times = document.createElement("dl");
+    times.className = "incident-times";
+    for (const [label, value, missing] of [
+      ["Inicio", record.start_known === false ? null : record.started_at, "Inicio no registrado"],
+      ["Recuperación", recovered ? record.ended_at : null, "No registrada"],
+    ]) {
+      const row = document.createElement("div"), term = document.createElement("dt"), detail = document.createElement("dd");
+      term.textContent = label;
+      const date = parseDate(value);
+      if (date) {
+        const time = document.createElement("time");
+        time.dateTime = date.toISOString();
+        time.textContent = dateFormat.format(date);
+        time.title = recordDateFormat.format(date);
+        detail.append(time);
+      } else detail.textContent = missing;
+      row.append(term, detail);
+      times.append(row);
+    }
+    body.append(title, status, duration, times);
+    item.append(symbol, body);
+    return item;
   }
 
   function renderPolicy(policy) {

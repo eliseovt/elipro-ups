@@ -166,10 +166,11 @@
         </article>
 
         <article id="recent-events-card" class="events-card card" aria-labelledby="events-heading">
-          <div class="section-header"><h2 id="events-heading" class="history-section-heading"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5h13M8 12h13M8 19h13"/><circle cx="3" cy="5" r=".8"/><circle cx="3" cy="12" r=".8"/><circle cx="3" cy="19" r=".8"/></svg>Eventos recientes</h2><span id="event-count" class="count-badge">0</span></div>
-          <label class="events-filter"><span>Filtrar</span><select id="events-filter"><option value="all">Todos</option><option value="power">Energía</option><option value="connection">Conexión</option><option value="protection">Protección</option></select></label>
-          <div id="events-list" class="events-list"><div class="events-empty"><span aria-hidden="true">✓</span><strong>Sin eventos registrados</strong><p>Los cortes, retornos de energía y cambios de conexión aparecerán aquí.</p></div></div>
-          <a id="overview-history-link" class="text-link recent-events-link" href="#historial" data-go-view="history">Ver registro completo<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m9 5 7 7-7 7"/></svg></a>
+          <div class="section-header"><h2 id="events-heading" class="history-section-heading"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5h13M8 12h13M8 19h13"/><circle cx="3" cy="5" r=".8"/><circle cx="3" cy="12" r=".8"/><circle cx="3" cy="19" r=".8"/></svg>Eventos recientes</h2><label class="events-filter"><span class="sr-only">Filtrar eventos recientes</span><select id="events-filter"><option value="all">Todos</option><option value="power">Energía</option><option value="connection">Conexión</option><option value="protection">Protección</option></select></label></div>
+          <p id="recent-events-caption" class="recent-events-caption">Últimos incidentes</p>
+          <p id="recent-events-error" class="section-error" role="status" hidden></p>
+          <div id="events-list" class="events-list" tabindex="0" role="region" aria-label="Eventos recientes del UPS" aria-busy="false"><div class="events-empty"><span aria-hidden="true">✓</span><strong>Sin eventos registrados</strong><p>Los cortes, retornos de energía y cambios de conexión aparecerán aquí.</p></div></div>
+          <a id="overview-history-link" class="text-link recent-events-link" href="#historial" data-go-view="history">Ver historial completo<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m9 5 7 7-7 7"/></svg></a>
         </article>
       </section>
       </section>
