@@ -1610,7 +1610,7 @@
       const type = incident ? record.type === "power" ? "Corte eléctrico" : "Comunicación" : alertLabels[record.kind || record.type] || categoryLabels[record.category] || eventLabel(record.kind || record.type) || "Evento";
       const date = incident && record.start_known === false ? "Inicio no registrado" : formatMoment(record.timestamp || record.started_at);
       const description = String(record.description || record.message || type);
-      const duration = incident && finite(record.duration_seconds) ? runtimeLabel(record.duration_seconds) : "—";
+      const duration = incident && recentDuration(record) !== null ? runtimeLabel(record.duration_seconds) : "—";
       const row = document.createElement("tr");
       row.className = "record-row";
       const dateCell = document.createElement("td"), typeCell = document.createElement("td"), descriptionCell = document.createElement("td");

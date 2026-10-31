@@ -185,6 +185,7 @@ class Store:
         self._batch_depth = 0
         self._recent_records_cache = None
         self._recent_records_sample_windows = ()
+        self._recent_records_mains_windows = ()
         self._db = sqlite3.connect(str(path), check_same_thread=False, timeout=busy_timeout_ms / 1000)
         try:
             with self._db:
@@ -248,9 +249,13 @@ class Store:
         with self._transaction():
             self._db.execute("INSERT INTO samples(ts,timestamp,payload) VALUES(?,?,?)",
                              (ts, normalized["timestamp"], json.dumps(normalized, allow_nan=False)))
-            if self._recent_records_cache is not None and any(
-                    start < ts < end for start, end in self._recent_records_sample_windows):
-                self._recent_records_cache = None
+            if self._recent_records_cache is not None:
+                voltage = normalized.get("input_voltage")
+                mains = (normalized.get("on_battery") is False and type(voltage) in (int, float)
+                         and math.isfinite(voltage) and voltage > 0)
+                if (any(start < ts < end for start, end in self._recent_records_sample_windows)
+                        or mains and any(start < ts < end for start, end in self._recent_records_mains_windows)):
+                    self._recent_records_cache = None
         return normalized
 
     def add_event(self, kind, message, data=None, *, timestamp=None):
@@ -764,12 +769,22 @@ class Store:
             raise ValueError("Cursor del registro inválido")
         try:
             value = json.loads(base64.urlsafe_b64decode(cursor + "=" * (-len(cursor) % 4)))
-            if (set(value) != {"v", "high", "before", "as_of", "filter"}
-                    or type(value["v"]) is not int or value["v"] != 1
+            legacy = isinstance(value, dict) and type(value.get("v")) is int and value["v"] == 1
+            fields = {"v", "high", "before", "as_of", "filter"} | (set() if legacy else {"sample_high", "sample_anchor"})
+            if (set(value) != fields
+                    or type(value["v"]) is not int or value["v"] not in (1, 2)
                     or type(value["high"]) is not int or not 0 < value["high"] < 2 ** 63 - 1
+                    or not legacy and (type(value["sample_high"]) is not int
+                                       or not 0 <= value["sample_high"] < 2 ** 63 - 1)
                     or not isinstance(value["before"], str) or len(value["before"]) > 64
                     or value["filter"] != cls._cursor_fingerprint(filters, "records")):
                 raise ValueError()
+            if not legacy:
+                anchor = value["sample_anchor"]
+                if (value["sample_high"] == 0 and anchor is not None or value["sample_high"] > 0
+                        and (not isinstance(anchor, str) or len(anchor) != 64
+                             or any(character not in "0123456789abcdef" for character in anchor))):
+                    raise ValueError()
             category, event_id = value["before"].split(":")
             if category not in {"power", "connection", "event"} or not event_id.isascii() or not event_id.isdecimal():
                 raise ValueError()
@@ -778,11 +793,14 @@ class Store:
             value["as_of"] = iso_utc(_timestamp(value["as_of"]))
         except (ValueError, TypeError, KeyError, UnicodeError, OverflowError, AttributeError) as exc:
             raise ValueError("Cursor inválido o perteneciente a otros filtros") from exc
+        if legacy:
+            raise RecordCursorExpired()
         return value
 
     @classmethod
-    def _encode_record_cursor(cls, high, before, as_of, filters):
-        value = {"v": 1, "high": high, "before": before, "as_of": as_of,
+    def _encode_record_cursor(cls, high, sample_high, sample_anchor, before, as_of, filters):
+        value = {"v": 2, "high": high, "sample_high": sample_high, "sample_anchor": sample_anchor,
+                 "before": before, "as_of": as_of,
                  "filter": cls._cursor_fingerprint(filters, "records")}
         return base64.urlsafe_b64encode(json.dumps(value, separators=(",", ":")).encode()).decode().rstrip("=")
 
@@ -813,8 +831,38 @@ class Store:
                     windows.append((start, end))
         return accepted, windows
 
+    def _power_episode_restarts(self, events, sample_high):
+        """Separate later battery episodes when readings prove mains in between.
+
+        A missing power-restored event leaves the old incident unclosed. Mains
+        readings cannot supply that missing recovery time, but they can prove
+        that a subsequent power-lost event is a different episode.
+        """
+        restarts, windows, start = set(), [], None
+        for event in events:
+            if event["kind"] == "power_restored":
+                start = None
+            elif event["kind"] == "power_lost":
+                end = _timestamp(event["timestamp"]).timestamp()
+                if start is not None:
+                    mains = self._db.execute(
+                        "SELECT 1 FROM samples WHERE ts>? AND ts<? AND id<=? "
+                        "AND json_type(payload, '$.on_battery')='false' "
+                        "AND json_type(payload, '$.input_voltage') IN ('integer','real') "
+                        "AND json_extract(payload, '$.input_voltage')>0 LIMIT 1", (start, end, sample_high)).fetchone()
+                    if mains is not None:
+                        restarts.add(event["id"])
+                        start = end
+                    else:
+                        # Only a late, confirmed mains sample in this interval
+                        # can change the decision; ordinary samples do not.
+                        windows.append((start, end))
+                else:
+                    start = end
+        return restarts, windows
+
     @classmethod
-    def _group_records(cls, events, as_of, *, telemetry_notice_ids=None):
+    def _group_records(cls, events, as_of, *, telemetry_notice_ids=None, power_restart_ids=None):
         """Associate only outage evidence and protection actions with incidents.
 
         Alerts and configuration are independent conditions, even during an
@@ -823,7 +871,7 @@ class Store:
         The overview can also recognize the exact historical policy notice
         emitted for missing telemetry, without reclassifying configuration waits.
         """
-        active, incidents, members = {}, [], set()
+        active, incidents, members, superseded = {}, [], set(), set()
         opening = {"power_lost": "power", "connection_lost": "connection", "monitor_error": "connection"}
         recovery = {"power_restored": "power", "connection_restored": "connection"}
         for event in events:
@@ -835,6 +883,12 @@ class Store:
             telemetry_notice = legacy_notice and event["id"] in telemetry_notice_ids
             event_type = "connection" if telemetry_notice else opening.get(kind)
             if event_type is not None:
+                if event_type == "power" and power_restart_ids and event["id"] in power_restart_ids:
+                    # Preserve the old incident without a fabricated closure;
+                    # later recovery and actions belong to the new episode.
+                    previous = active.pop("power", None)
+                    if previous is not None:
+                        superseded.add(previous["id"])
                 if event_type not in active:
                     incident = {"id": event_type + ":" + str(event["id"]), "record_type": "incident",
                                 "type": event_type, "category": event_type,
@@ -872,7 +926,8 @@ class Store:
                         members.add(event["id"])
         for incident in incidents:
             end = _timestamp(incident["ended_at"]) if incident["ended_at"] else as_of
-            incident["duration_seconds"] = max(0, round((end - _timestamp(incident["started_at"])).total_seconds(), 3))
+            incident["duration_seconds"] = (None if incident["id"] in superseded else
+                max(0, round((end - _timestamp(incident["started_at"])).total_seconds(), 3)))
             kinds = {event["kind"] for event in incident["actions"]}
             incident["action_result"] = ("failed" if "policy_action_failed" in kinds else
                                          "started" if "policy_action_started" in kinds else
@@ -892,8 +947,24 @@ class Store:
     def _record_feed(self, filters, position=None):
         with self._lock:
             high = position["high"] if position else self._db.execute("SELECT COALESCE(MAX(id),0) FROM events").fetchone()[0]
+            if position:
+                sample_high, sample_anchor = position["sample_high"], position["sample_anchor"]
+            else:
+                last_sample = self._db.execute("SELECT id,payload FROM samples ORDER BY id DESC LIMIT 1").fetchone()
+                sample_high = last_sample[0] if last_sample else 0
+                sample_anchor = hashlib.sha256(last_sample[1].encode("utf-8")).hexdigest() if last_sample else None
         now = _timestamp(position["as_of"]) if position else utc_now()
-        records = self._group_records(list(self.iter_events(_high_id=high)), now)
+        events = list(self.iter_events(_high_id=high))
+        with self._lock:
+            if sample_high:
+                anchor_row = self._db.execute("SELECT payload FROM samples WHERE id=?", (sample_high,)).fetchone()
+                # Row IDs can be reused after retention removes the maximum ID.
+                # Verify the exact row while holding the evidence-query lock.
+                if (anchor_row is None or
+                        hashlib.sha256(anchor_row[0].encode("utf-8")).hexdigest() != sample_anchor):
+                    raise RecordCursorExpired()
+            power_restarts, _windows = self._power_episode_restarts(events, sample_high)
+        records = self._group_records(events, now, power_restart_ids=power_restarts)
         lower = _timestamp(filters["from"]) if filters["from"] else None
         upper = _timestamp(filters["to"]) if filters["to"] else None
         query = filters["query"].casefold() if filters["query"] else None
@@ -916,14 +987,14 @@ class Store:
             selected.append(record)
         selected.sort(key=lambda item: (_timestamp(item["timestamp"]),
                                        item.get("opening_event_id", item["events"][0]["id"])), reverse=True)
-        return selected, high, iso_utc(now)
+        return selected, high, sample_high, sample_anchor, iso_utc(now)
 
     def records(self, *, start=None, end=None, kind=None, query=None, limit=50, cursor=None):
         """Filter and page the complete grouped register, never raw event pages."""
         filters = self._record_filters(start, end, kind, query)
         self._page_limit(limit)
         position = self._decode_record_cursor(cursor, filters)
-        records, high, as_of = self._record_feed(filters, position)
+        records, high, sample_high, sample_anchor, as_of = self._record_feed(filters, position)
         offset = 0
         if position:
             anchor = next((index for index, record in enumerate(records) if record["id"] == position["before"]), None)
@@ -933,15 +1004,16 @@ class Store:
         rows = records[offset:offset + limit]
         more = offset + len(rows) < len(records)
         return {"records": rows, "total": len(records), "limit": limit, **filters,
-                "next_cursor": self._encode_record_cursor(high, rows[-1]["id"], as_of, filters) if more else None,
+                "next_cursor": self._encode_record_cursor(high, sample_high, sample_anchor, rows[-1]["id"], as_of, filters) if more else None,
                 "as_of": as_of, "retention_days": self.retention_days}
 
     def recent_records(self, limit=100):
         """Return compact grouped summaries, rebuilding only when events change.
 
         Group the retained archive before limiting it: a long incident may
-        begin well before the 100 raw events exposed for notifications. Samples
-        do not invalidate this cache, and no member/action arrays reach status.
+        begin well before the 100 raw events exposed for notifications. Only
+        samples contradicting a cached inference invalidate it; no member or
+        action arrays reach status.
         """
         self._page_limit(limit)
         if limit > 100:
@@ -950,8 +1022,10 @@ class Store:
             if self._recent_records_cache is None:
                 events, now = list(self.iter_events()), utc_now()
                 notices, sample_windows = self._overview_telemetry_notices(events)
+                sample_high = self._db.execute("SELECT COALESCE(MAX(id),0) FROM samples").fetchone()[0]
+                power_restarts, mains_windows = self._power_episode_restarts(events, sample_high)
                 records = self._group_records(events, now,
-                                              telemetry_notice_ids=notices)
+                                              telemetry_notice_ids=notices, power_restart_ids=power_restarts)
                 records.sort(key=lambda record: (
                     _timestamp(record.get("ended_at") or record["timestamp"]),
                     record.get("recovery_event_id") or record.get("opening_event_id") or record["events"][0]["id"]),
@@ -970,11 +1044,12 @@ class Store:
                     compact.append(value)
                 self._recent_records_cache = compact
                 self._recent_records_sample_windows = sample_windows
+                self._recent_records_mains_windows = mains_windows
             return copy.deepcopy(self._recent_records_cache[:limit])
 
     def iter_records(self, *, start=None, end=None, kind=None, query=None):
         """Export all matching grouped rows from one fixed event/time snapshot."""
-        records, _high, _as_of = self._record_feed(self._record_filters(start, end, kind, query))
+        records, _high, _sample_high, _sample_anchor, _as_of = self._record_feed(self._record_filters(start, end, kind, query))
         yield from records
 
     def close(self):

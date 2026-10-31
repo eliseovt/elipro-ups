@@ -372,6 +372,192 @@ class RecordTests(unittest.TestCase):
         self.assertEqual(record["kind"], "power_restored")
         self.assertIsNone(record["duration_seconds"])
 
+    def test_overview_separates_power_episodes_after_confirmed_mains_without_inventing_recovery(self):
+        older = self.event("power_lost", 0)
+        self.event("policy_countdown", 1)
+        self.store.add_sample({"timestamp": self.stamp(20), "on_battery": False, "input_voltage": 220})
+        newer = self.event("power_lost", 40)
+        self.event("policy_countdown", 41)
+        cancelled = self.event("policy_cancelled", 42)
+        raw_before = self.store.events()
+
+        rows = self.store.recent_records()
+        self.assertEqual([row["opening_event_id"] for row in rows], [newer["id"], older["id"]])
+        self.assertEqual([row["started_at"] for row in rows], [newer["timestamp"], older["timestamp"]])
+        self.assertEqual(rows[0]["action_result"], "cancelled")
+        self.assertEqual(rows[1]["action_result"], "none")
+        for row in rows:
+            self.assertEqual(row["status"], "open")
+            self.assertIsNone(row["ended_at"])
+            self.assertIsNone(row["duration_seconds"])
+        self.assertEqual(self.store.events(), raw_before)
+        archive = self.store.records()["records"]
+        exported = list(self.store.iter_records())
+        self.assertEqual([row["opening_event_id"] for row in archive], [newer["id"], older["id"]])
+        self.assertEqual([row["opening_event_id"] for row in exported], [newer["id"], older["id"]])
+        self.assertIsNone(archive[1]["duration_seconds"])
+        self.assertIsNone(exported[1]["duration_seconds"])
+        self.assertEqual(archive[0]["actions"][-1], cancelled)
+        self.assertNotIn(cancelled, archive[1]["actions"])
+
+        recovery = self.event("power_restored", 50)
+        rows = self.store.recent_records()
+        self.assertEqual(rows[0]["opening_event_id"], newer["id"])
+        self.assertEqual(rows[0]["recovery_event_id"], recovery["id"])
+        self.assertEqual(rows[0]["duration_seconds"], 10)
+        self.assertEqual(rows[1]["status"], "open")
+        self.assertIsNone(rows[1]["ended_at"])
+        self.assertIsNone(rows[1]["duration_seconds"])
+        groups = self.store._group_records(list(self.store.iter_events()), utc_now(),
+                                          power_restart_ids={newer["id"]})
+        self.assertEqual(groups[1]["actions"][-1], cancelled)
+        self.assertNotIn(cancelled, groups[0]["actions"])
+
+    def test_overview_does_not_split_repeated_power_loss_without_confirmed_mains(self):
+        opening = self.event("power_lost", 0)
+        cases = [
+            {"on_battery": True, "input_voltage": 220},
+            {"on_battery": False, "input_voltage": 0},
+            {"on_battery": False, "input_voltage": None},
+            {"on_battery": None, "input_voltage": 220},
+            {"on_battery": 0, "input_voltage": 220},
+            {"on_battery": False, "input_voltage": "220"},
+            {"on_battery": False, "input_voltage": True},
+        ]
+        for index, sample in enumerate(cases, start=1):
+            self.store.add_sample({"timestamp": self.stamp(index * 10), **sample})
+            self.event("power_lost", index * 10 + 1)
+        rows = self.store.recent_records()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["opening_event_id"], opening["id"])
+        self.assertEqual(rows[0]["status"], "open")
+        self.assertIsNone(rows[0]["duration_seconds"])
+
+    def test_overview_power_split_cache_only_rebuilds_for_late_mains_inside_a_joined_interval(self):
+        old = self.event("power_lost", 0)
+        new = self.event("power_lost", 100)
+        with patch.object(self.store, "_group_records", wraps=self.store._group_records) as grouping:
+            self.assertEqual(self.store.recent_records()[0]["opening_event_id"], old["id"])
+            for second, sample in [
+                (50, {"on_battery": True, "input_voltage": 0}),
+                (60, {"on_battery": False, "input_voltage": 0}),
+                (70, {"on_battery": 0, "input_voltage": 220}),
+                (80, {"on_battery": False, "input_voltage": "220"}),
+                (110, {"on_battery": False, "input_voltage": 220}),
+            ]:
+                self.store.add_sample({"timestamp": self.stamp(second), **sample})
+                self.store.recent_records()
+            self.assertEqual(grouping.call_count, 1)
+            self.store.add_sample({"timestamp": self.stamp(90), "on_battery": False, "input_voltage": 220})
+            self.assertEqual([row["opening_event_id"] for row in self.store.recent_records()],
+                             [new["id"], old["id"]])
+            self.assertEqual(grouping.call_count, 2)
+            self.store.add_sample({"timestamp": self.stamp(95), "on_battery": False, "input_voltage": 221})
+            self.store.recent_records()
+            self.assertEqual(grouping.call_count, 2, "An already separated episode needs no sample-driven rebuild")
+
+    def test_overview_power_restarts_are_anchored_to_the_latest_separate_episode(self):
+        first = self.event("power_lost", 0)
+        self.store.add_sample({"timestamp": self.stamp(20), "on_battery": False, "input_voltage": 220})
+        second = self.event("power_lost", 30)
+        self.store.add_sample({"timestamp": self.stamp(40), "on_battery": True, "input_voltage": 0})
+        self.event("power_lost", 50)
+        self.store.add_sample({"timestamp": self.stamp(60), "on_battery": False, "input_voltage": 221})
+        third = self.event("power_lost", 70)
+        recovery = self.event("power_restored", 80)
+        fourth = self.event("power_lost", 90)
+        rows = self.store.recent_records()
+        self.assertEqual([row["opening_event_id"] for row in rows],
+                         [fourth["id"], third["id"], second["id"], first["id"]])
+        self.assertEqual(rows[1]["recovery_event_id"], recovery["id"])
+        self.assertTrue(all(row["status"] == "open" for row in [rows[0], rows[2], rows[3]]))
+
+    def test_record_cursor_freezes_mains_evidence_against_late_samples(self):
+        old = self.event("power_lost", 0)
+        new = self.event("power_lost", 100)
+        self.event("custom", 110)
+        page = self.store.records(limit=1)
+        self.assertEqual(page["total"], 2)
+        cursor = page["next_cursor"]
+        payload = json.loads(base64.urlsafe_b64decode(cursor + "=" * (-len(cursor) % 4)))
+        self.assertEqual(payload["v"], 2)
+        self.assertEqual(payload["sample_high"], 0)
+        self.assertIsNone(payload["sample_anchor"])
+        self.store.add_sample({"timestamp": self.stamp(50), "on_battery": False, "input_voltage": 220})
+
+        frozen = self.store.records(limit=1, cursor=cursor)
+        self.assertEqual(frozen["total"], 2)
+        self.assertIsNone(frozen["next_cursor"])
+        self.assertEqual(frozen["records"][0]["opening_event_id"], old["id"])
+        self.assertEqual([event["id"] for event in frozen["records"][0]["events"]], [old["id"], new["id"]])
+        fresh = self.store.records()["records"]
+        self.assertEqual(len(fresh), 3)
+        self.assertEqual([row["opening_event_id"] for row in fresh[1:]], [new["id"], old["id"]])
+
+    def test_record_cursor_rejects_legacy_and_invalid_sample_watermarks(self):
+        self.event("custom", 0)
+        self.event("custom", 1)
+        cursor = self.store.records(limit=1)["next_cursor"]
+        payload = json.loads(base64.urlsafe_b64decode(cursor + "=" * (-len(cursor) % 4)))
+        legacy = {key: value for key, value in payload.items() if key not in {"sample_high", "sample_anchor"}}
+        legacy["v"] = 1
+        encode = lambda value: base64.urlsafe_b64encode(json.dumps(value).encode()).decode().rstrip("=")
+        with self.assertRaises(RecordCursorExpired):
+            self.store.records(cursor=encode(legacy))
+        for sample_high in (True, -1, 2 ** 63 - 1, "0", None):
+            with self.subTest(sample_high=sample_high), self.assertRaises(ValueError):
+                self.store.records(cursor=encode({**payload, "sample_high": sample_high}))
+        with self.assertRaises(ValueError):
+            self.store.records(cursor=encode({**payload, "sample_anchor": "0" * 64}))
+        for sample_anchor in (None, True, "", "a" * 63, "G" * 64):
+            with self.subTest(sample_anchor=sample_anchor), self.assertRaises(ValueError):
+                self.store.records(cursor=encode({**payload, "sample_high": 1, "sample_anchor": sample_anchor}))
+
+    def test_record_cursor_expires_when_sample_anchor_is_pruned_or_reused(self):
+        self.event("power_lost", 0)
+        self.event("power_lost", 100)
+        self.event("custom", 110)
+        stamp = self.stamp(50)
+        self.store.add_sample({"timestamp": stamp, "on_battery": True, "input_voltage": 0})
+        cursor = self.store.records(limit=1)["next_cursor"]
+        payload = json.loads(base64.urlsafe_b64decode(cursor + "=" * (-len(cursor) % 4)))
+        self.assertEqual(payload["sample_high"], 1)
+        self.assertEqual(len(payload["sample_anchor"]), 64)
+        with self.store._db:
+            self.store._db.execute("DELETE FROM samples WHERE id=?", (payload["sample_high"],))
+        with self.assertRaises(RecordCursorExpired):
+            self.store.records(cursor=cursor)
+        self.store.add_sample({"timestamp": stamp, "on_battery": False, "input_voltage": 220})
+        self.assertEqual(self.store._db.execute("SELECT MAX(id) FROM samples").fetchone()[0], payload["sample_high"])
+        with self.assertRaises(RecordCursorExpired):
+            self.store.records(cursor=cursor)
+        self.assertEqual(self.store.records()["total"], 3)
+
+    def test_record_cursor_with_sample_anchor_accepts_normal_later_measurements(self):
+        old = self.event("power_lost", 0)
+        self.event("power_lost", 100)
+        self.event("custom", 110)
+        self.store.add_sample({"timestamp": self.stamp(50), "on_battery": True, "input_voltage": 0})
+        cursor = self.store.records(limit=1)["next_cursor"]
+        self.store.add_sample({"timestamp": self.stamp(60), "on_battery": False, "input_voltage": 220})
+        self.store.add_sample({"timestamp": self.stamp(120), "on_battery": False, "input_voltage": 221})
+        page = self.store.records(cursor=cursor)
+        self.assertEqual(page["total"], 2)
+        self.assertEqual(page["records"][0]["opening_event_id"], old["id"])
+        self.assertEqual(self.store.records()["total"], 3)
+
+    def test_record_export_keeps_its_initial_mains_evidence_snapshot(self):
+        old = self.event("power_lost", 0)
+        new = self.event("power_lost", 100)
+        self.event("custom", 110)
+        export = self.store.iter_records()
+        self.assertEqual(next(export)["record_type"], "event")
+        self.store.add_sample({"timestamp": self.stamp(50), "on_battery": False, "input_voltage": 220})
+        remainder = list(export)
+        self.assertEqual(len(remainder), 1)
+        self.assertEqual([event["id"] for event in remainder[0]["events"]], [old["id"], new["id"]])
+        self.assertEqual(len(list(self.store.iter_records())), 3)
+
     def test_recent_summary_is_bounded_and_resilient_reads_validate_without_disk_errors(self):
         for second in range(105):
             self.event("custom", second)

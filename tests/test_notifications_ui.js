@@ -696,6 +696,24 @@ test("open historical incidents stay historical and independent events do not in
   assert.equal(ui.get("critical-dialog").open, false);
 });
 
+test("Registro shows durations only when both incident endpoints are confirmed", async () => {
+  const ui = await connected();
+  const pending = ui.get("records-form").emit("submit");
+  answerRecords(ui, { records: [
+    incidentRecord({ id: "power:open", status: "open", ended_at: null, duration_seconds: 99999 }),
+    incidentRecord({ id: "power:unknown-start", start_known: false, duration_seconds: 60 }),
+    incidentRecord({ id: "power:unknown-end", ended_at: null, duration_seconds: 120 }),
+    incidentRecord({ id: "power:confirmed" }),
+  ], total: 4, next_cursor: null });
+  await pending;
+  const rows = recordRows(ui), details = recordDetails(ui);
+  assert.deepEqual(rows.map(row => row.children[4].textContent), ["—", "—", "—", "10 s"]);
+  assert.match(textOf(details[0]), /Tiempo desde la detección: —/);
+  assert.match(textOf(details[1]), /Duración detectada: —/);
+  assert.match(textOf(details[2]), /Duración detectada: —/);
+  assert.match(textOf(details[3]), /Duración detectada: 10 s/);
+});
+
 test("mixed records paginate with one cursor, deduplicate record IDs and keep applied filters despite drafts", async () => {
   const ui = await connected();
   ui.get("records-from").value = "2026-10-16T08:00";
@@ -844,7 +862,7 @@ test("incident details preserve literal opening, recovery and protection message
   })], total: 1, next_cursor: null });
   const row = recordRows(ui)[0], detail = recordDetails(ui)[0];
   assert.match(textOf(row), /Inicio no registrado/);
-  assert.equal(row.children[4].textContent, "1 min");
+  assert.equal(row.children[4].textContent, "—");
   assert.equal(detail.hidden, true);
   for (const message of ["<inicio>", "<recuperado>", "<cuenta>", "<fallo>"]) assert.ok(textOf(detail).includes(message), message);
   const button = row.children[5].children[0];

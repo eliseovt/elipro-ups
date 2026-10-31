@@ -3,9 +3,11 @@ import csv
 import io
 import json
 import sqlite3
+from datetime import timedelta
 from unittest.mock import patch
 
 from tests.test_reports_api import IsolatedMonitorTests
+from ups_monitor.core import iso_utc, utc_now
 
 
 class RecordsApiTests(IsolatedMonitorTests):
@@ -77,6 +79,48 @@ class RecordsApiTests(IsolatedMonitorTests):
         details = json.loads(rows[0]["detalles"])
         self.assertEqual([event["kind"] for event in details], ["power_lost", "policy_cancelled", "power_restored"])
         self.assertEqual(details[1]["data"]["trial"], 61)
+
+    def test_records_csv_leaves_open_duration_empty_and_preserves_confirmed_duration(self):
+        start = utc_now() - timedelta(hours=1)
+        self.backend.add_event("power_lost", "Cerrado", timestamp=iso_utc(start))
+        self.backend.add_event("power_restored", "Retorno", timestamp=iso_utc(start + timedelta(seconds=75)))
+        self.backend.add_event("power_lost", "Abierto", timestamp=iso_utc(start + timedelta(seconds=120)))
+        handler = self.handler("/api/records/export.csv")
+        self.capture_csv(handler)
+        handler.do_GET()
+        data = handler._send.call_args.args[0]
+        rows = {row["descripcion"]: row for row in csv.DictReader(io.StringIO(data.decode("utf-8-sig")))}
+        self.assertEqual(rows["Abierto"]["duracion_segundos"], "")
+        self.assertEqual(rows["Abierto"]["recuperacion"], "")
+        self.assertEqual(rows["Abierto"]["estado"], "Sin recuperación registrada")
+        self.assertEqual(float(rows["Cerrado"]["duracion_segundos"]), 75)
+        self.assertTrue(rows["Cerrado"]["recuperacion"])
+
+    def test_records_csv_does_not_publish_unconfirmed_or_invalid_durations(self):
+        start = utc_now() - timedelta(minutes=1)
+        self.backend.add_event("power_lost", "Corte", timestamp=iso_utc(start))
+        self.backend.add_event("power_restored", "Retorno", timestamp=iso_utc(start + timedelta(seconds=15)))
+        complete = self.backend.records()["records"][0]
+        cases = [
+            {"start_known": False},
+            {"started_at": None},
+            {"ended_at": None},
+            {"ended_at": iso_utc(start - timedelta(seconds=1))},
+            {"duration_seconds": -1},
+            {"duration_seconds": float("nan")},
+            {"duration_seconds": True},
+            {},
+        ]
+        records = [{**complete, **changes, "description": f"Caso {index}"}
+                   for index, changes in enumerate(cases)]
+        handler = self.handler("/api/records/export.csv")
+        self.capture_csv(handler)
+        with patch.object(self.store, "iter_records", return_value=iter(records)):
+            handler.do_GET()
+        data = handler._send.call_args.args[0]
+        rows = list(csv.DictReader(io.StringIO(data.decode("utf-8-sig"))))
+        self.assertEqual([row["duracion_segundos"] for row in rows[:-1]], [""] * (len(cases) - 1))
+        self.assertEqual(float(rows[-1]["duracion_segundos"]), 15)
 
     def test_records_and_export_failures_are_503_before_download_without_changing_live_monitor(self):
         for path, method in (("/api/records", "records"), ("/api/records/export.csv", "iter_records")):

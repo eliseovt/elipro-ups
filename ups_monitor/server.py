@@ -129,9 +129,20 @@ def write_records_csv(store, options, target):
     actions = {"none": "Sin acciones", "failed": "Fallida", "started": "Iniciada",
                "cancelled": "Cancelada", "simulated": "Simulada"}
     for record in store.iter_records(**options):
+        duration = None
+        if (record["record_type"] == "incident" and record["status"] == "recovered"
+                and record.get("start_known") is not False):
+            try:
+                start = datetime.fromisoformat(record.get("started_at", "").replace("Z", "+00:00"))
+                end = datetime.fromisoformat(record.get("ended_at", "").replace("Z", "+00:00"))
+                seconds = record.get("duration_seconds")
+                if end >= start and type(seconds) in (int, float) and math.isfinite(seconds) and seconds >= 0:
+                    duration = seconds
+            except (ValueError, TypeError, AttributeError):
+                pass
         row = {"fecha": record["timestamp"], "tipo": categories[record["category"]],
                "descripcion": record["description"], "estado": states.get(record["status"], ""),
-               "duracion_segundos": record["duration_seconds"], "recuperacion": record.get("ended_at"),
+               "duracion_segundos": duration, "recuperacion": record.get("ended_at"),
                "proteccion": actions.get(record["action_result"], ""),
                "detalles": json.dumps(record["events"], ensure_ascii=False, allow_nan=False)}
         writer.writerow({key: csv_cell(value) for key, value in row.items()})
